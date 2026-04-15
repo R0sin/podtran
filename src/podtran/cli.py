@@ -1167,7 +1167,7 @@ def _compose_output_suffix(cfg: AppConfig) -> str:
 def _task_mode_label(task_manifest: TaskManifest) -> str:
     if not task_manifest.preview:
         return "full"
-    return f"preview {_preview_window_label(task_manifest)}"
+    return "preview"
 
 
 

@@ -358,7 +358,6 @@ def test_status_reports_factual_stage_statuses_and_preview_mode(tmp_path: Path) 
     assert "up-to-date" not in status_result.output
     assert tasks_result.exit_code == 0
     assert "preview" in tasks_result.output
-    assert "0-300s" in tasks_result.output
 
 
 def test_translate_requires_transcript_json(tmp_path: Path) -> None:

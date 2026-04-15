@@ -31,12 +31,13 @@ class Translator:
     ) -> list[SegmentRecord]:
         segments = _load_resume_segments(input_path, output_path)
         pending = [segment for segment in segments if not segment.text_zh.strip()]
-        total_segments = len(pending)
+        total_segments = len(segments)
+        completed_segments = total_segments - len(pending)
         if progress_callback is not None:
-            progress_callback(0, max(total_segments, 1), "Preparing translation batches")
+            progress_callback(completed_segments, max(total_segments, 1), "Preparing translation batches")
         if not pending:
             if progress_callback is not None:
-                progress_callback(1, 1, "Translation complete")
+                progress_callback(total_segments, max(total_segments, 1), "Translation complete")
             return segments
 
         batch_size = max(1, self.config.translation.batch_size)
@@ -54,7 +55,11 @@ class Translator:
                 processed += len(batch)
                 write_json(output_path, segments)
                 if progress_callback is not None:
-                    progress_callback(processed, total_segments, f"Translating segments {processed}/{total_segments}")
+                    progress_callback(
+                        completed_segments + processed,
+                        total_segments,
+                        f"Translating segments {completed_segments + processed}/{total_segments}",
+                    )
 
         if progress_callback is not None:
             progress_callback(total_segments, total_segments, "Translation complete")

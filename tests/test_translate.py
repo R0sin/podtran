@@ -97,9 +97,41 @@ def test_translate_segments_reports_segment_progress(tmp_path: Path) -> None:
     translated = translator.translate_segments(input_path, output_path, progress_callback=lambda completed, total, message: events.append((completed, total, message)))
 
     assert [event[0] for event in events] == [0, 2, 3, 3]
-    assert all(event[1] == 3 for event in events[1:])
+    assert all(event[1] == 3 for event in events)
     assert events[0][2] == "Preparing translation batches"
     assert events[-1][2] == "Translation complete"
+    assert all(item.text_zh for item in translated)
+
+
+def test_translate_segments_reports_resume_progress_as_completed_over_total(tmp_path: Path) -> None:
+    input_path = tmp_path / "segments.json"
+    output_path = tmp_path / "translated.json"
+    segments = [_segment("seg_1"), _segment("seg_2"), _segment("seg_3"), _segment("seg_4")]
+    input_path.write_text(
+        "[" + ",".join(segment.model_dump_json() for segment in segments) + "]",
+        encoding="utf-8",
+    )
+    resumed = [
+        segments[0].model_copy(update={"text_zh": "zh-seg_1"}),
+        segments[1].model_copy(update={"text_zh": "zh-seg_2"}),
+        segments[2],
+        segments[3],
+    ]
+    output_path.write_text(
+        "[" + ",".join(segment.model_dump_json() for segment in resumed) + "]",
+        encoding="utf-8",
+    )
+    translator = _TranslatorHarness()
+    translator.config.translation.batch_size = 1
+    translator.config.translation.max_concurrency = 1
+    events: list[tuple[int, int, str]] = []
+
+    translated = translator.translate_segments(input_path, output_path, progress_callback=lambda completed, total, message: events.append((completed, total, message)))
+
+    assert [event[0] for event in events] == [2, 3, 4, 4]
+    assert all(event[1] == 4 for event in events)
+    assert events[1][2] == "Translating segments 3/4"
+    assert events[2][2] == "Translating segments 4/4"
     assert all(item.text_zh for item in translated)
 
 

@@ -31,6 +31,7 @@ base_url = ""
 model = "qwen3.5-flash"
 timeout_seconds = 90
 batch_size = 2
+max_concurrency = 3
 
 [tts]
 provider = "dashscope"
@@ -73,6 +74,7 @@ output_bitrate = "192k"
     assert config.translation.provider == "dashscope"
     assert config.translation.timeout_seconds == 90
     assert config.translation.batch_size == 2
+    assert config.translation.max_concurrency == 3
     assert config.tts.provider == "dashscope"
     assert config.tts.voice_mode == "clone"
     assert config.tts.clone_min_ref_seconds == 8
@@ -86,6 +88,8 @@ def test_translation_and_tts_resolve_provider_defaults_and_overrides() -> None:
     config = AppConfig()
     assert config.translation.provider == "dashscope"
     assert config.translation.model == DEFAULT_TRANSLATION_MODEL
+    assert config.translation.batch_size == 8
+    assert config.translation.max_concurrency == 2
     assert config.translation.resolved_base_url() == DEFAULT_TRANSLATION_BASE_URL
     assert config.tts.resolved_base_url() == DEFAULT_TTS_BASE_URL
     assert config.tts.resolved_customization_url() == "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/customization"
@@ -138,6 +142,8 @@ def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None
     assert "[providers.dashscope]" in rendered
     assert 'provider = "dashscope"' in rendered
     assert 'model = "qwen3.5-flash"' in rendered
+    assert "batch_size = 8" in rendered
+    assert "max_concurrency = 2" in rendered
     assert 'voice_mode = "clone"' in rendered
     assert f'model = "{DEFAULT_TTS_CLONE_MODEL}"' in rendered
     assert 'api_key = ""' in rendered

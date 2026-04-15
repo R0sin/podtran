@@ -42,7 +42,8 @@ class TranslationConfig(BaseModel):
     base_url: str = ""
     model: str = DEFAULT_TRANSLATION_MODEL
     timeout_seconds: int = 120
-    batch_size: int = 4
+    batch_size: int = 8
+    max_concurrency: int = 2
 
     def resolved_base_url(self) -> str:
         base_url = self.base_url.strip().rstrip("/")
@@ -193,6 +194,7 @@ def render_config_toml(config: AppConfig) -> str:
         f'model = "{config.translation.model}"',
         f"timeout_seconds = {config.translation.timeout_seconds}",
         f"batch_size = {config.translation.batch_size}",
+        f"max_concurrency = {config.translation.max_concurrency}",
         "",
         "[tts]",
         '# Clone-first defaults. Switch voice_mode to "preset" to use preset voices below.',

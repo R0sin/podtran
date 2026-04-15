@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from pathlib import Path
 
@@ -39,24 +40,21 @@ class Translator:
             return segments
 
         batch_size = max(1, self.config.translation.batch_size)
+        max_concurrency = max(1, self.config.translation.max_concurrency)
+        batches = [pending[start : start + batch_size] for start in range(0, len(pending), batch_size)]
         processed = 0
-        for start in range(0, len(pending), batch_size):
-            batch = pending[start : start + batch_size]
-            try:
-                translations = self._translate_batch(batch)
-                mapping = {item["segment_id"]: item["text_zh"] for item in translations}
-                for segment in segments:
-                    if segment.segment_id in mapping:
-                        segment.text_zh = mapping[segment.segment_id].strip()
-                        segment.error = None
-            except Exception as exc:
-                error_message = _format_batch_error(exc, batch)
-                for segment in batch:
-                    segment.error = error_message
-            processed += len(batch)
-            write_json(output_path, segments)
-            if progress_callback is not None:
-                progress_callback(processed, total_segments, f"Translating segments {processed}/{total_segments}")
+        with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+            future_to_batch = {executor.submit(self._translate_batch, batch): batch for batch in batches}
+            for future in as_completed(future_to_batch):
+                batch = future_to_batch[future]
+                try:
+                    _apply_translations(segments, future.result())
+                except Exception as exc:
+                    _apply_batch_error(batch, exc)
+                processed += len(batch)
+                write_json(output_path, segments)
+                if progress_callback is not None:
+                    progress_callback(processed, total_segments, f"Translating segments {processed}/{total_segments}")
 
         if progress_callback is not None:
             progress_callback(total_segments, total_segments, "Translation complete")
@@ -94,6 +92,20 @@ def _load_resume_segments(input_path: Path, output_path: Path) -> list[SegmentRe
     source = output_path if output_path.exists() else input_path
     return read_model_list(source, SegmentRecord)
 
+
+
+def _apply_translations(segments: list[SegmentRecord], translations: list[dict[str, str]]) -> None:
+    mapping = {item["segment_id"]: item["text_zh"] for item in translations}
+    for segment in segments:
+        if segment.segment_id in mapping:
+            segment.text_zh = mapping[segment.segment_id].strip()
+            segment.error = None
+
+
+def _apply_batch_error(batch: list[SegmentRecord], exc: Exception) -> None:
+    error_message = _format_batch_error(exc, batch)
+    for segment in batch:
+        segment.error = error_message
 
 
 def _parse_translation_response(content: str, batch: list[SegmentRecord]) -> list[dict[str, str]]:

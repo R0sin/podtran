@@ -582,6 +582,18 @@ def test_translate_config_fingerprint_includes_batch_size(tmp_path: Path) -> Non
     )
 
 
+def test_translate_config_fingerprint_ignores_max_concurrency(tmp_path: Path) -> None:
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    first = AppConfig()
+    second = AppConfig()
+    second.translation.max_concurrency = first.translation.max_concurrency + 1
+
+    assert (
+        fingerprints.hash_config_subset(first, cli.TRANSLATE_CONFIG_KEYS)
+        == fingerprints.hash_config_subset(second, cli.TRANSLATE_CONFIG_KEYS)
+    )
+
+
 def test_pipeline_progress_reporter_renders_overall_and_stage_lines() -> None:
     console = Console(record=True, width=120)
 

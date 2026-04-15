@@ -16,14 +16,12 @@ TRANSCRIBE_CONFIG_KEYS = [
     "asr.compute_type",
     "asr.device",
     "asr.language",
-    "asr.batch_size",
     "asr.align_model",
 ]
 TRANSLATE_CONFIG_KEYS = [
     "translation.provider",
     "translation.base_url",
     "translation.model",
-    "translation.batch_size",
 ]
 VOICE_CLONE_CONFIG_KEYS = [
     "tts.provider",

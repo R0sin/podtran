@@ -13,6 +13,7 @@
 - 默认支持 `clone` 音色克隆，也支持 `preset` 预置音色
 - 每次运行都会创建独立 task，避免旧结果污染新结果
 - 共享缓存会自动复用已完成的转写、翻译、声纹和逐段 TTS 结果
+- 中断后可用 `podtran resume` 从断点继续，已完成的翻译不会丢失
 - 支持 `--preview`，先用前 5 分钟低成本试跑
 
 ## 适合什么场景
@@ -121,7 +122,21 @@ podtran path\to\podcast.mp3 --preview
 podtran path\to\podcast.mp3
 ```
 
-4. 查看最近任务状态
+4. 如果运行中断（Ctrl+C 或意外退出），用 `resume` 从断点继续
+
+```powershell
+podtran resume
+```
+
+`resume` 默认恢复最近一个 task。已完成的阶段会自动跳过，翻译阶段会从上次保存的进度继续翻译。也可以指定 task id：
+
+```powershell
+podtran resume 20260415-083242-50ed61
+```
+
+提示：如果翻译已经**完成**过，重新运行 `podtran <audio>` 也会通过共享缓存自动复用。但如果翻译**中途中断**，只有 `resume` 能恢复未完成的进度。
+
+5. 查看最近任务状态
 
 ```powershell
 podtran tasks

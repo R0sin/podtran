@@ -52,9 +52,13 @@ Recommended entrypoint:
 Shortcut:
   podtran AUDIO [--preview]
 
+Resume an interrupted task:
+  podtran resume [TASK]
+
 Examples:
   podtran run path\\to\\episode.mp3 --preview
   podtran path\\to\\episode.mp3
+  podtran resume
   podtran status
 """
 
@@ -72,7 +76,7 @@ cache_app = typer.Typer(
 )
 app.add_typer(cache_app, name="cache", short_help="Manage the shared cache.")
 console = Console()
-KNOWN_COMMANDS = {"run", "init", "tasks", "status", "transcribe", "translate", "synthesize", "compose", "cache"}
+KNOWN_COMMANDS = {"run", "resume", "init", "tasks", "status", "transcribe", "translate", "synthesize", "compose", "cache"}
 DEFAULT_MIN_SPEAKERS = 2
 DEFAULT_MAX_SPEAKERS = 5
 
@@ -301,6 +305,35 @@ def _prompt_required(label: str, *, hide_input: bool = False, current_value: str
 
 def _prompt_with_default(label: str, default: str) -> str:
     return typer.prompt(label, default=default, show_default=True).strip()
+
+
+RESUME_HELP = """Resume an existing task and re-run the pipeline from where it left off.
+
+If TASK is omitted, picks the latest task. Completed stages are skipped automatically.
+Interrupted translations resume from the last saved checkpoint.
+"""
+
+
+@app.command(
+    short_help="Resume an existing task.",
+    help=RESUME_HELP,
+)
+def resume(
+    task: Optional[str] = typer.Argument(None, metavar="TASK", help="Task id or unique prefix. Defaults to latest."),
+    config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
+    workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+    min_speakers: int = typer.Option(DEFAULT_MIN_SPEAKERS, "--min_speakers", min=1, help="Minimum speaker count hint for diarization."),
+    max_speakers: int = typer.Option(DEFAULT_MAX_SPEAKERS, "--max_speakers", min=1, help="Maximum speaker count hint for diarization."),
+) -> None:
+    _validate_speaker_bounds(min_speakers, max_speakers)
+    cfg, _, task_store, cache_store, fingerprints = _load_runtime(config, workdir)
+    try:
+        task_manifest = task_store.load_task(task) if task else task_store.load_latest_task()
+    except FileNotFoundError:
+        _abort("No tasks found. Use 'podtran run AUDIO' to create a new task.")
+        return  # unreachable, _abort raises
+    console.print(f"[green]Resuming task:[/green] {task_manifest.task_id}")
+    _execute_pipeline(task_manifest, cfg, task_store, cache_store, fingerprints, min_speakers=min_speakers, max_speakers=max_speakers)
 
 
 @app.command(
@@ -608,22 +641,26 @@ def _execute_pipeline(
     decisions: list[StageDecision] = []
 
     with PipelineProgressReporter(console, show_overall=True) as reporter:
-        decisions.append(
-            _ensure_transcribe(
-                task_manifest,
-                cfg,
-                paths,
-                executor,
-                cache_store,
-                fingerprints,
-                min_speakers=min_speakers,
-                max_speakers=max_speakers,
-                reporter=reporter,
+        try:
+            decisions.append(
+                _ensure_transcribe(
+                    task_manifest,
+                    cfg,
+                    paths,
+                    executor,
+                    cache_store,
+                    fingerprints,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers,
+                    reporter=reporter,
+                )
             )
-        )
-        decisions.append(_ensure_translate(task_manifest, cfg, paths, executor, cache_store, fingerprints, reporter=reporter))
-        decisions.append(_ensure_synthesize(task_manifest, cfg, paths, executor, cache_store, fingerprints, reporter=reporter))
-        decisions.append(_ensure_compose(task_manifest, cfg, paths, executor, fingerprints, reporter=reporter))
+            decisions.append(_ensure_translate(task_manifest, cfg, paths, executor, cache_store, fingerprints, reporter=reporter))
+            decisions.append(_ensure_synthesize(task_manifest, cfg, paths, executor, cache_store, fingerprints, reporter=reporter))
+            decisions.append(_ensure_compose(task_manifest, cfg, paths, executor, fingerprints, reporter=reporter))
+        except KeyboardInterrupt:
+            console.print(f"\n[yellow]Interrupted.[/yellow] Resume with: podtran resume {task_manifest.task_id}")
+            raise typer.Exit(code=1)
     console.print(f"[green]Task complete:[/green] {task_manifest.task_id}")
     final_output_path = _compose_output_path(task_manifest, cfg, paths)
     if final_output_path.exists():
@@ -688,6 +725,33 @@ def _abort(message: str) -> None:
 def _validate_speaker_bounds(min_speakers: int, max_speakers: int) -> None:
     if min_speakers > max_speakers:
         raise typer.BadParameter("--min_speakers cannot be greater than --max_speakers.")
+
+
+
+def _can_resume_partial(
+    executor: StageExecutor,
+    stage: str,
+    stage_version: int,
+    input_fingerprints: dict[str, str],
+    config_fingerprint: str,
+) -> bool:
+    """Check if an interrupted stage can resume with partial results intact.
+
+    Returns True only when the previous manifest exists with status 'running'
+    or 'interrupted' AND the stage version, input and config fingerprints all
+    still match, meaning the partial results are compatible with the current run.
+    """
+    manifest = executor.load_manifest(stage)
+    if manifest is None or manifest.status not in ("running", "interrupted"):
+        return False
+    if manifest.stage_version != stage_version:
+        return False
+    if manifest.config_fingerprint != config_fingerprint:
+        return False
+    for key, value in input_fingerprints.items():
+        if manifest.input_fingerprints.get(key) != value:
+            return False
+    return True
 
 
 
@@ -770,6 +834,11 @@ def _ensure_transcribe(
         if reporter is not None:
             reporter.complete_stage("transcribe", f"transcribe done: {len(transcript)} transcript segments")
         return StageDecision("transcribe", "run", reason or "cache miss")
+    except KeyboardInterrupt:
+        if reporter is not None:
+            reporter.fail_stage("transcribe", "Interrupted by user")
+        executor.interrupt(manifest)
+        raise
     except Exception as exc:
         if reporter is not None:
             reporter.fail_stage("transcribe", str(exc))
@@ -874,11 +943,13 @@ def _ensure_translate(
             reporter.skip_stage("translate", "cache hit")
         return StageDecision("translate", "cache hit", reason or "cache available")
 
+    resumable = _can_resume_partial(executor, "translate", TRANSLATE_STAGE_VERSION, input_fingerprints, config_fingerprint)
     executor.start(manifest)
     try:
         if reporter is not None:
             reporter.start_stage("translate", max(len(segments), 1), "Preparing segments")
-        remove_path(paths.translated_json)
+        if not resumable:
+            remove_path(paths.translated_json)
         translated = Translator(cfg).translate_segments(
             paths.segments_json,
             paths.translated_json,
@@ -895,6 +966,11 @@ def _ensure_translate(
         if reporter is not None:
             reporter.complete_stage("translate", _translate_stage_summary(translated))
         return StageDecision("translate", "run", reason or "cache miss")
+    except KeyboardInterrupt:
+        if reporter is not None:
+            reporter.fail_stage("translate", "Interrupted by user")
+        executor.interrupt(manifest)
+        raise
     except Exception as exc:
         if reporter is not None:
             reporter.fail_stage("translate", str(exc))
@@ -960,6 +1036,11 @@ def _ensure_synthesize(
         if reporter is not None:
             reporter.complete_stage("synthesize", _synthesize_stage_summary(synthesized))
         return StageDecision("synthesize", "run", reason or "stage needs execution")
+    except KeyboardInterrupt:
+        if reporter is not None:
+            reporter.fail_stage("synthesize", "Interrupted by user")
+        executor.interrupt(manifest)
+        raise
     except Exception as exc:
         if reporter is not None:
             reporter.fail_stage("synthesize", str(exc))
@@ -1013,6 +1094,11 @@ def _ensure_compose(
         if reporter is not None:
             reporter.complete_stage("compose", f"compose done: {output_path.name}")
         return StageDecision("compose", "run", reason or "stage needs execution")
+    except KeyboardInterrupt:
+        if reporter is not None:
+            reporter.fail_stage("compose", "Interrupted by user")
+        executor.interrupt(manifest)
+        raise
     except Exception as exc:
         if reporter is not None:
             reporter.fail_stage("compose", str(exc))

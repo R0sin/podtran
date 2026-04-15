@@ -33,7 +33,7 @@ ensuring reproducibility and efficient reuse across tasks.
 ```text
 podtran/
 ├── src/podtran/          # Main package (hatchling src-layout)
-│   ├── cli.py            # Typer CLI: root AUDIO entry, init, tasks, status, stages, cache clean
+│   ├── cli.py            # Typer CLI: root AUDIO entry, resume, init, tasks, status, stages, cache clean
 │   ├── config.py         # Pydantic config models, TOML loader, render_config_toml
 │   ├── models.py         # Domain models: TaskManifest, StageManifest, SegmentRecord, VoiceProfile, etc.
 │   ├── asr.py            # WhisperX transcription with progress callbacks
@@ -79,6 +79,7 @@ uv sync
 ```powershell
 uv run podtran --help
 uv run podtran path\to\podcast.mp3
+uv run podtran resume
 uv run podtran tasks
 uv run podtran status
 ```
@@ -105,6 +106,8 @@ uv run ruff format --check src/ tests/
 
 - **`podtran <audio>`** → creates a new task under `~/.podtran/artifacts/tasks/<task_id>/`,
   then runs the full pipeline `transcribe → merge → translate → synthesize → compose`.
+- **`podtran resume [task]`** → loads an existing task (defaults to latest) and re-runs the pipeline
+  from where it left off. Completed stages are skipped; interrupted translations resume from partial results.
 - **`podtran tasks`** → lists recent task instances.
 - **`podtran status [task]`** → shows the current facts for a task; defaults to the latest task.
 - **Single-stage commands** (`transcribe`, `translate`, `synthesize`, `compose`)
@@ -142,9 +145,15 @@ Cache keys are SHA-256 hashes of `{stage, stage_version, input_fingerprints, con
 
 ### Stage Lifecycle (`StageExecutor`)
 
-Each stage follows: `is_current? → cache hit? → start → <execute> → complete/fail`.
+Each stage follows: `is_current? → cache hit? → start → <execute> → complete/fail/interrupt`.
 `StageManifest` records `input_fingerprints`, `config_fingerprint`, and `output_refs`
 for deterministic staleness detection.
+
+- **`KeyboardInterrupt` (Ctrl+C)** is caught per-stage and calls `executor.interrupt(manifest)`,
+  setting status to `"interrupted"` before exiting. The pipeline prints a resume hint.
+- **Partial result preservation**: `_can_resume_partial()` checks the old manifest's status,
+  `stage_version`, input fingerprints, and config fingerprint to decide whether to keep
+  existing partial output (e.g. `translated.json`) on resume.
 
 ### Status Reporting
 
@@ -188,8 +197,9 @@ It does not perform dry-run planning or predict reruns.
    add its dotted key to the corresponding `*_CONFIG_KEYS` list in `fingerprints.py`
    and bump the stage version in `stage_versions.py`.
 6. **Error handling** — stages catch exceptions via `StageExecutor.fail()` which
-   records the error in the manifest and updates task status. Individual segment-level
-   failures (translate, TTS) are recorded per-segment in `SegmentRecord.error`.
+   records the error in the manifest and updates task status. `KeyboardInterrupt` is
+   caught separately via `StageExecutor.interrupt()` to set `"interrupted"` status.
+   Individual segment-level failures (translate, TTS) are recorded per-segment in `SegmentRecord.error`.
 7. **CLI pattern** — commands that need runtime state load it via `_load_runtime()` or `_load_task_context()`.
 8. **No globals / singletons** — all state flows through function args or dataclass instances.
 

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 
 
 StageStatus = Literal["pending", "running", "completed", "failed"]
+TaskStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
 VoiceMode = Literal["preset", "clone"]
 StageProgressCallback = Callable[[int, int, str], None]
 
@@ -74,7 +75,7 @@ class TaskManifest(BaseModel):
     config_hash: str
     config_snapshot: dict[str, Any] = Field(default_factory=dict)
     current_stage: str = ""
-    status: StageStatus = "pending"
+    status: TaskStatus = "pending"
 
     @model_validator(mode="after")
     def apply_processing_defaults(self) -> "TaskManifest":
@@ -87,7 +88,7 @@ class TaskManifest(BaseModel):
 
 class StageManifest(BaseModel):
     stage: str
-    status: StageStatus = "pending"
+    status: TaskStatus = "pending"
     stage_version: int = 1
     cache_key: str = ""
     input_fingerprints: dict[str, str] = Field(default_factory=dict)

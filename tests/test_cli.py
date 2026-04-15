@@ -89,13 +89,14 @@ def test_root_help_documents_run_and_shortcut_entrypoints() -> None:
 
     assert result.exit_code == 0
     assert "run" in result.output
+    assert "resume" in result.output
     assert "tasks" in result.output
     assert "status" in result.output
     assert "Recommended entrypoint" in result.output
     assert "podtran run AUDIO" in result.output
     assert "Shortcut" in result.output
     assert "podtran AUDIO [--preview]" in result.output
-    assert "resume" not in result.output
+    assert "podtran resume" in result.output
 
 
 def test_cache_help_only_lists_clean() -> None:
@@ -612,7 +613,7 @@ def test_parse_before_normalizes_to_utc() -> None:
     assert cli._parse_before("2026-04-01T08:00:00+08:00") == datetime(2026, 4, 1, tzinfo=timezone.utc)
 
 
-def test_translate_config_fingerprint_includes_batch_size(tmp_path: Path) -> None:
+def test_translate_config_fingerprint_ignores_batch_size(tmp_path: Path) -> None:
     fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
     first = AppConfig()
     second = AppConfig()
@@ -620,7 +621,7 @@ def test_translate_config_fingerprint_includes_batch_size(tmp_path: Path) -> Non
 
     assert (
         fingerprints.hash_config_subset(first, cli.TRANSLATE_CONFIG_KEYS)
-        != fingerprints.hash_config_subset(second, cli.TRANSLATE_CONFIG_KEYS)
+        == fingerprints.hash_config_subset(second, cli.TRANSLATE_CONFIG_KEYS)
     )
 
 
@@ -675,3 +676,300 @@ def test_pipeline_progress_reporter_stage_only_skip_message_is_concise() -> None
     rendered = console.export_text()
     assert "translate skipped (cache hit)" in rendered
     assert "Pipeline Translate" not in rendered
+
+
+def test_resume_help_documents_task_argument_and_latest_default() -> None:
+    result = runner.invoke(cli.app, ["resume", "--help"])
+
+    assert result.exit_code == 0
+    assert "TASK" in result.output
+    assert "latest" in result.output.lower()
+    assert "Interrupted translations resume" in result.output
+
+
+def test_resume_loads_latest_task_and_executes_pipeline(tmp_path: Path, monkeypatch) -> None:
+    config_path, cfg = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task_manifest = store.create_task(audio, cfg, f"podtran {audio}")
+    captured: dict[str, object] = {}
+
+    def fake_execute_pipeline(task_manifest, cfg, task_store, cache_store, fingerprints, min_speakers=2, max_speakers=5):
+        captured["task_id"] = task_manifest.task_id
+        return []
+
+    monkeypatch.setattr(cli, "_execute_pipeline", fake_execute_pipeline)
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", "--config", str(config_path), "--workdir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    assert "Resuming task:" in result.output
+    assert captured["task_id"] == task_manifest.task_id
+
+
+def test_resume_with_explicit_task_id(tmp_path: Path, monkeypatch) -> None:
+    config_path, cfg = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task_manifest = store.create_task(audio, cfg, f"podtran {audio}")
+    captured: dict[str, object] = {}
+
+    def fake_execute_pipeline(task_manifest, cfg, task_store, cache_store, fingerprints, min_speakers=2, max_speakers=5):
+        captured["task_id"] = task_manifest.task_id
+        return []
+
+    monkeypatch.setattr(cli, "_execute_pipeline", fake_execute_pipeline)
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", task_manifest.task_id, "--config", str(config_path), "--workdir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    assert captured["task_id"] == task_manifest.task_id
+
+
+def test_resume_aborts_when_no_tasks_exist(tmp_path: Path) -> None:
+    config_path, _ = _create_config(tmp_path)
+
+    result = runner.invoke(
+        cli.app,
+        ["resume", "--config", str(config_path), "--workdir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "No tasks found" in result.output
+
+
+def test_can_resume_partial_returns_true_for_interrupted_with_matching_fingerprints(tmp_path: Path) -> None:
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    input_fps = {"segments_json": "abc123"}
+    config_fp = "cfg-hash"
+    manifest = StageManifest(
+        stage="translate",
+        status="running",
+        input_fingerprints=input_fps,
+        config_fingerprint=config_fp,
+        output_refs={"translated_json": "translated.json"},
+    )
+    write_json(paths.manifest_path("translate"), manifest)
+
+    assert cli._can_resume_partial(executor, "translate", 1, input_fps, config_fp) is True
+
+
+def test_can_resume_partial_returns_false_when_config_changed(tmp_path: Path) -> None:
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    manifest = StageManifest(
+        stage="translate",
+        status="running",
+        input_fingerprints={"segments_json": "abc123"},
+        config_fingerprint="old-cfg-hash",
+        output_refs={"translated_json": "translated.json"},
+    )
+    write_json(paths.manifest_path("translate"), manifest)
+
+    assert cli._can_resume_partial(executor, "translate", 1, {"segments_json": "abc123"}, "new-cfg-hash") is False
+
+
+def test_can_resume_partial_returns_false_when_stage_completed(tmp_path: Path) -> None:
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    manifest = StageManifest(
+        stage="translate",
+        status="completed",
+        input_fingerprints={"segments_json": "abc123"},
+        config_fingerprint="cfg-hash",
+        output_refs={"translated_json": "translated.json"},
+    )
+    write_json(paths.manifest_path("translate"), manifest)
+
+    assert cli._can_resume_partial(executor, "translate", 1, {"segments_json": "abc123"}, "cfg-hash") is False
+
+
+def test_ensure_translate_preserves_partial_results_on_resume(tmp_path: Path, monkeypatch) -> None:
+    import podtran.translate as translate_module
+
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    transcript = [TranscriptSegment(segment_id="ts_1", start=0.0, end=1.0, text="hello", speaker="SPEAKER_00")]
+    write_json(paths.transcript_json, transcript)
+
+    # Simulate an interrupted translate with partial results
+    segments = cli._write_segments(paths, cfg)
+    input_fps = {"segments_json": cli._translate_input_fingerprint(fingerprints, segments)}
+    config_fp = fingerprints.hash_config_subset(cfg, cli.TRANSLATE_CONFIG_KEYS)
+    interrupted_manifest = StageManifest(
+        stage="translate",
+        status="running",
+        stage_version=cli.TRANSLATE_STAGE_VERSION,
+        input_fingerprints=input_fps,
+        config_fingerprint=config_fp,
+        output_refs={"translated_json": "translated.json", "segments_json": "segments.json"},
+    )
+    write_json(paths.manifest_path("translate"), interrupted_manifest)
+    # Write partial translated output
+    partial = [_segment("seg_00000", None)]
+    partial[0].text_zh = "你好"
+    write_json(paths.translated_json, partial)
+
+    class FakeTranslator:
+        def __init__(self, config: AppConfig) -> None:
+            self.config = config
+
+        def translate_segments(self, input_path, output_path, progress_callback=None):
+            # _load_resume_segments should find the existing translated.json
+            loaded = read_model_list(output_path, SegmentRecord) if output_path.exists() else read_model_list(input_path, SegmentRecord)
+            return loaded
+
+    monkeypatch.setattr(translate_module, "Translator", FakeTranslator)
+
+    result = cli._ensure_translate(task, cfg, paths, executor, cache_store, fingerprints)
+
+    assert result.action == "run"
+    assert paths.translated_json.exists()
+    restored = read_model_list(paths.translated_json, SegmentRecord)
+    assert restored[0].text_zh == "你好"
+
+
+def test_can_resume_partial_returns_true_for_interrupted_status(tmp_path: Path) -> None:
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    input_fps = {"segments_json": "abc123"}
+    config_fp = "cfg-hash"
+    manifest = StageManifest(
+        stage="translate",
+        status="interrupted",
+        input_fingerprints=input_fps,
+        config_fingerprint=config_fp,
+        output_refs={"translated_json": "translated.json"},
+        error="Interrupted by user",
+    )
+    write_json(paths.manifest_path("translate"), manifest)
+
+    assert cli._can_resume_partial(executor, "translate", 1, input_fps, config_fp) is True
+
+
+def test_can_resume_partial_returns_false_when_stage_version_changed(tmp_path: Path) -> None:
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    input_fps = {"segments_json": "abc123"}
+    config_fp = "cfg-hash"
+    manifest = StageManifest(
+        stage="translate",
+        status="interrupted",
+        stage_version=2,
+        input_fingerprints=input_fps,
+        config_fingerprint=config_fp,
+        output_refs={"translated_json": "translated.json"},
+        error="Interrupted by user",
+    )
+    write_json(paths.manifest_path("translate"), manifest)
+
+    # Old manifest has stage_version=2, current version is 3 → should not resume
+    assert cli._can_resume_partial(executor, "translate", 3, input_fps, config_fp) is False
+    # Same version → should resume
+    assert cli._can_resume_partial(executor, "translate", 2, input_fps, config_fp) is True
+
+
+def test_keyboard_interrupt_sets_interrupted_status(tmp_path: Path, monkeypatch) -> None:
+    import podtran.translate as translate_module
+
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    transcript = [TranscriptSegment(segment_id="ts_1", start=0.0, end=1.0, text="hello", speaker="SPEAKER_00")]
+    write_json(paths.transcript_json, transcript)
+
+    class InterruptingTranslator:
+        def __init__(self, config: AppConfig) -> None:
+            self.config = config
+
+        def translate_segments(self, input_path, output_path, progress_callback=None):
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(translate_module, "Translator", InterruptingTranslator)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli._ensure_translate(task, cfg, paths, executor, cache_store, fingerprints)
+
+    manifest = read_model(paths.manifest_path("translate"), StageManifest)
+    assert manifest.status == "interrupted"
+    assert manifest.error == "Interrupted by user"
+    reloaded_task = store.load_task(task.task_id)
+    assert reloaded_task.status == "interrupted"
+
+
+def test_execute_pipeline_prints_resume_hint_on_interrupt(tmp_path: Path, monkeypatch) -> None:
+    cfg, store, task_manifest = _preview_task(tmp_path)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    recorded_console = Console(record=True, width=160)
+    previous_console = cli.console
+
+    def interrupting_transcribe(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(cli, "_ensure_transcribe", interrupting_transcribe)
+    cli.console = recorded_console
+    try:
+        with pytest.raises((SystemExit, Exception)):
+            cli._execute_pipeline(task_manifest, cfg, store, cache_store, fingerprints)
+        rendered = recorded_console.export_text()
+    finally:
+        cli.console = previous_console
+
+    assert "Interrupted" in rendered
+    assert f"podtran resume {task_manifest.task_id}" in rendered
+    assert "Task complete" not in rendered

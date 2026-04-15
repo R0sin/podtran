@@ -32,6 +32,8 @@ class StageExecutor:
             return False, "stage has not run yet"
         if manifest.status == "running":
             return False, "previous execution interrupted"
+        if manifest.status == "interrupted":
+            return False, "previous execution interrupted by user"
         if manifest.status != "completed":
             return False, manifest.error or f"{stage} is {manifest.status}"
         if manifest.output_refs != output_refs:
@@ -72,6 +74,14 @@ class StageExecutor:
         manifest.error = str(exc).strip() or repr(exc)
         self._save_manifest(manifest)
         self._update_task(stage=manifest.stage, status="failed")
+        return manifest
+
+    def interrupt(self, manifest: StageManifest) -> StageManifest:
+        manifest.status = "interrupted"
+        manifest.finished_at = _utc_now()
+        manifest.error = "Interrupted by user"
+        self._save_manifest(manifest)
+        self._update_task(stage=manifest.stage, status="interrupted")
         return manifest
 
     def save_completed(self, manifest: StageManifest) -> StageManifest:

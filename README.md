@@ -42,6 +42,8 @@ uv tool install git+https://github.com/R0sin/podtran
 podtran --help
 ```
 
+提示：CLI help 会把 `podtran run AUDIO` 作为正式入口展示，日常使用仍可直接写 `podtran AUDIO`。
+
 升级：
 
 ```powershell

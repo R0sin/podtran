@@ -84,14 +84,18 @@ def test_print_stage_failure_summary_renders_unique_messages() -> None:
     assert "ValueError: bad json" in rendered
 
 
-def test_root_help_uses_simplified_command_surface() -> None:
+def test_root_help_documents_run_and_shortcut_entrypoints() -> None:
     result = runner.invoke(cli.app, ["--help"])
 
     assert result.exit_code == 0
+    assert "run" in result.output
     assert "tasks" in result.output
     assert "status" in result.output
+    assert "Recommended entrypoint" in result.output
+    assert "podtran run AUDIO" in result.output
+    assert "Shortcut" in result.output
+    assert "podtran AUDIO [--preview]" in result.output
     assert "resume" not in result.output
-    assert "\n| run" not in result.output
 
 
 def test_cache_help_only_lists_clean() -> None:
@@ -99,8 +103,46 @@ def test_cache_help_only_lists_clean() -> None:
 
     assert result.exit_code == 0
     assert "clean" in result.output
+    assert "only exposed maintenance action is" in result.output
     assert "inspect" not in result.output
     assert "\n| list" not in result.output
+
+
+def test_run_help_exposes_audio_and_preview_options() -> None:
+    result = runner.invoke(cli.app, ["run", "--help"])
+
+    assert result.exit_code == 0
+    assert "AUDIO" in result.output
+    assert "--preview" in result.output
+    assert "--min_speakers" in result.output
+    assert "--max_speakers" in result.output
+    assert "Create a new task for AUDIO and run the full pipeline." in result.output
+
+
+def test_stage_help_documents_task_requirements() -> None:
+    status_result = runner.invoke(cli.app, ["status", "--help"])
+    translate_result = runner.invoke(cli.app, ["translate", "--help"])
+    synthesize_result = runner.invoke(cli.app, ["synthesize", "--help"])
+    compose_result = runner.invoke(cli.app, ["compose", "--help"])
+    cache_clean_result = runner.invoke(cli.app, ["cache", "clean", "--help"])
+
+    assert status_result.exit_code == 0
+    assert "If TASK is omitted" in status_result.output
+    assert "latest task" in status_result.output
+
+    assert translate_result.exit_code == 0
+    assert "Requires `transcript.json`" in translate_result.output
+
+    assert synthesize_result.exit_code == 0
+    assert "Requires `translated.json`" in synthesize_result.output
+
+    assert compose_result.exit_code == 0
+    assert "Requires `translated.json`" in compose_result.output
+    assert "completed TTS output" in compose_result.output
+
+    assert cache_clean_result.exit_code == 0
+    assert "2026-04-01" in cache_clean_result.output
+    assert "2026-04-01T12:30:00+08:00" in cache_clean_result.output
 
 
 def test_init_prompts_for_provider_managed_config_and_writes_defaults(tmp_path: Path) -> None:

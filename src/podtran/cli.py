@@ -44,11 +44,35 @@ from podtran.tasks import TaskStore
 PREVIEW_DURATION_SECONDS = 300.0
 PREVIEW_START_SECONDS = 0.0
 
-app = typer.Typer(no_args_is_help=True, add_completion=False, help="Use `podtran AUDIO [--preview]` to create and run a new task.")
-cache_app = typer.Typer(no_args_is_help=True, add_completion=False)
-app.add_typer(cache_app, name="cache")
+ROOT_HELP = """Translate English podcast audio into Chinese with a staged CLI.
+
+Recommended entrypoint:
+  podtran run AUDIO [--preview]
+
+Shortcut:
+  podtran AUDIO [--preview]
+
+Examples:
+  podtran run path\\to\\episode.mp3 --preview
+  podtran path\\to\\episode.mp3
+  podtran status
+"""
+
+RUN_HELP = """Create a new task for AUDIO and run the full pipeline.
+
+This command executes transcribe, translate, synthesize, and compose for a new task.
+Use --preview to process only the first five minutes before running the full audio.
+"""
+
+app = typer.Typer(no_args_is_help=True, add_completion=False, help=ROOT_HELP)
+cache_app = typer.Typer(
+    no_args_is_help=True,
+    add_completion=False,
+    help="Manage the shared artifact cache. The only exposed maintenance action is `clean`.",
+)
+app.add_typer(cache_app, name="cache", short_help="Manage the shared cache.")
 console = Console()
-KNOWN_COMMANDS = {"init", "tasks", "status", "transcribe", "translate", "synthesize", "compose", "cache"}
+KNOWN_COMMANDS = {"run", "init", "tasks", "status", "transcribe", "translate", "synthesize", "compose", "cache"}
 DEFAULT_MIN_SPEAKERS = 2
 DEFAULT_MAX_SPEAKERS = 5
 
@@ -192,8 +216,11 @@ class PipelineProgressReporter:
         return f"Pipeline {PIPELINE_STAGE_LABELS.get(stage, stage.title())}: {message}"
 
 
-@app.command("_start", hidden=True)
-def hidden_start(
+@app.command(
+    short_help="Create a task and run the full pipeline.",
+    help=RUN_HELP,
+)
+def run(
     audio: Path = typer.Argument(..., metavar="AUDIO", help="Input podcast audio for a new task."),
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
     workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
@@ -202,10 +229,13 @@ def hidden_start(
     max_speakers: int = typer.Option(DEFAULT_MAX_SPEAKERS, "--max_speakers", min=1, help="Maximum speaker count hint for diarization."),
 ) -> None:
     _validate_speaker_bounds(min_speakers, max_speakers)
-    _start_task(audio, config, workdir, preview=preview, min_speakers=min_speakers, max_speakers=max_speakers)
+    _run_task(audio, config, workdir, preview=preview, min_speakers=min_speakers, max_speakers=max_speakers)
 
 
-@app.command()
+@app.command(
+    short_help="Create or update config interactively.",
+    help="Launch an interactive config wizard, write `podtran.toml`, and prepare the artifact workdir.",
+)
 def init(
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
     workdir: Optional[Path] = typer.Option(None, "--workdir", help="Artifact workdir."),
@@ -273,7 +303,10 @@ def _prompt_with_default(label: str, default: str) -> str:
     return typer.prompt(label, default=default, show_default=True).strip()
 
 
-@app.command()
+@app.command(
+    short_help="List recent tasks.",
+    help="List recent tasks from the workdir so you can inspect task ids, modes, stages, and status.",
+)
 def tasks(
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
     workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
@@ -304,7 +337,10 @@ def tasks(
     console.print(table)
 
 
-@app.command()
+@app.command(
+    short_help="Show task status.",
+    help="Show the factual status for a task. If TASK is omitted, podtran loads the latest task in the workdir.",
+)
 def status(
     task: Optional[str] = typer.Argument(None, metavar="TASK", help="Task id or unique prefix."),
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
@@ -339,7 +375,10 @@ def status(
         console.print(f"voices={len(profiles)} cloned={cloned} failed_voice_profiles={failed_profiles}")
 
 
-@app.command()
+@app.command(
+    short_help="Run transcription for an existing task.",
+    help="Run only the transcription stage for TASK. This command operates on an existing task and refreshes `transcript.json` when needed.",
+)
 def transcribe(
     task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
@@ -363,7 +402,10 @@ def transcribe(
         )
 
 
-@app.command()
+@app.command(
+    short_help="Run translation for an existing task.",
+    help="Run only the translation stage for TASK. Requires `transcript.json` to exist for that task.",
+)
 def translate(
     task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
@@ -375,7 +417,10 @@ def translate(
         _ensure_translate(task_manifest, cfg, paths, executor, cache_store, fingerprints, reporter=reporter)
 
 
-@app.command()
+@app.command(
+    short_help="Run TTS synthesis for an existing task.",
+    help="Run only the synthesis stage for TASK. Requires `translated.json` to exist for that task.",
+)
 def synthesize(
     task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
@@ -387,7 +432,10 @@ def synthesize(
         _ensure_synthesize(task_manifest, cfg, paths, executor, cache_store, fingerprints, reporter=reporter)
 
 
-@app.command()
+@app.command(
+    short_help="Compose the final output for an existing task.",
+    help="Run only the compose stage for TASK. Requires `translated.json` and at least one completed TTS output.",
+)
 def compose(
     task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
@@ -400,7 +448,11 @@ def compose(
         _ensure_compose(task_manifest, cfg, paths, executor, fingerprints, reporter=reporter)
 
 
-@cache_app.command("clean")
+@cache_app.command(
+    "clean",
+    short_help="Delete old cache entries.",
+    help="Delete shared cache entries, optionally limited by `--before`. Example values: `2026-04-01` or `2026-04-01T12:30:00+08:00`.",
+)
 def cache_clean(
     before: Optional[str] = typer.Option(None, "--before", help="Delete cache entries finished before ISO datetime/date."),
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
@@ -417,7 +469,7 @@ def main() -> None:
     argv = sys.argv[1:]
     original_argv = sys.argv[:]
     if _should_dispatch_root_task(argv):
-        sys.argv = [sys.argv[0], "_start", *argv]
+        sys.argv = [sys.argv[0], "run", *argv]
     try:
         app(standalone_mode=False)
     finally:
@@ -463,7 +515,7 @@ def _load_runtime(
 
 
 
-def _start_task(
+def _run_task(
     audio: Path,
     config_path: Optional[Path],
     workdir_override: Optional[Path],

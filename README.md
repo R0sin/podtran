@@ -136,3 +136,7 @@ podtran status
 - 预览任务通常生成 `<原文件名>.preview.interleave.mp3`
 
 `interleave` 是默认模式，表示保留英文原声并穿插中文配音。
+
+## License
+
+本项目采用 MIT License，详见 [LICENSE](LICENSE)。

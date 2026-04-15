@@ -73,6 +73,38 @@ podtran init
 
 默认配置会写到 `~/.podtran/podtran.toml`。如果传 `--workdir <path>`，则会写到 `<path>/podtran.toml`，同时任务和缓存也会放到这个目录下。
 
+转录相关设置默认来自 `podtran.toml` 里的 `[asr]` 配置：
+
+```toml
+[asr]
+model = "medium"
+compute_type = "int8"
+device = "cpu"
+batch_size = 4
+```
+
+`medium + cpu + int8` 是面向普通笔记本的默认组合。如果有实力或想尝试不同效果，可以手动调整 `model`、`device` 和 `compute_type`。
+
+可选值参考：
+
+- `model`：`base`、`small`、`medium`、`large-v2`、`large-v3`、`turbo`、`distil-large-v3`
+- `compute_type`：`int8`、`float16`
+
+一般建议：
+
+- CPU 环境优先用 `int8`
+- CUDA 环境优先用 `float16`
+
+以下是单卡 3090 的示例：
+
+```toml
+[asr]
+model = "distil-large-v3"
+compute_type = "float16"
+device = "cuda"
+batch_size = 16
+```
+
 2. 先跑一个 5 分钟预览
 
 ```powershell

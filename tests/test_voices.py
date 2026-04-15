@@ -116,7 +116,7 @@ def test_voice_profile_manager_reuses_cached_voice_profile(tmp_path: Path) -> No
             VoiceProfile(
                 speaker="SPEAKER_00",
                 provider="dashscope",
-                target_model="qwen3-tts-vc",
+                target_model="qwen3-tts-vc-2026-01-22",
                 voice_token="voice-token-1",
                 ref_audio_path=str(ref_audio.resolve()),
                 ref_text_path=str(ref_text.resolve()),

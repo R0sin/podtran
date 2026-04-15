@@ -119,7 +119,7 @@ def test_init_prompts_for_provider_managed_config_and_writes_defaults(tmp_path: 
     assert config.translation.provider == "dashscope"
     assert config.translation.model == "qwen3.5-flash"
     assert config.tts.provider == "dashscope"
-    assert config.tts.model == "qwen3-tts-vc"
+    assert config.tts.model == "qwen3-tts-vc-2026-01-22"
     assert (tmp_path / "artifacts").exists()
     assert "speaker-diarization-community-1" in result.output
     assert "hf.co/settings/tokens" in result.output

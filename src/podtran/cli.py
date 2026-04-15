@@ -1,0 +1,1104 @@
+from __future__ import annotations
+
+import gc
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.table import Table
+
+from podtran.artifacts import ArtifactPaths, output_refs_exist, read_model_list, remove_path, write_json
+from podtran.audio import FFMPEG_COMMAND, FFPROBE_COMMAND, extract_audio_chunk
+from podtran.cache_store import CacheStore
+from podtran.checks import ensure_audio_file, ensure_command, ensure_hf_token
+from podtran.compose import compose_output
+from podtran.config import (
+    AppConfig,
+    DEFAULT_TRANSLATION_PROVIDER,
+    DEFAULT_TRANSLATION_MODEL,
+    DEFAULT_TTS_PROVIDER,
+    DEFAULT_TTS_CLONE_MODEL,
+    load_config,
+    render_config_toml,
+    resolve_config_path,
+    resolve_workdir,
+)
+from podtran.fingerprints import (
+    COMPOSE_CONFIG_KEYS,
+    SYNTHESIZE_CONFIG_KEYS,
+    TRANSCRIBE_CONFIG_KEYS,
+    TRANSLATE_CONFIG_KEYS,
+    FingerprintService,
+)
+from podtran.merge import merge_transcript_segments
+from podtran.models import TaskManifest, SegmentRecord, StageManifest, TranscriptSegment, VoiceProfile
+from podtran.stage_executor import StageExecutor
+from podtran.stage_versions import COMPOSE_STAGE_VERSION, SYNTHESIZE_STAGE_VERSION, TRANSCRIBE_STAGE_VERSION, TRANSLATE_STAGE_VERSION
+from podtran.tasks import TaskStore
+
+PREVIEW_DURATION_SECONDS = 300.0
+PREVIEW_START_SECONDS = 0.0
+
+app = typer.Typer(no_args_is_help=True, add_completion=False, help="Use `podtran AUDIO [--preview]` to create and run a new task.")
+cache_app = typer.Typer(no_args_is_help=True, add_completion=False)
+app.add_typer(cache_app, name="cache")
+console = Console()
+KNOWN_COMMANDS = {"init", "tasks", "status", "transcribe", "translate", "synthesize", "compose", "cache"}
+DEFAULT_MIN_SPEAKERS = 2
+DEFAULT_MAX_SPEAKERS = 5
+
+
+@dataclass(slots=True)
+class StageDecision:
+    stage: str
+    action: str
+    reason: str
+
+
+PIPELINE_STAGE_ORDER = ["transcribe", "translate", "synthesize", "compose"]
+PIPELINE_STAGE_LABELS = {
+    "transcribe": "Transcribe",
+    "translate": "Translate",
+    "synthesize": "Synthesize",
+    "compose": "Compose",
+}
+
+
+class PipelineProgressReporter:
+    def __init__(self, target_console: Console, show_overall: bool) -> None:
+        self.console = target_console
+        self.show_overall = show_overall
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=None),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=target_console,
+        )
+        self._overall_task_id: int | None = None
+        self._stage_task_id: int | None = None
+        self._current_stage: str | None = None
+        self._stage_total: int = 1
+
+    def __enter__(self) -> "PipelineProgressReporter":
+        self._progress.__enter__()
+        if self.show_overall:
+            self._overall_task_id = self._progress.add_task("Pipeline waiting", total=len(PIPELINE_STAGE_ORDER), completed=0)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._remove_stage_task()
+        self._progress.__exit__(exc_type, exc, tb)
+
+    def start_stage(self, stage: str, total: int, message: str) -> None:
+        normalized_total = max(total, 1)
+        self._remove_stage_task()
+        self._current_stage = stage
+        self._stage_total = normalized_total
+        self._stage_task_id = self._progress.add_task(
+            self._stage_description(stage, message),
+            total=normalized_total,
+            completed=0,
+        )
+        if self._overall_task_id is not None:
+            self._progress.update(
+                self._overall_task_id,
+                completed=self._stage_start(stage),
+                description=self._overall_description(stage, message),
+            )
+
+    def update_stage(self, stage: str, completed: int, total: int, message: str) -> None:
+        normalized_total = max(total, 1)
+        normalized_completed = min(max(completed, 0), normalized_total)
+        if self._current_stage != stage or self._stage_task_id is None:
+            self.start_stage(stage, normalized_total, message)
+        self._stage_total = normalized_total
+        if self._stage_task_id is not None:
+            self._progress.update(
+                self._stage_task_id,
+                total=normalized_total,
+                completed=normalized_completed,
+                description=self._stage_description(stage, message),
+            )
+        if self._overall_task_id is not None:
+            self._progress.update(
+                self._overall_task_id,
+                completed=self._stage_start(stage),
+                description=self._overall_description(stage, message),
+            )
+
+    def complete_stage(self, stage: str, summary: str) -> None:
+        if self._stage_task_id is not None:
+            self._progress.update(
+                self._stage_task_id,
+                total=self._stage_total,
+                completed=self._stage_total,
+                description=self._stage_description(stage, "Complete"),
+            )
+        if self._overall_task_id is not None:
+            self._progress.update(
+                self._overall_task_id,
+                completed=self._stage_end(stage),
+                description=self._overall_description(stage, "Complete"),
+            )
+        self.print(summary)
+        self._remove_stage_task()
+
+    def skip_stage(self, stage: str, action: str) -> None:
+        if self._overall_task_id is not None:
+            self._progress.update(
+                self._overall_task_id,
+                completed=self._stage_end(stage),
+                description=self._overall_description(stage, f"Skipped ({action})"),
+            )
+        self.print(f"{stage} skipped ({action})")
+        self._remove_stage_task()
+
+    def fail_stage(self, stage: str, error: str) -> None:
+        self.print(f"{stage} failed: {_truncate(error)}")
+        self._remove_stage_task()
+
+    def print(self, message: str) -> None:
+        self._progress.console.print(message)
+
+    def _remove_stage_task(self) -> None:
+        if self._stage_task_id is None:
+            self._current_stage = None
+            self._stage_total = 1
+            return
+        self._progress.remove_task(self._stage_task_id)
+        self._stage_task_id = None
+        self._current_stage = None
+        self._stage_total = 1
+
+    def _stage_start(self, stage: str) -> int:
+        return PIPELINE_STAGE_ORDER.index(stage)
+
+    def _stage_end(self, stage: str) -> int:
+        return self._stage_start(stage) + 1
+
+    def _stage_description(self, stage: str, message: str) -> str:
+        return f"{PIPELINE_STAGE_LABELS.get(stage, stage.title())}: {message}"
+
+    def _overall_description(self, stage: str, message: str) -> str:
+        if not self.show_overall:
+            return "Pipeline"
+        return f"Pipeline {PIPELINE_STAGE_LABELS.get(stage, stage.title())}: {message}"
+
+
+@app.command("_start", hidden=True)
+def hidden_start(
+    audio: Path = typer.Argument(..., metavar="AUDIO", help="Input podcast audio for a new task."),
+    config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
+    workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+    preview: bool = typer.Option(False, "--preview", help="Run only the first five minutes as a preview task."),
+    min_speakers: int = typer.Option(DEFAULT_MIN_SPEAKERS, "--min_speakers", min=1, help="Minimum speaker count hint for diarization."),
+    max_speakers: int = typer.Option(DEFAULT_MAX_SPEAKERS, "--max_speakers", min=1, help="Maximum speaker count hint for diarization."),
+) -> None:
+    _validate_speaker_bounds(min_speakers, max_speakers)
+    _start_task(audio, config, workdir, preview=preview, min_speakers=min_speakers, max_speakers=max_speakers)
+
+
+@app.command()
+def init(
+    config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
+    workdir: Optional[Path] = typer.Option(None, "--workdir", help="Artifact workdir."),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing config."),
+) -> None:
+    config_path = resolve_config_path(config, workdir)
+    existing_config: AppConfig | None = None
+    if config_path.exists():
+        if force:
+            existing_config = None
+        else:
+            existing_config = load_config(config_path)
+    config_data = _prompt_init_config(existing_config)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(render_config_toml(config_data), encoding="utf-8")
+    resolved_workdir = resolve_workdir(workdir, config_path=config_path)
+    paths = ArtifactPaths.from_task_id(resolved_workdir, "example-run")
+    paths.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    paths.tasks_dir.mkdir(parents=True, exist_ok=True)
+    paths.cache_indexes_dir.mkdir(parents=True, exist_ok=True)
+    console.print(f"[green]Wrote config:[/green] {config_path}")
+    console.print(f"[green]Prepared workdir:[/green] {resolved_workdir}")
+
+
+def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
+    config = existing_config.model_copy(deep=True) if existing_config is not None else AppConfig()
+    console.print("[bold]podtran init[/bold]")
+    console.print("Provider-managed auth. Translation and TTS default to DashScope; leave advanced endpoint overrides for later edits.")
+    console.print(
+        "Before entering your Hugging Face token, accept the model terms at "
+        "https://huggingface.co/pyannote/speaker-diarization-community-1 "
+        "and create a token at https://hf.co/settings/tokens ."
+    )
+    config.hf_token = _prompt_required("Hugging Face token", current_value=config.hf_token)
+    config.providers.dashscope.api_key = _prompt_required(
+        "DashScope API key",
+        hide_input=True,
+        current_value=config.providers.dashscope.api_key,
+    )
+    config.translation.provider = DEFAULT_TRANSLATION_PROVIDER
+    config.translation.model = _prompt_with_default(
+        "Translation model",
+        config.translation.model or DEFAULT_TRANSLATION_MODEL,
+    )
+    config.tts.provider = DEFAULT_TTS_PROVIDER
+    config.tts.model = _prompt_with_default(
+        "TTS model",
+        config.tts.model or DEFAULT_TTS_CLONE_MODEL,
+    )
+    return config
+
+
+def _prompt_required(label: str, *, hide_input: bool = False, current_value: str = "") -> str:
+    while True:
+        prompt_label = label if not current_value.strip() else f"{label} (press Enter to keep existing)"
+        value = typer.prompt(prompt_label, hide_input=hide_input, default="", show_default=False).strip()
+        if value:
+            return value
+        if current_value.strip():
+            return current_value.strip()
+        console.print(f"[yellow]{label} cannot be empty.[/yellow]")
+
+
+def _prompt_with_default(label: str, default: str) -> str:
+    return typer.prompt(label, default=default, show_default=True).strip()
+
+
+@app.command()
+def tasks(
+    config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
+    workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+    limit: int = typer.Option(20, "--limit", min=1, help="Maximum tasks to show."),
+) -> None:
+    _, _, task_store, _, _ = _load_runtime(config, workdir)
+    entries = task_store.list_tasks(limit=limit)
+    if not entries:
+        console.print("[yellow]No tasks found.[/yellow]")
+        return
+
+    table = Table(title="podtran tasks")
+    table.add_column("Task ID")
+    table.add_column("Audio")
+    table.add_column("Mode")
+    table.add_column("Status")
+    table.add_column("Stage")
+    table.add_column("Updated")
+    for item in entries:
+        table.add_row(
+            item.task_id,
+            item.source_audio_name,
+            _task_mode_label(item),
+            item.status,
+            item.current_stage or "-",
+            item.updated_at,
+        )
+    console.print(table)
+
+
+@app.command()
+def status(
+    task: Optional[str] = typer.Argument(None, metavar="TASK", help="Task id or unique prefix."),
+    config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
+    workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+) -> None:
+    cfg, _, task_store, _, _ = _load_runtime(config, workdir)
+    try:
+        task_manifest = task_store.load_task(task) if task else task_store.load_latest_task()
+    except FileNotFoundError:
+        console.print("[yellow]No tasks found.[/yellow]")
+        return
+
+    paths = task_store.paths_for(task_manifest)
+    executor = StageExecutor(task_store, task_manifest, paths)
+    preview_fields = f" mode=preview clip={_preview_window_label(task_manifest)}" if task_manifest.preview else " mode=full"
+    console.print(
+        f"task_id={task_manifest.task_id} audio={task_manifest.source_audio_name}{preview_fields} "
+        f"status={task_manifest.status} stage={task_manifest.current_stage or '-'}"
+    )
+    _print_task_stage_status(task_manifest, cfg, paths, executor)
+
+    if paths.translated_json.exists():
+        segments = read_model_list(paths.translated_json, SegmentRecord)
+        completed = sum(1 for item in segments if item.status == "completed")
+        failed = sum(1 for item in segments if item.status == "failed")
+        translated = sum(1 for item in segments if item.text_zh.strip())
+        console.print(f"segments={len(segments)} translated={translated} completed_tts={completed} failed={failed}")
+    if paths.voices_json.exists():
+        profiles = read_model_list(paths.voices_json, VoiceProfile)
+        cloned = sum(1 for item in profiles if item.status == "completed")
+        failed_profiles = sum(1 for item in profiles if item.status == "failed")
+        console.print(f"voices={len(profiles)} cloned={cloned} failed_voice_profiles={failed_profiles}")
+
+
+@app.command()
+def transcribe(
+    task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
+    config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
+    workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+    min_speakers: int = typer.Option(DEFAULT_MIN_SPEAKERS, "--min_speakers", min=1, help="Minimum speaker count hint for diarization."),
+    max_speakers: int = typer.Option(DEFAULT_MAX_SPEAKERS, "--max_speakers", min=1, help="Maximum speaker count hint for diarization."),
+) -> None:
+    _validate_speaker_bounds(min_speakers, max_speakers)
+    cfg, task_manifest, paths, executor, cache_store, fingerprints = _load_task_context(task, config, workdir)
+    with PipelineProgressReporter(console, show_overall=False) as reporter:
+        _ensure_transcribe(
+            task_manifest,
+            cfg,
+            paths,
+            executor,
+            cache_store,
+            fingerprints,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            reporter=reporter,
+        )
+
+
+@app.command()
+def translate(
+    task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
+    config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
+    workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+) -> None:
+    cfg, task_manifest, paths, executor, cache_store, fingerprints = _load_task_context(task, config, workdir)
+    _require_artifact(paths.transcript_json, "translate", "transcript.json")
+    with PipelineProgressReporter(console, show_overall=False) as reporter:
+        _ensure_translate(task_manifest, cfg, paths, executor, cache_store, fingerprints, reporter=reporter)
+
+
+@app.command()
+def synthesize(
+    task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
+    config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
+    workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+) -> None:
+    cfg, task_manifest, paths, executor, cache_store, fingerprints = _load_task_context(task, config, workdir)
+    _require_artifact(paths.translated_json, "synthesize", "translated.json")
+    with PipelineProgressReporter(console, show_overall=False) as reporter:
+        _ensure_synthesize(task_manifest, cfg, paths, executor, cache_store, fingerprints, reporter=reporter)
+
+
+@app.command()
+def compose(
+    task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
+    config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
+    workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+) -> None:
+    cfg, task_manifest, paths, executor, _, fingerprints = _load_task_context(task, config, workdir)
+    _require_artifact(paths.translated_json, "compose", "translated.json")
+    _require_completed_tts(paths.translated_json)
+    with PipelineProgressReporter(console, show_overall=False) as reporter:
+        _ensure_compose(task_manifest, cfg, paths, executor, fingerprints, reporter=reporter)
+
+
+@cache_app.command("clean")
+def cache_clean(
+    before: Optional[str] = typer.Option(None, "--before", help="Delete cache entries finished before ISO datetime/date."),
+    config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
+    workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+) -> None:
+    _, _, _, cache_store, _ = _load_runtime(config, workdir)
+    cutoff = _parse_before(before) if before else None
+    removed = cache_store.clean(cutoff)
+    console.print(f"[green]Removed cache entries:[/green] {removed}")
+
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    original_argv = sys.argv[:]
+    if _should_dispatch_root_task(argv):
+        sys.argv = [sys.argv[0], "_start", *argv]
+    try:
+        app(standalone_mode=False)
+    finally:
+        sys.argv = original_argv
+
+
+
+def _should_dispatch_root_task(argv: list[str]) -> bool:
+    option_with_value = {"--config", "--workdir", "--min_speakers", "--max_speakers"}
+    boolean_options = {"--preview"}
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"-h", "--help"}:
+            return False
+        if token in option_with_value:
+            index += 2
+            continue
+        if token in boolean_options:
+            index += 1
+            continue
+        if token.startswith("-"):
+            return False
+        return token not in KNOWN_COMMANDS
+    return False
+
+
+
+def _load_runtime(
+    config_path: Optional[Path],
+    workdir_override: Optional[Path],
+) -> tuple[AppConfig, Path, TaskStore, CacheStore, FingerprintService]:
+    resolved_config_path = resolve_config_path(config_path, workdir_override)
+    cfg = load_config(resolved_config_path)
+    workdir = resolve_workdir(workdir_override, config_path=resolved_config_path)
+    artifacts_dir = workdir / "artifacts"
+    cache_dir = artifacts_dir / "cache"
+    cache_indexes_dir = cache_dir / "_indexes"
+    fingerprints = FingerprintService(cache_indexes_dir)
+    task_store = TaskStore(workdir, fingerprints)
+    cache_store = CacheStore(cache_dir)
+    return cfg, workdir, task_store, cache_store, fingerprints
+
+
+
+def _start_task(
+    audio: Path,
+    config_path: Optional[Path],
+    workdir_override: Optional[Path],
+    preview: bool = False,
+    min_speakers: int = DEFAULT_MIN_SPEAKERS,
+    max_speakers: int = DEFAULT_MAX_SPEAKERS,
+) -> None:
+    ensure_audio_file(audio)
+    cfg, _, task_store, cache_store, fingerprints = _load_runtime(config_path, workdir_override)
+    entry_command = _entry_command(audio, preview, min_speakers, max_speakers)
+    if preview:
+        ensure_command(FFMPEG_COMMAND)
+        task_id, source_audio_sha256 = task_store.reserve_task_id(audio)
+        paths = ArtifactPaths.from_task_id(task_store.workdir, task_id)
+        paths.ensure()
+        try:
+            processing_audio = _create_preview_audio(audio.resolve(), cfg, paths)
+            processing_audio_sha256 = fingerprints.hash_audio(processing_audio)
+        except Exception:
+            remove_path(paths.task_dir)
+            raise
+        task_manifest = task_store.create_task_with_processing_audio(
+            audio,
+            cfg,
+            entry_command=entry_command,
+            task_id=task_id,
+            source_audio_sha256=source_audio_sha256,
+            processing_audio=processing_audio,
+            processing_audio_sha256=processing_audio_sha256,
+            preview=True,
+            preview_start_seconds=PREVIEW_START_SECONDS,
+            preview_duration_seconds=PREVIEW_DURATION_SECONDS,
+        )
+    else:
+        task_manifest = task_store.create_task(audio, cfg, entry_command=entry_command)
+    console.print(f"[green]Created task:[/green] {task_manifest.task_id}")
+    _execute_pipeline(task_manifest, cfg, task_store, cache_store, fingerprints, min_speakers=min_speakers, max_speakers=max_speakers)
+
+
+
+def _create_preview_audio(audio: Path, cfg: AppConfig, paths: ArtifactPaths) -> Path:
+    remove_path(paths.preview_audio_path)
+    return extract_audio_chunk(
+        FFMPEG_COMMAND,
+        audio,
+        paths.preview_audio_path,
+        PREVIEW_START_SECONDS,
+        PREVIEW_START_SECONDS + PREVIEW_DURATION_SECONDS,
+    )
+
+
+
+def _entry_command(audio: Path, preview: bool, min_speakers: int, max_speakers: int) -> str:
+    preview_flag = " --preview" if preview else ""
+    speaker_flags = ""
+    if min_speakers != DEFAULT_MIN_SPEAKERS:
+        speaker_flags += f" --min_speakers {min_speakers}"
+    if max_speakers != DEFAULT_MAX_SPEAKERS:
+        speaker_flags += f" --max_speakers {max_speakers}"
+    return f"podtran{preview_flag}{speaker_flags} {audio}"
+
+
+
+def _load_task_context(
+    task: str,
+    config_path: Optional[Path],
+    workdir_override: Optional[Path],
+) -> tuple[AppConfig, TaskManifest, ArtifactPaths, StageExecutor, CacheStore, FingerprintService]:
+    cfg, _, task_store, cache_store, fingerprints = _load_runtime(config_path, workdir_override)
+    task_manifest = task_store.load_task(task)
+    paths = task_store.paths_for(task_manifest)
+    paths.ensure()
+    executor = StageExecutor(task_store, task_manifest, paths)
+    return cfg, task_manifest, paths, executor, cache_store, fingerprints
+
+
+
+def _execute_pipeline(
+    task_manifest: TaskManifest,
+    cfg: AppConfig,
+    task_store: TaskStore,
+    cache_store: CacheStore,
+    fingerprints: FingerprintService,
+    min_speakers: int = DEFAULT_MIN_SPEAKERS,
+    max_speakers: int = DEFAULT_MAX_SPEAKERS,
+) -> list[StageDecision]:
+    paths = task_store.paths_for(task_manifest)
+    paths.ensure()
+    executor = StageExecutor(task_store, task_manifest, paths)
+    decisions: list[StageDecision] = []
+
+    with PipelineProgressReporter(console, show_overall=True) as reporter:
+        decisions.append(
+            _ensure_transcribe(
+                task_manifest,
+                cfg,
+                paths,
+                executor,
+                cache_store,
+                fingerprints,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                reporter=reporter,
+            )
+        )
+        decisions.append(_ensure_translate(task_manifest, cfg, paths, executor, cache_store, fingerprints, reporter=reporter))
+        decisions.append(_ensure_synthesize(task_manifest, cfg, paths, executor, cache_store, fingerprints, reporter=reporter))
+        decisions.append(_ensure_compose(task_manifest, cfg, paths, executor, fingerprints, reporter=reporter))
+    console.print(f"[green]Task complete:[/green] {task_manifest.task_id}")
+    final_output_path = _compose_output_path(task_manifest, cfg, paths)
+    if final_output_path.exists():
+        console.print(f"[green]Output file:[/green] {final_output_path.resolve()}")
+    return decisions
+
+
+
+def _print_task_stage_status(
+    task_manifest: TaskManifest,
+    cfg: AppConfig,
+    paths: ArtifactPaths,
+    executor: StageExecutor,
+) -> None:
+    stage_specs = [
+        ("transcribe", {"transcript_json": "transcript.json"}),
+        ("translate", {"segments_json": "segments.json", "translated_json": "translated.json"}),
+        ("synthesize", _synthesize_output_refs(cfg)),
+        ("compose", _compose_output_refs(task_manifest, cfg)),
+    ]
+
+    table = Table(title="podtran status")
+    table.add_column("Stage")
+    table.add_column("Status")
+    table.add_column("Outputs")
+    table.add_column("Error")
+    for stage, output_refs in stage_specs:
+        manifest = executor.load_manifest(stage)
+        stage_status = manifest.status if manifest else "pending"
+        outputs_present = "yes" if output_refs_exist(paths.task_dir, output_refs) else "no"
+        error = _truncate(manifest.error) if manifest and manifest.error else "-"
+        table.add_row(stage, stage_status, outputs_present, error)
+    console.print(table)
+
+
+
+def _require_artifact(path: Path, stage_name: str, artifact_name: str) -> None:
+    if path.exists():
+        return
+    _abort(f"Cannot run {stage_name}: missing {artifact_name}.")
+
+
+
+def _require_completed_tts(translated_json: Path) -> None:
+    segments = read_model_list(translated_json, SegmentRecord)
+    has_completed_audio = any(
+        item.status == "completed" and item.tts_audio_path.strip() and Path(item.tts_audio_path).exists()
+        for item in segments
+    )
+    if has_completed_audio:
+        return
+    _abort("Cannot run compose: no completed synthesized audio found.")
+
+
+
+def _abort(message: str) -> None:
+    console.print(f"[red]{message}[/red]")
+    raise typer.Exit(code=1)
+
+
+
+def _validate_speaker_bounds(min_speakers: int, max_speakers: int) -> None:
+    if min_speakers > max_speakers:
+        raise typer.BadParameter("--min_speakers cannot be greater than --max_speakers.")
+
+
+
+def _transcribe_config_fingerprint(
+    fingerprints: FingerprintService,
+    cfg: AppConfig,
+    min_speakers: int,
+    max_speakers: int,
+) -> str:
+    return fingerprints.hash_value(
+        {
+            "config": fingerprints.config_subset(cfg, TRANSCRIBE_CONFIG_KEYS),
+            "runtime": {
+                "min_speakers": min_speakers,
+                "max_speakers": max_speakers,
+            },
+        }
+    )
+
+
+
+def _ensure_transcribe(
+    task_manifest: TaskManifest,
+    cfg: AppConfig,
+    paths: ArtifactPaths,
+    executor: StageExecutor,
+    cache_store: CacheStore,
+    fingerprints: FingerprintService,
+    min_speakers: int = DEFAULT_MIN_SPEAKERS,
+    max_speakers: int = DEFAULT_MAX_SPEAKERS,
+    reporter: PipelineProgressReporter | None = None,
+) -> StageDecision:
+    from podtran.asr import transcription_stage_count
+
+    audio = Path(task_manifest.processing_audio_path)
+    input_fingerprints = {"audio": task_manifest.processing_audio_sha256}
+    config_fingerprint = _transcribe_config_fingerprint(fingerprints, cfg, min_speakers, max_speakers)
+    output_refs = {"transcript_json": "transcript.json"}
+    cache_key = fingerprints.build_stage_cache_key("transcribe", TRANSCRIBE_STAGE_VERSION, input_fingerprints, config_fingerprint)
+    current, reason = executor.is_current("transcribe", input_fingerprints, config_fingerprint, output_refs)
+    manifest = _build_stage_manifest(
+        "transcribe",
+        TRANSCRIBE_STAGE_VERSION,
+        cache_key,
+        input_fingerprints,
+        config_fingerprint,
+        [*TRANSCRIBE_CONFIG_KEYS, "runtime.min_speakers", "runtime.max_speakers"],
+        output_refs,
+    )
+    if current:
+        if reporter is not None:
+            reporter.skip_stage("transcribe", "up-to-date")
+        return StageDecision("transcribe", "up-to-date", "task outputs current")
+
+    entry = cache_store.lookup("transcribe", cache_key)
+    if entry is not None:
+        cache_store.restore(entry, {"transcript_json": paths.transcript_json})
+        executor.save_completed(manifest)
+        if reporter is not None:
+            reporter.skip_stage("transcribe", "cache hit")
+        return StageDecision("transcribe", "cache hit", reason or "cache available")
+
+    executor.start(manifest)
+    try:
+        ensure_command(FFMPEG_COMMAND)
+        ensure_hf_token(cfg.hf_token)
+        if reporter is not None:
+            reporter.start_stage("transcribe", transcription_stage_count(), "Loading audio")
+        transcript = _run_transcription_with_progress(
+            audio,
+            cfg,
+            min_speakers,
+            max_speakers,
+            progress_callback=(lambda completed, total_steps, message: reporter.update_stage("transcribe", completed, total_steps, message)) if reporter is not None else None,
+        )
+        write_json(paths.transcript_json, transcript)
+        executor.complete(manifest)
+        cache_store.publish("transcribe", cache_key, {"transcript_json": paths.transcript_json}, manifest)
+        _release_memory()
+        if reporter is not None:
+            reporter.complete_stage("transcribe", f"transcribe done: {len(transcript)} transcript segments")
+        return StageDecision("transcribe", "run", reason or "cache miss")
+    except Exception as exc:
+        if reporter is not None:
+            reporter.fail_stage("transcribe", str(exc))
+        executor.fail(manifest, exc)
+        raise
+
+
+
+def _write_segments(paths: ArtifactPaths, cfg: AppConfig) -> list[SegmentRecord]:
+    transcript = read_model_list(paths.transcript_json, TranscriptSegment)
+    merged = _build_segments_from_transcript(transcript, cfg)
+    write_json(paths.segments_json, merged)
+    return merged
+
+
+
+def _build_segments_from_transcript(transcript: list[TranscriptSegment], cfg: AppConfig) -> list[SegmentRecord]:
+    return merge_transcript_segments(
+        transcript,
+        pause_threshold=cfg.compose.block_pause_threshold,
+        max_block_duration=cfg.compose.max_block_duration,
+        configured_voice_map=cfg.tts.voice_map,
+        fallback_voices=cfg.tts.fallback_voices,
+    )
+
+
+
+def _ensure_translate(
+    task_manifest: TaskManifest,
+    cfg: AppConfig,
+    paths: ArtifactPaths,
+    executor: StageExecutor,
+    cache_store: CacheStore,
+    fingerprints: FingerprintService,
+    reporter: PipelineProgressReporter | None = None,
+) -> StageDecision:
+    from podtran.translate import Translator
+
+    _ = task_manifest
+    segments = _write_segments(paths, cfg)
+    input_fingerprints = {"segments_json": fingerprints.hash_json(segments)}
+    config_fingerprint = fingerprints.hash_config_subset(cfg, TRANSLATE_CONFIG_KEYS)
+    output_refs = {"translated_json": "translated.json", "segments_json": "segments.json"}
+    cache_key = fingerprints.build_stage_cache_key("translate", TRANSLATE_STAGE_VERSION, input_fingerprints, config_fingerprint)
+    current, reason = executor.is_current("translate", input_fingerprints, config_fingerprint, output_refs)
+    manifest = _build_stage_manifest("translate", TRANSLATE_STAGE_VERSION, cache_key, input_fingerprints, config_fingerprint, TRANSLATE_CONFIG_KEYS, output_refs)
+    if current:
+        if reporter is not None:
+            reporter.skip_stage("translate", "up-to-date")
+        return StageDecision("translate", "up-to-date", "task outputs current")
+
+    entry = cache_store.lookup("translate", cache_key)
+    if entry is not None:
+        cache_store.restore(entry, {"translated_json": paths.translated_json})
+        executor.save_completed(manifest)
+        if reporter is not None:
+            reporter.skip_stage("translate", "cache hit")
+        return StageDecision("translate", "cache hit", reason or "cache available")
+
+    executor.start(manifest)
+    try:
+        if reporter is not None:
+            reporter.start_stage("translate", max(len(segments), 1), "Preparing segments")
+        remove_path(paths.translated_json)
+        translated = Translator(cfg).translate_segments(
+            paths.segments_json,
+            paths.translated_json,
+            progress_callback=(lambda completed, total_steps, message: reporter.update_stage("translate", completed, total_steps, message)) if reporter is not None else None,
+        )
+        translated_count = sum(1 for item in translated if item.text_zh.strip())
+        if translated_count == 0:
+            _print_stage_failure_summary("translate", translated)
+            raise RuntimeError("All translations failed.")
+        write_json(paths.translated_json, translated)
+        _print_stage_failure_summary("translate", translated)
+        executor.complete(manifest)
+        cache_store.publish("translate", cache_key, {"translated_json": paths.translated_json}, manifest)
+        if reporter is not None:
+            reporter.complete_stage("translate", _translate_stage_summary(translated))
+        return StageDecision("translate", "run", reason or "cache miss")
+    except Exception as exc:
+        if reporter is not None:
+            reporter.fail_stage("translate", str(exc))
+        executor.fail(manifest, exc)
+        raise
+
+
+
+def _ensure_synthesize(
+    task_manifest: TaskManifest,
+    cfg: AppConfig,
+    paths: ArtifactPaths,
+    executor: StageExecutor,
+    cache_store: CacheStore,
+    fingerprints: FingerprintService,
+    reporter: PipelineProgressReporter | None = None,
+) -> StageDecision:
+    from podtran.tts import synthesize_segments
+
+    translation_input = _synthesize_input_segments(paths)
+    input_fingerprints = {"translated_json": fingerprints.hash_json(translation_input)}
+    config_fingerprint = fingerprints.hash_config_subset(cfg, SYNTHESIZE_CONFIG_KEYS)
+    output_refs = _synthesize_output_refs(cfg)
+    cache_key = fingerprints.build_stage_cache_key("synthesize", SYNTHESIZE_STAGE_VERSION, input_fingerprints, config_fingerprint)
+    current, reason = executor.is_current("synthesize", input_fingerprints, config_fingerprint, output_refs)
+    manifest = _build_stage_manifest("synthesize", SYNTHESIZE_STAGE_VERSION, cache_key, input_fingerprints, config_fingerprint, SYNTHESIZE_CONFIG_KEYS, output_refs)
+    if current:
+        if reporter is not None:
+            reporter.skip_stage("synthesize", "up-to-date")
+        return StageDecision("synthesize", "up-to-date", "task outputs current")
+
+    executor.start(manifest)
+    try:
+        ensure_command(FFMPEG_COMMAND)
+        ensure_command(FFPROBE_COMMAND)
+        if reporter is not None:
+            reporter.start_stage("synthesize", 1, "Resolving voices")
+        remove_path(paths.tts_dir)
+        remove_path(paths.refs_dir)
+        remove_path(paths.voices_json)
+        paths.tts_dir.mkdir(parents=True, exist_ok=True)
+        paths.refs_dir.mkdir(parents=True, exist_ok=True)
+        segments = translation_input
+        write_json(paths.translated_json, segments)
+        synthesized = synthesize_segments(
+            paths.translated_json,
+            paths.translated_json,
+            cfg,
+            paths,
+            source_audio=Path(task_manifest.processing_audio_path),
+            source_audio_fingerprint=task_manifest.processing_audio_sha256,
+            cache_store=cache_store,
+            fingerprints=fingerprints,
+            progress_callback=(lambda completed, total_steps, message: reporter.update_stage("synthesize", completed, total_steps, message)) if reporter is not None else None,
+        )
+        synthesized_count = sum(1 for item in synthesized if item.status == "completed")
+        if synthesized_count == 0:
+            _print_stage_failure_summary("tts", synthesized)
+            raise RuntimeError("No synthesized audio was produced.")
+        write_json(paths.translated_json, synthesized)
+        _print_stage_failure_summary("tts", synthesized)
+        executor.complete(manifest)
+        if reporter is not None:
+            reporter.complete_stage("synthesize", _synthesize_stage_summary(synthesized))
+        return StageDecision("synthesize", "run", reason or "stage needs execution")
+    except Exception as exc:
+        if reporter is not None:
+            reporter.fail_stage("synthesize", str(exc))
+        executor.fail(manifest, exc)
+        raise
+
+
+
+def _ensure_compose(
+    task_manifest: TaskManifest,
+    cfg: AppConfig,
+    paths: ArtifactPaths,
+    executor: StageExecutor,
+    fingerprints: FingerprintService,
+    reporter: PipelineProgressReporter | None = None,
+) -> StageDecision:
+    audio = Path(task_manifest.processing_audio_path)
+    output_refs = _compose_output_refs(task_manifest, cfg)
+    input_fingerprints = {
+        "source_audio": task_manifest.processing_audio_sha256,
+        "translated_json": fingerprints.hash_json(paths.translated_json),
+    }
+    config_fingerprint = fingerprints.hash_config_subset(cfg, COMPOSE_CONFIG_KEYS)
+    cache_key = fingerprints.build_stage_cache_key("compose", COMPOSE_STAGE_VERSION, input_fingerprints, config_fingerprint)
+    current, reason = executor.is_current("compose", input_fingerprints, config_fingerprint, output_refs)
+    manifest = _build_stage_manifest("compose", COMPOSE_STAGE_VERSION, cache_key, input_fingerprints, config_fingerprint, COMPOSE_CONFIG_KEYS, output_refs)
+    if current:
+        if reporter is not None:
+            reporter.skip_stage("compose", "up-to-date")
+        return StageDecision("compose", "up-to-date", "task outputs current")
+
+    executor.start(manifest)
+    try:
+        ensure_command(FFMPEG_COMMAND)
+        ensure_command(FFPROBE_COMMAND)
+        segments = read_model_list(paths.translated_json, SegmentRecord)
+        selected_mode = cfg.compose.mode
+        output_path = _compose_output_path(task_manifest, cfg, paths)
+        if reporter is not None:
+            reporter.start_stage("compose", 1, "Scanning segments")
+        compose_output(
+            audio,
+            segments,
+            cfg,
+            paths.temp_dir / f"compose_{_compose_output_suffix(cfg)}",
+            output_path,
+            selected_mode,
+            progress_callback=(lambda completed, total_steps, message: reporter.update_stage("compose", completed, total_steps, message)) if reporter is not None else None,
+        )
+        executor.complete(manifest)
+        if reporter is not None:
+            reporter.complete_stage("compose", f"compose done: {output_path.name}")
+        return StageDecision("compose", "run", reason or "stage needs execution")
+    except Exception as exc:
+        if reporter is not None:
+            reporter.fail_stage("compose", str(exc))
+        executor.fail(manifest, exc)
+        raise
+
+
+
+def _build_stage_manifest(
+    stage: str,
+    stage_version: int,
+    cache_key: str,
+    input_fingerprints: dict[str, str],
+    config_fingerprint: str,
+    config_keys: list[str],
+    output_refs: dict[str, str],
+) -> StageManifest:
+    return StageManifest(
+        stage=stage,
+        status="pending",
+        stage_version=stage_version,
+        cache_key=cache_key,
+        input_fingerprints=input_fingerprints,
+        config_fingerprint=config_fingerprint,
+        config_keys=config_keys,
+        output_refs=output_refs,
+    )
+
+
+
+def _synthesize_output_refs(cfg: AppConfig) -> dict[str, str]:
+    refs = {
+        "translated_json": "translated.json",
+        "tts_dir": "tts",
+        "refs_dir": "refs",
+    }
+    if cfg.tts.voice_mode.strip().lower() == "clone":
+        refs["voices_json"] = "voices.json"
+    return refs
+
+
+
+def _compose_output_refs(task_manifest: TaskManifest, cfg: AppConfig) -> dict[str, str]:
+    return {"final_output": f"final/{_compose_output_filename(task_manifest, _compose_output_suffix(cfg))}"}
+
+
+
+def _compose_output_filename(task_manifest: TaskManifest, suffix: str) -> str:
+    stem = Path(task_manifest.source_audio_name).stem
+    if task_manifest.preview:
+        stem = f"{stem}.preview"
+    return f"{stem}.{suffix}.mp3"
+
+
+
+def _compose_output_path(task_manifest: TaskManifest, cfg: AppConfig, paths: ArtifactPaths) -> Path:
+    return paths.final_dir / _compose_output_filename(task_manifest, _compose_output_suffix(cfg))
+
+
+
+def _compose_output_suffix(cfg: AppConfig) -> str:
+    return "replace" if cfg.compose.mode.lower() == "replace" else "interleave"
+
+
+
+def _task_mode_label(task_manifest: TaskManifest) -> str:
+    if not task_manifest.preview:
+        return "full"
+    return f"preview {_preview_window_label(task_manifest)}"
+
+
+
+def _preview_window_label(task_manifest: TaskManifest) -> str:
+    start = f"{task_manifest.preview_start_seconds:g}"
+    end = f"{task_manifest.preview_start_seconds + task_manifest.preview_duration_seconds:g}"
+    return f"{start}-{end}s"
+
+
+
+def _reset_tts_state(segments: list[SegmentRecord]) -> list[SegmentRecord]:
+    reset: list[SegmentRecord] = []
+    for item in segments:
+        reset.append(
+            item.model_copy(
+                update={
+                    "tts_audio_path": "",
+                    "tts_duration_ms": 0,
+                    "status": "pending",
+                    "error": None,
+                }
+            )
+        )
+    return reset
+
+
+def _synthesize_input_segments(paths: ArtifactPaths) -> list[SegmentRecord]:
+    return _reset_tts_state(read_model_list(paths.translated_json, SegmentRecord))
+
+
+
+def _run_transcription_with_progress(
+    audio: Path,
+    cfg: AppConfig,
+    min_speakers: int = DEFAULT_MIN_SPEAKERS,
+    max_speakers: int = DEFAULT_MAX_SPEAKERS,
+    progress_callback=None,
+) -> list[TranscriptSegment]:
+    from podtran.asr import transcribe_audio
+
+    return transcribe_audio(
+        audio,
+        cfg.asr,
+        cfg.hf_token,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        progress_callback=progress_callback,
+    )
+
+
+
+def _release_memory() -> None:
+    gc.collect()
+
+
+
+def _translate_stage_summary(segments: list[SegmentRecord]) -> str:
+    translated = sum(1 for item in segments if item.text_zh.strip())
+    failed = sum(1 for item in segments if item.error)
+    return f"translate done: {translated}/{len(segments)} translated, {failed} failed"
+
+
+
+def _synthesize_stage_summary(segments: list[SegmentRecord]) -> str:
+    completed = sum(1 for item in segments if item.status == "completed")
+    failed = sum(1 for item in segments if item.status == "failed")
+    return f"synthesize done: {completed}/{len(segments)} audio ready, {failed} failed"
+
+
+
+def _print_stage_failure_summary(stage: str, segments: list[SegmentRecord], limit: int = 3) -> None:
+    failures = [item for item in segments if item.error]
+    if not failures:
+        return
+
+    unique_messages: list[str] = []
+    seen: set[str] = set()
+    for item in failures:
+        message = item.error or "Unknown error"
+        if message in seen:
+            continue
+        seen.add(message)
+        unique_messages.append(message)
+
+    console.print(f"[yellow]{stage} failures:[/yellow] {len(failures)} segment(s)")
+    for message in unique_messages[:limit]:
+        console.print(f"[yellow]-[/yellow] {_truncate(message)}")
+    if len(unique_messages) > limit:
+        console.print(f"[yellow]-[/yellow] ... {len(unique_messages) - limit} more unique error(s)")
+
+
+
+def _truncate(text: str, limit: int = 220) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+
+def _parse_before(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        parsed = datetime.fromisoformat(f"{value}T00:00:00")
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+
+
+
+
+
+
+

@@ -744,6 +744,49 @@ def _build_segments_from_transcript(transcript: list[TranscriptSegment], cfg: Ap
     )
 
 
+def _translate_input_fingerprint(fingerprints: FingerprintService, segments: list[SegmentRecord]) -> str:
+    return fingerprints.hash_value(
+        [
+            {
+                "segment_id": item.segment_id,
+                "block_id": item.block_id,
+                "start": item.start,
+                "end": item.end,
+                "text": item.text,
+                "speaker": item.speaker,
+                "words": [word.model_dump() for word in item.words],
+            }
+            for item in segments
+        ]
+    )
+
+
+def _sync_translated_output(paths: ArtifactPaths, segments: list[SegmentRecord]) -> None:
+    if not paths.translated_json.exists():
+        return
+
+    existing = read_model_list(paths.translated_json, SegmentRecord)
+    translated_by_id = {item.segment_id: item for item in existing}
+    synced = [
+        segment.model_copy(
+            update={
+                "text_zh": previous.text_zh,
+                "tts_audio_path": previous.tts_audio_path,
+                "tts_duration_ms": previous.tts_duration_ms,
+                "status": previous.status,
+                "error": previous.error,
+            }
+        )
+        if (previous := translated_by_id.get(segment.segment_id)) is not None
+        else segment
+        for segment in segments
+    ]
+
+    if [item.model_dump() for item in existing] == [item.model_dump() for item in synced]:
+        return
+    write_json(paths.translated_json, synced)
+
+
 
 def _ensure_translate(
     task_manifest: TaskManifest,
@@ -758,13 +801,14 @@ def _ensure_translate(
 
     _ = task_manifest
     segments = _write_segments(paths, cfg)
-    input_fingerprints = {"segments_json": fingerprints.hash_json(segments)}
+    input_fingerprints = {"segments_json": _translate_input_fingerprint(fingerprints, segments)}
     config_fingerprint = fingerprints.hash_config_subset(cfg, TRANSLATE_CONFIG_KEYS)
     output_refs = {"translated_json": "translated.json", "segments_json": "segments.json"}
     cache_key = fingerprints.build_stage_cache_key("translate", TRANSLATE_STAGE_VERSION, input_fingerprints, config_fingerprint)
     current, reason = executor.is_current("translate", input_fingerprints, config_fingerprint, output_refs)
     manifest = _build_stage_manifest("translate", TRANSLATE_STAGE_VERSION, cache_key, input_fingerprints, config_fingerprint, TRANSLATE_CONFIG_KEYS, output_refs)
     if current:
+        _sync_translated_output(paths, segments)
         if reporter is not None:
             reporter.skip_stage("translate", "up-to-date")
         return StageDecision("translate", "up-to-date", "task outputs current")
@@ -772,6 +816,7 @@ def _ensure_translate(
     entry = cache_store.lookup("translate", cache_key)
     if entry is not None:
         cache_store.restore(entry, {"translated_json": paths.translated_json})
+        _sync_translated_output(paths, segments)
         executor.save_completed(manifest)
         if reporter is not None:
             reporter.skip_stage("translate", "cache hit")

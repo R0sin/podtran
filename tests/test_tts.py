@@ -133,6 +133,42 @@ def test_synthesize_segments_reuses_shared_tts_cache(tmp_path: Path, monkeypatch
 
 
 
+def test_synthesize_segments_does_not_reuse_shared_tts_cache_when_preset_voice_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    first_paths = _paths(tmp_path, "task-1")
+    second_paths = _paths(tmp_path, "task-2")
+    first_paths.ensure()
+    second_paths.ensure()
+    write_json(first_paths.translated_json, [_segment()])
+    write_json(second_paths.translated_json, [_segment().model_copy(update={"voice": "Serena"})])
+
+    config = AppConfig(tts=TTSConfig(voice_mode="preset"))
+    cache_store = CacheStore(first_paths.cache_dir)
+    fingerprints = FingerprintService(first_paths.cache_indexes_dir)
+    backend = _DummyBackend()
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesize_segments(
+        first_paths.translated_json,
+        first_paths.translated_json,
+        config,
+        first_paths,
+        cache_store=cache_store,
+        fingerprints=fingerprints,
+    )
+    synthesize_segments(
+        second_paths.translated_json,
+        second_paths.translated_json,
+        config,
+        second_paths,
+        cache_store=cache_store,
+        fingerprints=fingerprints,
+    )
+
+    assert backend.calls == 2
+
+
 def test_synthesize_segments_reports_progress_for_preset_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     paths = _paths(tmp_path)
     paths.ensure()

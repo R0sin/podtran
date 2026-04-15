@@ -6,11 +6,11 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 import podtran.cli as cli
-from podtran.artifacts import read_model, write_json
+from podtran.artifacts import read_model, read_model_list, write_json
 from podtran.cache_store import CacheStore
 from podtran.config import AppConfig, load_config, write_default_config
 from podtran.fingerprints import FingerprintService
-from podtran.models import SegmentRecord, StageManifest, TaskManifest
+from podtran.models import SegmentRecord, StageManifest, TaskManifest, TranscriptSegment
 from podtran.stage_executor import StageExecutor
 from podtran.tasks import TaskStore
 
@@ -330,6 +330,67 @@ def test_translate_requires_transcript_json(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "Cannot run translate: missing transcript.json." in result.output
+
+
+def test_translate_shared_cache_ignores_voice_map_and_syncs_current_voice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import podtran.translate as translate_module
+
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+
+    first_cfg = AppConfig()
+    first_cfg.tts.voice_mode = "preset"
+    first_cfg.tts.voice_map = {"SPEAKER_00": "Cherry"}
+
+    second_cfg = first_cfg.model_copy(deep=True)
+    second_cfg.tts.voice_map = {"SPEAKER_00": "Serena"}
+
+    first_task = store.create_task(audio, first_cfg, f"podtran {audio}")
+    second_task = store.create_task(audio, second_cfg, f"podtran {audio}")
+    first_paths = store.paths_for(first_task)
+    second_paths = store.paths_for(second_task)
+    transcript = [
+        TranscriptSegment(
+            segment_id="ts_1",
+            start=0.0,
+            end=1.0,
+            text="hello world",
+            speaker="SPEAKER_00",
+        )
+    ]
+    write_json(first_paths.transcript_json, transcript)
+    write_json(second_paths.transcript_json, transcript)
+
+    class FakeTranslator:
+        calls = 0
+
+        def __init__(self, config: AppConfig) -> None:
+            self.config = config
+
+        def translate_segments(self, input_path: Path, output_path: Path, progress_callback=None) -> list[SegmentRecord]:
+            FakeTranslator.calls += 1
+            segments = read_model_list(input_path, SegmentRecord)
+            translated = [segment.model_copy(update={"text_zh": f"zh-{segment.segment_id}"}) for segment in segments]
+            write_json(output_path, translated)
+            return translated
+
+    monkeypatch.setattr(translate_module, "Translator", FakeTranslator)
+
+    first_executor = StageExecutor(store, first_task, first_paths)
+    second_executor = StageExecutor(store, second_task, second_paths)
+
+    first_result = cli._ensure_translate(first_task, first_cfg, first_paths, first_executor, cache_store, fingerprints)
+    second_result = cli._ensure_translate(second_task, second_cfg, second_paths, second_executor, cache_store, fingerprints)
+    restored = read_model_list(second_paths.translated_json, SegmentRecord)
+
+    assert first_result.action == "run"
+    assert second_result.action == "cache hit"
+    assert FakeTranslator.calls == 1
+    assert restored[0].text_zh == "zh-seg_00000"
+    assert restored[0].voice == "Serena"
 
 
 def test_preview_transcribe_uses_processing_audio(tmp_path: Path, monkeypatch) -> None:

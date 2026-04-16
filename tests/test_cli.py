@@ -160,7 +160,7 @@ def test_init_prompts_for_provider_managed_config_and_writes_defaults(tmp_path: 
     assert config.hf_token == "hf-token"
     assert config.providers.dashscope.api_key == "dash-key"
     assert config.translation.provider == "dashscope"
-    assert config.translation.model == "qwen3.5-flash"
+    assert config.translation.model == "qwen-flash"
     assert config.tts.provider == "dashscope"
     assert config.tts.model == "qwen3-tts-vc-2026-01-22"
     assert (tmp_path / "artifacts").exists()

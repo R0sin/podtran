@@ -13,7 +13,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 DEFAULT_TRANSLATION_PROVIDER = "dashscope"
 DEFAULT_TRANSLATION_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DEFAULT_TRANSLATION_MODEL = "qwen3.5-flash"
+DEFAULT_TRANSLATION_MODEL = "qwen-flash"
 DEFAULT_TTS_PROVIDER = "dashscope"
 DEFAULT_TTS_PRESET_MODEL = "qwen3-tts-flash"
 DEFAULT_TTS_CLONE_MODEL = "qwen3-tts-vc-2026-01-22"
@@ -43,7 +43,7 @@ class TranslationConfig(BaseModel):
     model: str = DEFAULT_TRANSLATION_MODEL
     timeout_seconds: int = 120
     batch_size: int = 8
-    max_concurrency: int = 2
+    max_concurrency: int = 4
 
     def resolved_base_url(self) -> str:
         base_url = self.base_url.strip().rstrip("/")

@@ -66,6 +66,7 @@ class TTSConfig(BaseModel):
     fallback_voices: list[str] = Field(default_factory=lambda: ["Cherry", "Serena", "Ethan", "Chelsie"])
     language_type: str = "Chinese"
     timeout_seconds: int = 120
+    max_concurrency: int = 4
     clone_min_ref_seconds: int = 10
     clone_max_ref_seconds: int = 20
     customization_url: str = ""
@@ -205,6 +206,8 @@ def render_config_toml(config: AppConfig) -> str:
         f'enrollment_model = "{config.tts.enrollment_model}"',
         f'language_type = "{config.tts.language_type}"',
         f"timeout_seconds = {config.tts.timeout_seconds}",
+        "# Segment-level synthesis concurrency. Lower this if your TTS provider rate-limits aggressively.",
+        f"max_concurrency = {config.tts.max_concurrency}",
         f"clone_min_ref_seconds = {config.tts.clone_min_ref_seconds}",
         f"clone_max_ref_seconds = {config.tts.clone_max_ref_seconds}",
         f'customization_url = "{config.tts.customization_url}"',

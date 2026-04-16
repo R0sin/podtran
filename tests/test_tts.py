@@ -1,4 +1,6 @@
 from pathlib import Path
+import threading
+import time
 
 import pytest
 
@@ -19,6 +21,30 @@ class _DummyBackend:
         output_path.write_bytes(b"wav")
 
 
+class _TrackingBackend:
+    def __init__(self, *, fail_texts: set[str] | None = None, sleep_seconds: float = 0.05) -> None:
+        self.calls = 0
+        self.active_calls = 0
+        self.max_active_calls = 0
+        self.fail_texts = fail_texts or set()
+        self.sleep_seconds = sleep_seconds
+        self._lock = threading.Lock()
+
+    def synthesize(self, text: str, target: ResolvedVoiceTarget, output_path: Path) -> None:
+        with self._lock:
+            self.calls += 1
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            time.sleep(self.sleep_seconds)
+            if text in self.fail_texts:
+                raise RuntimeError(f"boom: {text}")
+            output_path.write_bytes(text.encode("utf-8"))
+        finally:
+            with self._lock:
+                self.active_calls -= 1
+
+
 
 def _paths(tmp_path: Path, task_id: str = "task-1") -> ArtifactPaths:
     return ArtifactPaths.from_task_id(tmp_path, task_id)
@@ -36,6 +62,10 @@ def _segment() -> SegmentRecord:
         voice="Cherry",
         text_zh="你好",
     )
+
+
+def _segment_with_text(segment_id: str, text_zh: str, voice: str = "Cherry") -> SegmentRecord:
+    return _segment().model_copy(update={"segment_id": segment_id, "block_id": f"block_{segment_id}", "text_zh": text_zh, "voice": voice})
 
 
 
@@ -191,3 +221,108 @@ def test_synthesize_segments_reports_progress_for_preset_mode(tmp_path: Path, mo
     assert events[1][2] == "Using preset voices"
     assert events[-1][2] == "Synthesis complete"
     assert events[-1][0] == events[-1][1]
+
+
+def test_synthesize_segments_runs_distinct_work_items_concurrently(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "你好一"),
+        _segment_with_text("seg_2", "你好二"),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _TrackingBackend()
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(tts=TTSConfig(voice_mode="preset", max_concurrency=2)),
+        paths,
+    )
+
+    synthesized = read_model_list(paths.translated_json, SegmentRecord)
+    assert backend.calls == 2
+    assert backend.max_active_calls >= 2
+    assert all(item.status == "completed" for item in synthesized)
+
+
+def test_synthesize_segments_deduplicates_identical_work_items(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "重复文本"),
+        _segment_with_text("seg_2", "重复文本"),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _TrackingBackend(sleep_seconds=0.01)
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(tts=TTSConfig(voice_mode="preset", max_concurrency=4)),
+        paths,
+    )
+
+    synthesized = read_model_list(paths.translated_json, SegmentRecord)
+    assert backend.calls == 1
+    assert synthesized[0].status == "completed"
+    assert synthesized[1].status == "completed"
+    assert synthesized[0].tts_audio_path != synthesized[1].tts_audio_path
+    assert Path(synthesized[0].tts_audio_path).exists()
+    assert Path(synthesized[1].tts_audio_path).exists()
+
+
+def test_synthesize_segments_isolates_worker_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "good"),
+        _segment_with_text("seg_2", "bad"),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _TrackingBackend(fail_texts={"bad"}, sleep_seconds=0.01)
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesized = synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(tts=TTSConfig(voice_mode="preset", max_concurrency=2)),
+        paths,
+    )
+
+    assert backend.calls == 2
+    assert synthesized[0].status == "completed"
+    assert synthesized[1].status == "failed"
+    assert synthesized[1].error == "boom: bad"
+
+
+def test_synthesize_segments_respects_max_concurrency_of_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "你好一"),
+        _segment_with_text("seg_2", "你好二"),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _TrackingBackend()
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(tts=TTSConfig(voice_mode="preset", max_concurrency=1)),
+        paths,
+    )
+
+    assert backend.calls == 2
+    assert backend.max_active_calls == 1

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from podtran.artifacts import copy_path, output_refs_exist, read_model, remove_path, write_json
 from podtran.models import StageManifest
@@ -44,20 +44,43 @@ class CacheStore:
 
     def publish(self, stage: str, cache_key: str, outputs: dict[str, Path], manifest: StageManifest) -> CacheEntry:
         entry_dir = self._entry_dir(stage, cache_key)
-        if entry_dir.exists():
-            shutil.rmtree(entry_dir)
-        entry_dir.mkdir(parents=True, exist_ok=True)
+        existing = self.lookup(stage, cache_key)
+        if existing is not None:
+            return existing
+        entry_dir.parent.mkdir(parents=True, exist_ok=True)
+        temp_dir = entry_dir.parent / f".{cache_key}.tmp-{uuid4().hex}"
+        temp_dir.mkdir(parents=True, exist_ok=False)
 
-        output_refs: dict[str, str] = {}
-        for name, source in outputs.items():
-            destination = entry_dir / source.name
-            copy_path(source, destination)
-            output_refs[name] = destination.name
+        try:
+            output_refs: dict[str, str] = {}
+            for name, source in outputs.items():
+                destination = temp_dir / source.name
+                copy_path(source, destination)
+                output_refs[name] = destination.name
 
-        cache_manifest = manifest.model_copy(deep=True)
-        cache_manifest.output_refs = output_refs
-        write_json(entry_dir / "manifest.json", cache_manifest)
-        return CacheEntry(stage=stage, cache_key=cache_key, entry_dir=entry_dir, manifest=cache_manifest)
+            cache_manifest = manifest.model_copy(deep=True)
+            cache_manifest.output_refs = output_refs
+            write_json(temp_dir / "manifest.json", cache_manifest)
+
+            try:
+                temp_dir.rename(entry_dir)
+            except FileExistsError:
+                existing = self.lookup(stage, cache_key)
+                if existing is not None:
+                    return existing
+                remove_path(entry_dir)
+                try:
+                    temp_dir.rename(entry_dir)
+                except FileExistsError:
+                    existing = self.lookup(stage, cache_key)
+                    if existing is not None:
+                        return existing
+                    raise
+
+            return CacheEntry(stage=stage, cache_key=cache_key, entry_dir=entry_dir, manifest=cache_manifest)
+        finally:
+            if temp_dir.exists():
+                remove_path(temp_dir)
 
     def restore(self, entry: CacheEntry, outputs: dict[str, Path]) -> None:
         for name, destination in outputs.items():

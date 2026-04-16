@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -9,7 +11,7 @@ import httpx
 from openai import OpenAI
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from podtran.artifacts import ArtifactPaths, atomic_write_bytes, read_model_list, write_json
+from podtran.artifacts import ArtifactPaths, atomic_write_bytes, copy_path, read_model_list, write_json
 from podtran.audio import FFPROBE_COMMAND, probe_duration
 from podtran.cache_store import CacheStore
 from podtran.config import AppConfig, DEFAULT_TTS_PRESET_MODEL
@@ -86,6 +88,26 @@ class OpenAICompatibleTTSBackend:
         atomic_write_bytes(output_path, payload)
 
 
+@dataclass(slots=True)
+class _PendingSegment:
+    segment_index: int
+    audio_path: Path
+
+
+@dataclass(slots=True)
+class _SynthesisWorkItem:
+    text_zh: str
+    target: ResolvedVoiceTarget
+    output_path: Path
+    cache_key: str | None
+    segments: list[_PendingSegment] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _SynthesisResult:
+    output_path: Path
+    duration_ms: int
+
 
 def synthesize_segments(
     input_path: Path,
@@ -99,7 +121,6 @@ def synthesize_segments(
     progress_callback: StageProgressCallback | None = None,
 ) -> list[SegmentRecord]:
     segments = _load_resume_segments(input_path, output_path)
-    backend = build_tts_backend(config)
     paths.tts_dir.mkdir(parents=True, exist_ok=True)
 
     speaker_units = _speaker_progress_units(config, segments)
@@ -129,17 +150,16 @@ def synthesize_segments(
 
     tts_config_fingerprint = fingerprints.hash_config_subset(config, TTS_CONFIG_KEYS) if fingerprints else ""
     processed_segments = 0
-    for segment in segments:
-        audio_path = paths.tts_dir / f"{segment.segment_id}_{segment.speaker}.wav"
+    work_items: dict[str, _SynthesisWorkItem] = {}
+
+    for index, segment in enumerate(segments):
+        audio_path = _segment_audio_path(paths, segment)
         if segment.tts_audio_path and Path(segment.tts_audio_path).exists() and segment.status == "completed":
             processed_segments += 1
             _emit_segment_progress(progress_callback, segment_offset + processed_segments, stage_total, processed_segments, segment_units, "Reusing audio")
             continue
         if audio_path.exists() and audio_path.stat().st_size > 0:
-            segment.tts_audio_path = str(audio_path.resolve())
-            segment.tts_duration_ms = int(probe_duration(FFPROBE_COMMAND, audio_path) * 1000)
-            segment.status = "completed"
-            segment.error = None
+            _mark_segment_completed(segment, audio_path, int(probe_duration(FFPROBE_COMMAND, audio_path) * 1000))
             write_json(output_path, segments)
             processed_segments += 1
             _emit_segment_progress(progress_callback, segment_offset + processed_segments, stage_total, processed_segments, segment_units, "Reusing audio")
@@ -167,46 +187,67 @@ def synthesize_segments(
             entry = cache_store.lookup("tts", cache_key)
             if entry is not None:
                 cache_store.restore(entry, {"audio": audio_path})
-                segment.tts_audio_path = str(audio_path.resolve())
-                segment.tts_duration_ms = int(probe_duration(FFPROBE_COMMAND, audio_path) * 1000)
-                segment.status = "completed"
-                segment.error = None
+                _mark_segment_completed(segment, audio_path, int(probe_duration(FFPROBE_COMMAND, audio_path) * 1000))
                 write_json(output_path, segments)
                 processed_segments += 1
                 _emit_segment_progress(progress_callback, segment_offset + processed_segments, stage_total, processed_segments, segment_units, "Restored cached audio")
                 continue
 
-        try:
-            backend.synthesize(segment.text_zh, target, audio_path)
-            segment.tts_audio_path = str(audio_path.resolve())
-            segment.tts_duration_ms = int(probe_duration(FFPROBE_COMMAND, audio_path) * 1000)
-            segment.status = "completed"
-            segment.error = None
-            if cache_key and cache_store and fingerprints:
-                manifest = StageManifest(
-                    stage="tts",
-                    status="completed",
-                    stage_version=TTS_STAGE_VERSION,
-                    cache_key=cache_key,
-                    input_fingerprints={
-                        "text_zh": fingerprints.hash_value(normalize_text(segment.text_zh)),
-                        "voice_target": fingerprints.hash_value(target.model_dump()),
-                    },
-                    config_fingerprint=tts_config_fingerprint,
-                    config_keys=TTS_CONFIG_KEYS,
+        work_key = _tts_work_key(segment, target, config)
+        work_item = work_items.get(work_key)
+        if work_item is None:
+            work_item = _SynthesisWorkItem(
+                text_zh=segment.text_zh,
+                target=target,
+                output_path=audio_path,
+                cache_key=cache_key,
+            )
+            work_items[work_key] = work_item
+        work_item.segments.append(_PendingSegment(segment_index=index, audio_path=audio_path))
+
+    if work_items:
+        max_workers = max(1, config.tts.max_concurrency)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_item = {
+                executor.submit(_synthesize_work_item, config, item): item
+                for item in work_items.values()
+            }
+            for future in as_completed(future_to_item):
+                item = future_to_item[future]
+                try:
+                    result = future.result()
+                    if item.cache_key and cache_store and fingerprints:
+                        cache_store.publish(
+                            "tts",
+                            item.cache_key,
+                            {"audio": result.output_path},
+                            _build_tts_manifest(item.text_zh, item.target, item.cache_key, tts_config_fingerprint, fingerprints),
+                        )
+                    for pending in item.segments:
+                        destination = pending.audio_path
+                        if destination.resolve() != result.output_path.resolve():
+                            copy_path(result.output_path, destination)
+                        _mark_segment_completed(segments[pending.segment_index], destination, result.duration_ms)
+                        processed_segments += 1
+                except Exception as exc:
+                    for pending in item.segments:
+                        segment = segments[pending.segment_index]
+                        segment.status = "failed"
+                        segment.error = str(exc)
+                        processed_segments += 1
+                write_json(output_path, segments)
+                _emit_segment_progress(
+                    progress_callback,
+                    segment_offset + processed_segments,
+                    stage_total,
+                    processed_segments,
+                    segment_units,
+                    "Synthesizing audio",
                 )
-                cache_store.publish("tts", cache_key, {"audio": audio_path}, manifest)
-        except Exception as exc:
-            segment.status = "failed"
-            segment.error = str(exc)
-        write_json(output_path, segments)
-        processed_segments += 1
-        _emit_segment_progress(progress_callback, segment_offset + processed_segments, stage_total, processed_segments, segment_units, "Synthesizing audio")
 
     if progress_callback is not None:
         progress_callback(stage_total, stage_total, "Synthesis complete")
     return segments
-
 
 
 def build_tts_backend(config: AppConfig) -> TTSBackend:
@@ -220,11 +261,9 @@ def build_tts_backend(config: AppConfig) -> TTSBackend:
     raise RuntimeError(f"Unsupported TTS provider: {config.tts.provider}")
 
 
-
 def _load_resume_segments(input_path: Path, output_path: Path) -> list[SegmentRecord]:
     source = output_path if output_path.exists() else input_path
     return read_model_list(source, SegmentRecord)
-
 
 
 def _resolve_voice_targets(
@@ -252,7 +291,6 @@ def _resolve_voice_targets(
     )
 
 
-
 def _speaker_progress_units(config: AppConfig, segments: list[SegmentRecord]) -> int:
     speakers = {segment.speaker for segment in segments}
     if not speakers:
@@ -260,7 +298,6 @@ def _speaker_progress_units(config: AppConfig, segments: list[SegmentRecord]) ->
     if config.tts.voice_mode.strip().lower() == "clone":
         return len(speakers)
     return 1
-
 
 
 def _emit_segment_progress(
@@ -276,6 +313,56 @@ def _emit_segment_progress(
     total_segments = max(segment_units, 1)
     progress_callback(completed, stage_total, f"{action} {processed_segments}/{total_segments}")
 
+
+def _mark_segment_completed(segment: SegmentRecord, audio_path: Path, duration_ms: int) -> None:
+    segment.tts_audio_path = str(audio_path.resolve())
+    segment.tts_duration_ms = duration_ms
+    segment.status = "completed"
+    segment.error = None
+
+
+def _segment_audio_path(paths: ArtifactPaths, segment: SegmentRecord) -> Path:
+    return paths.tts_dir / f"{segment.segment_id}_{segment.speaker}.wav"
+
+
+def _tts_work_key(segment: SegmentRecord, target: ResolvedVoiceTarget, config: AppConfig) -> str:
+    return json.dumps(
+        {
+            "text_zh": normalize_text(segment.text_zh),
+            "voice_target": target.model_dump(),
+            "model": _resolve_tts_model(config, target),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _synthesize_work_item(config: AppConfig, item: _SynthesisWorkItem) -> _SynthesisResult:
+    backend = build_tts_backend(config)
+    backend.synthesize(item.text_zh, item.target, item.output_path)
+    duration_ms = int(probe_duration(FFPROBE_COMMAND, item.output_path) * 1000)
+    return _SynthesisResult(output_path=item.output_path, duration_ms=duration_ms)
+
+
+def _build_tts_manifest(
+    text_zh: str,
+    target: ResolvedVoiceTarget,
+    cache_key: str,
+    config_fingerprint: str,
+    fingerprints: FingerprintService,
+) -> StageManifest:
+    return StageManifest(
+        stage="tts",
+        status="completed",
+        stage_version=TTS_STAGE_VERSION,
+        cache_key=cache_key,
+        input_fingerprints={
+            "text_zh": fingerprints.hash_value(normalize_text(text_zh)),
+            "voice_target": fingerprints.hash_value(target.model_dump()),
+        },
+        config_fingerprint=config_fingerprint,
+        config_keys=TTS_CONFIG_KEYS,
+    )
 
 
 def _tts_cache_key(
@@ -303,7 +390,6 @@ def _tts_cache_key(
     )
 
 
-
 def _read_binary_response(response: object) -> bytes:
     if hasattr(response, "read"):
         data = response.read()
@@ -316,14 +402,12 @@ def _read_binary_response(response: object) -> bytes:
     raise RuntimeError("Unsupported binary response from TTS backend.")
 
 
-
 def _resolve_tts_model(config: AppConfig, target: ResolvedVoiceTarget) -> str:
     if target.mode == "clone":
         return config.tts.resolved_model()
     if config.tts.voice_mode.strip().lower() == "clone":
         return DEFAULT_TTS_PRESET_MODEL
     return config.tts.resolved_model()
-
 
 
 def _resolve_tts_key(config: AppConfig) -> str:
@@ -333,4 +417,3 @@ def _resolve_tts_key(config: AppConfig) -> str:
     if config.tts.provider.strip().lower() == "dashscope":
         return os.getenv("DASHSCOPE_API_KEY", "")
     return os.getenv("PODTRAN_TTS_API_KEY", "")
-

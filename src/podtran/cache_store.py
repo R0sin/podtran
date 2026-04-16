@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,14 +65,18 @@ class CacheStore:
 
             try:
                 temp_dir.rename(entry_dir)
-            except FileExistsError:
+            except OSError as exc:
+                if not _is_entry_dir_conflict(exc):
+                    raise
                 existing = self.lookup(stage, cache_key)
                 if existing is not None:
                     return existing
                 remove_path(entry_dir)
                 try:
                     temp_dir.rename(entry_dir)
-                except FileExistsError:
+                except OSError as retry_exc:
+                    if not _is_entry_dir_conflict(retry_exc):
+                        raise
                     existing = self.lookup(stage, cache_key)
                     if existing is not None:
                         return existing
@@ -137,3 +142,7 @@ def _normalize_datetime(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _is_entry_dir_conflict(exc: OSError) -> bool:
+    return exc.errno in {errno.EEXIST, errno.ENOTEMPTY}

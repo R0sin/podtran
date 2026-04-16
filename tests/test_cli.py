@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 
 import pytest
 from rich.console import Console
@@ -15,6 +16,11 @@ from podtran.stage_executor import StageExecutor
 from podtran.tasks import TaskStore
 
 runner = CliRunner()
+
+
+def _normalize_help_output(output: str) -> str:
+    without_ansi = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", output)
+    return " ".join(without_ansi.split())
 
 
 def _segment(segment_id: str, error: str | None, status: str = "pending", tts_audio_path: str = "") -> SegmentRecord:
@@ -86,17 +92,26 @@ def test_print_stage_failure_summary_renders_unique_messages() -> None:
 
 def test_root_help_documents_run_and_shortcut_entrypoints() -> None:
     result = runner.invoke(cli.app, ["--help"])
+    normalized = _normalize_help_output(result.output)
 
     assert result.exit_code == 0
-    assert "run" in result.output
-    assert "resume" in result.output
-    assert "tasks" in result.output
-    assert "status" in result.output
-    assert "Recommended entrypoint" in result.output
-    assert "podtran run AUDIO" in result.output
-    assert "Shortcut" in result.output
-    assert "podtran AUDIO [--preview]" in result.output
-    assert "podtran resume" in result.output
+    assert "run" in normalized
+    assert "resume" in normalized
+    assert "tasks" in normalized
+    assert "status" in normalized
+    assert "version" in normalized
+    assert "Recommended entrypoint" in normalized
+    assert "podtran run AUDIO [--preview]" in normalized
+    assert "Shortcut" in normalized
+    assert "podtran AUDIO [--preview]" in normalized
+    assert "podtran resume [TASK]" in normalized
+
+
+def test_version_command_prints_package_version() -> None:
+    result = runner.invoke(cli.app, ["version"])
+
+    assert result.exit_code == 0
+    assert result.output.strip() == f"podtran {cli.__version__}"
 
 
 def test_cache_help_only_lists_clean() -> None:
@@ -111,13 +126,14 @@ def test_cache_help_only_lists_clean() -> None:
 
 def test_run_help_exposes_audio_and_preview_options() -> None:
     result = runner.invoke(cli.app, ["run", "--help"])
+    normalized = _normalize_help_output(result.output)
 
     assert result.exit_code == 0
-    assert "AUDIO" in result.output
-    assert "--preview" in result.output
-    assert "--min_speakers" in result.output
-    assert "--max_speakers" in result.output
-    assert "Create a new task for AUDIO and run the full pipeline." in result.output
+    assert "AUDIO" in normalized
+    assert "--preview" in normalized
+    assert "--min_speakers" in normalized
+    assert "--max_speakers" in normalized
+    assert "Create a new task for AUDIO and run the full pipeline." in normalized
 
 
 def test_stage_help_documents_task_requirements() -> None:

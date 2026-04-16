@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
+from podtran import __version__
 from podtran.artifacts import ArtifactPaths, output_refs_exist, read_model_list, remove_path, write_json
 from podtran.audio import FFMPEG_COMMAND, FFPROBE_COMMAND, extract_audio_chunk
 from podtran.cache_store import CacheStore
@@ -76,7 +77,7 @@ cache_app = typer.Typer(
 )
 app.add_typer(cache_app, name="cache", short_help="Manage the shared cache.")
 console = Console()
-KNOWN_COMMANDS = {"run", "resume", "init", "tasks", "status", "transcribe", "translate", "synthesize", "compose", "cache"}
+KNOWN_COMMANDS = {"run", "resume", "init", "tasks", "status", "version", "transcribe", "translate", "synthesize", "compose", "cache"}
 DEFAULT_MIN_SPEAKERS = 2
 DEFAULT_MAX_SPEAKERS = 5
 
@@ -406,6 +407,14 @@ def status(
         cloned = sum(1 for item in profiles if item.status == "completed")
         failed_profiles = sum(1 for item in profiles if item.status == "failed")
         console.print(f"voices={len(profiles)} cloned={cloned} failed_voice_profiles={failed_profiles}")
+
+
+@app.command(
+    short_help="Show the installed podtran version.",
+    help="Print the installed podtran package version.",
+)
+def version() -> None:
+    console.print(f"podtran {__version__}")
 
 
 @app.command(

@@ -14,24 +14,39 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from podtran.artifacts import ArtifactPaths, atomic_write_bytes, copy_path, read_model_list, write_json
 from podtran.audio import FFPROBE_COMMAND, probe_duration
 from podtran.cache_store import CacheStore
-from podtran.config import AppConfig, DEFAULT_TTS_PRESET_MODEL
+from podtran.config import AppConfig
 from podtran.fingerprints import FingerprintService, TTS_CONFIG_KEYS, normalize_text
-from podtran.models import ResolvedVoiceTarget, SegmentRecord, StageManifest, StageProgressCallback
+from podtran.models import (
+    PresetVoiceSpec,
+    ProviderCloneSpec,
+    ReferenceCloneSpec,
+    ResolvedVoiceTarget,
+    SegmentRecord,
+    StageManifest,
+    StageProgressCallback,
+    VoiceSpec,
+)
 from podtran.stage_versions import TTS_STAGE_VERSION
-from podtran.voices import VoiceProfileManager, build_preset_targets
+from podtran.voices import VoiceResolver, build_preset_targets, resolve_dashscope_api_key
 
 TTS_RETRY_ATTEMPTS = 3
+CLONE_VOICE_KINDS = frozenset({"provider_clone", "reference_clone"})
 
 
 class TTSBackend(Protocol):
-    def synthesize(self, text: str, target: ResolvedVoiceTarget, output_path: Path) -> None:
+    supported_voice_kinds: frozenset[str]
+
+    def synthesize(self, text: str, spec: VoiceSpec, model: str, output_path: Path) -> None:
         ...
 
 
 class DashScopeTTSBackend:
+    supported_voice_kinds = frozenset({"preset", "provider_clone"})
+
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.client = httpx.Client(timeout=config.tts.timeout_seconds)
+        self.api_key = resolve_dashscope_api_key(config)
 
     @retry(
         reraise=True,
@@ -39,16 +54,15 @@ class DashScopeTTSBackend:
         wait=wait_exponential(multiplier=1, min=1, max=8),
         retry=retry_if_exception_type((RuntimeError, httpx.HTTPError)),
     )
-    def synthesize(self, text: str, target: ResolvedVoiceTarget, output_path: Path) -> None:
+    def synthesize(self, text: str, spec: VoiceSpec, model: str, output_path: Path) -> None:
         response = self.client.post(
             f"{self.config.tts.resolved_base_url()}/services/aigc/multimodal-generation/generation",
-            headers={"Authorization": f"Bearer {_resolve_tts_key(self.config)}"},
+            headers={"Authorization": f"Bearer {self.api_key}"},
             json={
-                "model": _resolve_tts_model(self.config, target),
+                "model": model,
                 "input": {
                     "text": text,
-                    "voice": target.voice,
-                    "language_type": self.config.tts.language_type,
+                    "voice": self._voice_value(spec),
                 },
             },
         )
@@ -61,11 +75,22 @@ class DashScopeTTSBackend:
         audio_response.raise_for_status()
         atomic_write_bytes(output_path, audio_response.content)
 
+    def _voice_value(self, spec: VoiceSpec) -> str:
+        if isinstance(spec, PresetVoiceSpec):
+            return spec.voice_name
+        if isinstance(spec, ProviderCloneSpec):
+            return spec.payload.voice_token
+        if isinstance(spec, ReferenceCloneSpec):
+            raise RuntimeError("DashScope TTS backend does not support reference_clone specs.")
+        raise RuntimeError(f"Unsupported voice spec for DashScope TTS: {spec.kind}")
+
 
 class OpenAICompatibleTTSBackend:
+    supported_voice_kinds = frozenset({"preset"})
+
     def __init__(self, config: AppConfig) -> None:
         self.client = OpenAI(
-            api_key=_resolve_tts_key(config),
+            api_key=_resolve_openai_compatible_api_key(),
             base_url=config.tts.resolved_base_url(),
             timeout=config.tts.timeout_seconds,
         )
@@ -77,10 +102,12 @@ class OpenAICompatibleTTSBackend:
         wait=wait_exponential(multiplier=1, min=1, max=8),
         retry=retry_if_exception_type(RuntimeError),
     )
-    def synthesize(self, text: str, target: ResolvedVoiceTarget, output_path: Path) -> None:
+    def synthesize(self, text: str, spec: VoiceSpec, model: str, output_path: Path) -> None:
+        if not isinstance(spec, PresetVoiceSpec):
+            raise RuntimeError(f"OpenAI-compatible TTS does not support voice kind: {spec.kind}")
         response = self.client.audio.speech.create(
-            model=_resolve_tts_model(self.config, target),
-            voice=target.voice,
+            model=model,
+            voice=spec.voice_name,
             input=text,
             response_format="wav",
         )
@@ -99,6 +126,7 @@ class _SynthesisWorkItem:
     text_zh: str
     target: ResolvedVoiceTarget
     output_path: Path
+    model: str
     cache_key: str | None
     segments: list[_PendingSegment] = field(default_factory=list)
 
@@ -145,7 +173,7 @@ def synthesize_segments(
             else None
         ),
     )
-    if progress_callback is not None and speaker_units == 1 and config.tts.voice_mode.strip().lower() != "clone":
+    if progress_callback is not None and speaker_units == 1 and config.tts.normalized_mode() != "clone":
         progress_callback(1, stage_total, "Using preset voices")
 
     tts_config_fingerprint = fingerprints.hash_config_subset(config, TTS_CONFIG_KEYS) if fingerprints else ""
@@ -174,15 +202,15 @@ def synthesize_segments(
 
         target = voice_targets.get(segment.speaker)
         if target is None:
-            if config.tts.voice_mode.strip().lower() == "clone":
+            if config.tts.normalized_mode() == "clone":
                 raise RuntimeError(f"Missing resolved clone voice target for {segment.speaker}.")
             target = ResolvedVoiceTarget(
                 speaker=segment.speaker,
-                mode="preset",
-                voice=segment.voice,
+                spec=PresetVoiceSpec(identity=f"preset:{segment.voice.strip()}", voice_name=segment.voice.strip()),
             )
 
-        cache_key = _tts_cache_key(segment, target, config, fingerprints)
+        model = _resolve_tts_model(config, target.spec)
+        cache_key = _tts_cache_key(segment, target.spec, model, config, fingerprints)
         if cache_key and cache_store:
             entry = cache_store.lookup("tts", cache_key)
             if entry is not None:
@@ -193,13 +221,14 @@ def synthesize_segments(
                 _emit_segment_progress(progress_callback, segment_offset + processed_segments, stage_total, processed_segments, segment_units, "Restored cached audio")
                 continue
 
-        work_key = _tts_work_key(segment, target, config)
+        work_key = _tts_work_key(segment, target.spec, model)
         work_item = work_items.get(work_key)
         if work_item is None:
             work_item = _SynthesisWorkItem(
                 text_zh=segment.text_zh,
                 target=target,
                 output_path=audio_path,
+                model=model,
                 cache_key=cache_key,
             )
             work_items[work_key] = work_item
@@ -221,7 +250,7 @@ def synthesize_segments(
                             "tts",
                             item.cache_key,
                             {"audio": result.output_path},
-                            _build_tts_manifest(item.text_zh, item.target, item.cache_key, tts_config_fingerprint, fingerprints),
+                            _build_tts_manifest(item.text_zh, item.target.spec, item.model, item.cache_key, tts_config_fingerprint, fingerprints),
                         )
                     for pending in item.segments:
                         destination = pending.audio_path
@@ -251,14 +280,17 @@ def synthesize_segments(
 
 
 def build_tts_backend(config: AppConfig) -> TTSBackend:
-    backend = config.tts.resolved_backend()
-    if config.tts.voice_mode.strip().lower() == "clone" and backend != "dashscope":
+    provider = config.tts.provider.strip().lower()
+    if provider == "dashscope":
+        backend: TTSBackend = DashScopeTTSBackend(config)
+    elif provider == "openai_compatible":
+        backend = OpenAICompatibleTTSBackend(config)
+    else:
+        raise RuntimeError(f"Unsupported TTS provider: {config.tts.provider}")
+
+    if config.tts.normalized_mode() == "clone" and not (backend.supported_voice_kinds & CLONE_VOICE_KINDS):
         raise RuntimeError(f"Clone mode is not supported for TTS provider: {config.tts.provider}")
-    if backend == "dashscope":
-        return DashScopeTTSBackend(config)
-    if backend == "openai_compatible":
-        return OpenAICompatibleTTSBackend(config)
-    raise RuntimeError(f"Unsupported TTS provider: {config.tts.provider}")
+    return backend
 
 
 def _load_resume_segments(input_path: Path, output_path: Path) -> list[SegmentRecord]:
@@ -276,14 +308,14 @@ def _resolve_voice_targets(
     fingerprints: FingerprintService | None,
     progress_callback: StageProgressCallback | None = None,
 ) -> dict[str, ResolvedVoiceTarget]:
-    if config.tts.voice_mode.strip().lower() != "clone":
+    if config.tts.normalized_mode() != "clone":
         return build_preset_targets(segments)
     if source_audio is None:
         raise RuntimeError("Clone mode requires source audio.")
     resolved_source_audio = source_audio.resolve()
     if not resolved_source_audio.exists():
         raise RuntimeError(f"Source audio not found for clone mode: {resolved_source_audio}")
-    return VoiceProfileManager(config, paths, cache_store=cache_store, fingerprints=fingerprints).resolve_voice_targets(
+    return VoiceResolver(config, paths, cache_store=cache_store, fingerprints=fingerprints).resolve_voice_targets(
         segments,
         resolved_source_audio,
         source_audio_fingerprint=source_audio_fingerprint,
@@ -295,7 +327,7 @@ def _speaker_progress_units(config: AppConfig, segments: list[SegmentRecord]) ->
     speakers = {segment.speaker for segment in segments}
     if not speakers:
         return 0
-    if config.tts.voice_mode.strip().lower() == "clone":
+    if config.tts.normalized_mode() == "clone":
         return len(speakers)
     return 1
 
@@ -325,12 +357,12 @@ def _segment_audio_path(paths: ArtifactPaths, segment: SegmentRecord) -> Path:
     return paths.tts_dir / f"{segment.segment_id}_{segment.speaker}.wav"
 
 
-def _tts_work_key(segment: SegmentRecord, target: ResolvedVoiceTarget, config: AppConfig) -> str:
+def _tts_work_key(segment: SegmentRecord, spec: VoiceSpec, model: str) -> str:
     return json.dumps(
         {
             "text_zh": normalize_text(segment.text_zh),
-            "voice_target": target.model_dump(),
-            "model": _resolve_tts_model(config, target),
+            "voice_spec": spec.model_dump(),
+            "model": model,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -339,14 +371,16 @@ def _tts_work_key(segment: SegmentRecord, target: ResolvedVoiceTarget, config: A
 
 def _synthesize_work_item(config: AppConfig, item: _SynthesisWorkItem) -> _SynthesisResult:
     backend = build_tts_backend(config)
-    backend.synthesize(item.text_zh, item.target, item.output_path)
+    _ensure_backend_supports_spec(backend, item.target.spec)
+    backend.synthesize(item.text_zh, item.target.spec, item.model, item.output_path)
     duration_ms = int(probe_duration(FFPROBE_COMMAND, item.output_path) * 1000)
     return _SynthesisResult(output_path=item.output_path, duration_ms=duration_ms)
 
 
 def _build_tts_manifest(
     text_zh: str,
-    target: ResolvedVoiceTarget,
+    spec: VoiceSpec,
+    model: str,
     cache_key: str,
     config_fingerprint: str,
     fingerprints: FingerprintService,
@@ -358,7 +392,12 @@ def _build_tts_manifest(
         cache_key=cache_key,
         input_fingerprints={
             "text_zh": fingerprints.hash_value(normalize_text(text_zh)),
-            "voice_target": fingerprints.hash_value(target.model_dump()),
+            "voice_spec": fingerprints.hash_value(
+                {
+                    "spec": spec.model_dump(),
+                    "model": model,
+                }
+            ),
         },
         config_fingerprint=config_fingerprint,
         config_keys=TTS_CONFIG_KEYS,
@@ -367,7 +406,8 @@ def _build_tts_manifest(
 
 def _tts_cache_key(
     segment: SegmentRecord,
-    target: ResolvedVoiceTarget,
+    spec: VoiceSpec,
+    model: str,
     config: AppConfig,
     fingerprints: FingerprintService | None,
 ) -> str | None:
@@ -379,10 +419,10 @@ def _tts_cache_key(
         TTS_STAGE_VERSION,
         {
             "text_zh": fingerprints.hash_value(normalize_text(segment.text_zh)),
-            "voice_target": fingerprints.hash_value(
+            "voice_spec": fingerprints.hash_value(
                 {
-                    "target": target.model_dump(),
-                    "model": _resolve_tts_model(config, target),
+                    "spec": spec.model_dump(),
+                    "model": model,
                 }
             ),
         },
@@ -402,18 +442,17 @@ def _read_binary_response(response: object) -> bytes:
     raise RuntimeError("Unsupported binary response from TTS backend.")
 
 
-def _resolve_tts_model(config: AppConfig, target: ResolvedVoiceTarget) -> str:
-    if target.mode == "clone":
-        return config.tts.resolved_model()
-    if config.tts.voice_mode.strip().lower() == "clone":
-        return DEFAULT_TTS_PRESET_MODEL
-    return config.tts.resolved_model()
+def _resolve_tts_model(config: AppConfig, spec: VoiceSpec) -> str:
+    if spec.kind == "preset":
+        return config.tts.preset_model()
+    return config.tts.clone_model()
 
 
-def _resolve_tts_key(config: AppConfig) -> str:
-    resolved = config.resolve_provider_api_key(config.tts.provider)
-    if resolved:
-        return resolved
-    if config.tts.provider.strip().lower() == "dashscope":
-        return os.getenv("DASHSCOPE_API_KEY", "")
+def _resolve_openai_compatible_api_key() -> str:
     return os.getenv("PODTRAN_TTS_API_KEY", "")
+
+
+def _ensure_backend_supports_spec(backend: TTSBackend, spec: VoiceSpec) -> None:
+    if spec.kind in backend.supported_voice_kinds:
+        return
+    raise RuntimeError(f"TTS provider does not support voice kind: {spec.kind}")

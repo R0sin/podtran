@@ -14,9 +14,20 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from podtran.artifacts import ArtifactPaths, read_model, read_model_list, write_json
 from podtran.audio import FFMPEG_COMMAND, concat_wav_chunks, extract_audio_chunk, reset_temp_dir
 from podtran.cache_store import CacheStore
-from podtran.config import AppConfig
+from podtran.config import AppConfig, DEFAULT_TTS_ENROLLMENT_MODEL
 from podtran.fingerprints import FingerprintService, VOICE_CLONE_CONFIG_KEYS
-from podtran.models import ResolvedVoiceTarget, SegmentRecord, StageManifest, StageProgressCallback, VoiceProfile
+from podtran.models import (
+    CloneVoiceSpec,
+    PresetVoiceSpec,
+    ProviderClonePayload,
+    ProviderCloneSpec,
+    ReferenceCloneSpec,
+    ResolvedVoiceTarget,
+    SegmentRecord,
+    StageManifest,
+    StageProgressCallback,
+    VoiceProfile,
+)
 from podtran.stage_versions import VOICE_CLONE_STAGE_VERSION
 
 MAX_CLONE_REFERENCE_DURATION = 60.0
@@ -25,15 +36,25 @@ MIN_CLONE_CONTIGUOUS_SPEECH = 3.0
 VOICE_ENROLLMENT_RETRY_ATTEMPTS = 3
 
 
-class VoiceCloningProvider(Protocol):
-    def ensure_voice(self, reference_audio: Path, target_model: str, preferred_name: str) -> str:
+class VoiceCloneProvider(Protocol):
+    def create_voice_spec(
+        self,
+        reference_audio: Path,
+        reference_text: str,
+        target_model: str,
+        preferred_name: str,
+        reference_fingerprint: str,
+    ) -> CloneVoiceSpec:
         ...
 
 
-class DashScopeVoiceCloningProvider:
+class DashScopeCloneProvider:
+    ENROLLMENT_MODEL = DEFAULT_TTS_ENROLLMENT_MODEL
+
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.client = httpx.Client(timeout=config.tts.timeout_seconds)
+        self.api_key = resolve_dashscope_api_key(config)
 
     @retry(
         reraise=True,
@@ -41,18 +62,26 @@ class DashScopeVoiceCloningProvider:
         wait=wait_exponential(multiplier=1, min=1, max=8),
         retry=retry_if_exception_type((RuntimeError, httpx.HTTPError)),
     )
-    def ensure_voice(self, reference_audio: Path, target_model: str, preferred_name: str) -> str:
+    def create_voice_spec(
+        self,
+        reference_audio: Path,
+        reference_text: str,
+        target_model: str,
+        preferred_name: str,
+        reference_fingerprint: str,
+    ) -> ProviderCloneSpec:
+        _ = reference_text
         audio_bytes = reference_audio.read_bytes()
         mime_type = mimetypes.guess_type(reference_audio.name)[0] or "audio/wav"
         data_uri = f"data:{mime_type};base64,{base64.b64encode(audio_bytes).decode('utf-8')}"
         response = self.client.post(
-            self.config.tts.resolved_customization_url(),
+            _dashscope_clone_url(self.config),
             headers={
-                "Authorization": f"Bearer {self._resolve_api_key()}",
+                "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
             json={
-                "model": self.config.tts.enrollment_model,
+                "model": self.ENROLLMENT_MODEL,
                 "input": {
                     "action": "create",
                     "target_model": target_model,
@@ -66,15 +95,11 @@ class DashScopeVoiceCloningProvider:
         voice_token = str(payload.get("output", {}).get("voice", "")).strip()
         if not voice_token:
             raise RuntimeError(f"DashScope voice enrollment returned no voice token: {payload}")
-        return voice_token
-
-    def _resolve_api_key(self) -> str:
-        resolved = self.config.resolve_provider_api_key(self.config.tts.provider)
-        if resolved:
-            return resolved
-        import os as _os
-
-        return _os.getenv("DASHSCOPE_API_KEY", "")
+        return ProviderCloneSpec(
+            identity=f"dashscope:provider_clone:{voice_token}",
+            provider="dashscope",
+            payload=ProviderClonePayload(voice_token=voice_token),
+        )
 
 
 @dataclass(slots=True)
@@ -89,7 +114,7 @@ class ReferenceCandidate:
         return self.end - self.start
 
 
-class VoiceProfileManager:
+class VoiceResolver:
     def __init__(
         self,
         config: AppConfig,
@@ -101,7 +126,7 @@ class VoiceProfileManager:
         self.paths = paths
         self.cache_store = cache_store
         self.fingerprints = fingerprints
-        self._provider = self._build_provider()
+        self._clone_provider = self._build_clone_provider()
 
     def resolve_voice_targets(
         self,
@@ -111,41 +136,25 @@ class VoiceProfileManager:
         progress_callback: StageProgressCallback | None = None,
     ) -> dict[str, ResolvedVoiceTarget]:
         source_path = source_audio.resolve()
-        preset_targets = build_preset_targets(segments)
-        if self.config.tts.voice_mode.strip().lower() != "clone":
-            return preset_targets
-
-        target_model = self.config.tts.resolved_model()
+        target_model = self.config.tts.clone_model()
         profile_map = {profile.speaker: profile for profile in self._load_profiles()}
         build_dir = self.paths.temp_dir / "voice_refs"
         reset_temp_dir(build_dir, self.paths.task_dir)
         resolved: dict[str, ResolvedVoiceTarget] = {}
         failures: list[str] = []
-        speakers = list(preset_targets)
+        speakers = list(build_preset_targets(segments))
         total_speakers = max(len(speakers), 1)
         completed = 0
         if progress_callback is not None:
             progress_callback(0, total_speakers, "Resolving cloned voices")
 
         for speaker in speakers:
-            cached = profile_map.get(speaker)
-            if self._is_profile_reusable(cached, source_path, target_model):
-                resolved[speaker] = ResolvedVoiceTarget(
-                    speaker=speaker,
-                    provider=cached.provider,
-                    mode="clone",
-                    voice=cached.voice_token,
-                )
-                completed += 1
-                self._emit_progress(progress_callback, completed, total_speakers, f"Reusing voice for {speaker}")
-                continue
-
             candidate = select_reference_candidate(
                 segments,
                 speaker,
                 pause_threshold=max(float(self.config.compose.block_pause_threshold), MAX_CLONE_REFERENCE_PAUSE),
-                preferred_min_duration=float(self.config.tts.clone_min_ref_seconds),
-                preferred_max_duration=float(self.config.tts.clone_max_ref_seconds),
+                preferred_min_duration=float(self.config.tts.clone.min_ref_seconds),
+                preferred_max_duration=float(self.config.tts.clone.max_ref_seconds),
                 hard_max_duration=MAX_CLONE_REFERENCE_DURATION,
                 min_continuous_speech=MIN_CLONE_CONTIGUOUS_SPEECH,
             )
@@ -155,73 +164,94 @@ class VoiceProfileManager:
                     f"Need at least {MIN_CLONE_CONTIGUOUS_SPEECH:g}s contiguous speech, "
                     f"short pauses <= {MAX_CLONE_REFERENCE_PAUSE:g}s, and total reference audio <= "
                     f"{MAX_CLONE_REFERENCE_DURATION:g}s "
-                    f"(preferred {self.config.tts.clone_min_ref_seconds}s-"
-                    f"{self.config.tts.clone_max_ref_seconds}s)."
+                    f"(preferred {self.config.tts.clone.min_ref_seconds}s-"
+                    f"{self.config.tts.clone.max_ref_seconds}s)."
                 )
                 profile_map[speaker] = VoiceProfile(
                     speaker=speaker,
                     provider=self.config.tts.provider,
                     target_model=target_model,
-                    ref_audio_path="",
-                    ref_text_path="",
-                    source_audio_path=str(source_path),
                     status="failed",
                     error=message,
+                    source_audio_fingerprint=source_audio_fingerprint or "",
+                    source_audio_path=str(source_path),
                 )
                 failures.append(f"{speaker}: {message}")
                 completed += 1
                 self._emit_progress(progress_callback, completed, total_speakers, f"Voice reference failed for {speaker}")
                 continue
 
+            reference_fingerprint = self._reference_fingerprint(speaker, candidate, source_audio_fingerprint)
             ref_audio_path, ref_text_path = self._export_reference_audio(source_path, speaker, candidate, build_dir)
+
+            cached_profile = profile_map.get(speaker)
+            if self._is_profile_reusable(
+                cached_profile,
+                source_path,
+                source_audio_fingerprint,
+                target_model,
+                reference_fingerprint,
+            ):
+                reusable = self._refresh_profile_paths(
+                    cached_profile,
+                    source_path,
+                    source_audio_fingerprint,
+                    reference_fingerprint,
+                    ref_audio_path,
+                    ref_text_path,
+                )
+                profile_map[speaker] = reusable
+                resolved[speaker] = ResolvedVoiceTarget(speaker=speaker, spec=self._clone_spec_from_profile(reusable))
+                completed += 1
+                self._emit_progress(progress_callback, completed, total_speakers, f"Reusing voice for {speaker}")
+                continue
+
             cache_key = self._voice_cache_key(speaker, candidate, source_audio_fingerprint, target_model)
-            cached_profile = self._load_cached_profile(cache_key)
-            if cached_profile is not None:
-                profile_map[speaker] = VoiceProfile(
-                    speaker=speaker,
-                    provider=cached_profile.provider,
-                    target_model=target_model,
-                    voice_token=cached_profile.voice_token,
-                    ref_audio_path=str(ref_audio_path.resolve()),
-                    ref_text_path=str(ref_text_path.resolve()),
-                    source_audio_path=str(source_path),
-                    status="completed",
-                    error=None,
+            shared_profile = self._load_cached_profile(cache_key)
+            if self._is_profile_reusable(
+                shared_profile,
+                source_path,
+                source_audio_fingerprint,
+                target_model,
+                reference_fingerprint,
+            ):
+                restored = self._refresh_profile_paths(
+                    shared_profile,
+                    source_path,
+                    source_audio_fingerprint,
+                    reference_fingerprint,
+                    ref_audio_path,
+                    ref_text_path,
                 )
-                resolved[speaker] = ResolvedVoiceTarget(
-                    speaker=speaker,
-                    provider=cached_profile.provider,
-                    mode="clone",
-                    voice=cached_profile.voice_token,
-                )
+                profile_map[speaker] = restored
+                resolved[speaker] = ResolvedVoiceTarget(speaker=speaker, spec=self._clone_spec_from_profile(restored))
                 completed += 1
                 self._emit_progress(progress_callback, completed, total_speakers, f"Restored cached voice for {speaker}")
                 continue
 
             try:
-                voice_token = self._provider.ensure_voice(
+                voice_spec = self._clone_provider.create_voice_spec(
                     ref_audio_path,
+                    candidate.text,
                     target_model,
                     preferred_name=self._preferred_name(speaker),
+                    reference_fingerprint=reference_fingerprint,
                 )
                 profile = VoiceProfile(
                     speaker=speaker,
                     provider=self.config.tts.provider,
                     target_model=target_model,
-                    voice_token=voice_token,
-                    ref_audio_path=str(ref_audio_path.resolve()),
-                    ref_text_path=str(ref_text_path.resolve()),
+                    voice_spec=voice_spec,
+                    reference_fingerprint=reference_fingerprint,
+                    reference_audio_path=str(ref_audio_path.resolve()),
+                    reference_text_path=str(ref_text_path.resolve()),
+                    source_audio_fingerprint=source_audio_fingerprint or "",
                     source_audio_path=str(source_path),
                     status="completed",
                     error=None,
                 )
                 profile_map[speaker] = profile
-                resolved[speaker] = ResolvedVoiceTarget(
-                    speaker=speaker,
-                    provider=self.config.tts.provider,
-                    mode="clone",
-                    voice=voice_token,
-                )
+                resolved[speaker] = ResolvedVoiceTarget(speaker=speaker, spec=voice_spec)
                 self._publish_cached_profile(cache_key, profile, source_audio_fingerprint, candidate)
                 completed += 1
                 self._emit_progress(progress_callback, completed, total_speakers, f"Enrolled voice for {speaker}")
@@ -230,8 +260,10 @@ class VoiceProfileManager:
                     speaker=speaker,
                     provider=self.config.tts.provider,
                     target_model=target_model,
-                    ref_audio_path=str(ref_audio_path.resolve()),
-                    ref_text_path=str(ref_text_path.resolve()),
+                    reference_fingerprint=reference_fingerprint,
+                    reference_audio_path=str(ref_audio_path.resolve()),
+                    reference_text_path=str(ref_text_path.resolve()),
+                    source_audio_fingerprint=source_audio_fingerprint or "",
                     source_audio_path=str(source_path),
                     status="failed",
                     error=str(exc),
@@ -246,11 +278,29 @@ class VoiceProfileManager:
         self._emit_progress(progress_callback, total_speakers, total_speakers, "Voice resolution complete")
         return resolved
 
-    def _build_provider(self) -> VoiceCloningProvider:
-        backend = self.config.tts.resolved_backend()
-        if backend == "dashscope":
-            return DashScopeVoiceCloningProvider(self.config)
+    def _build_clone_provider(self) -> VoiceCloneProvider:
+        provider = self.config.tts.provider.strip().lower()
+        if provider == "dashscope":
+            return DashScopeCloneProvider(self.config)
         raise RuntimeError(f"Clone mode is not supported for TTS provider: {self.config.tts.provider}")
+
+    def _reference_fingerprint(
+        self,
+        speaker: str,
+        candidate: ReferenceCandidate,
+        source_audio_fingerprint: str | None,
+    ) -> str:
+        if self.fingerprints is None:
+            return f"{speaker}:{round(candidate.start, 3)}:{round(candidate.end, 3)}"
+        return self.fingerprints.hash_value(
+            {
+                "speaker": speaker,
+                "source_audio": source_audio_fingerprint or "",
+                "start": round(candidate.start, 3),
+                "end": round(candidate.end, 3),
+                "text": candidate.text.strip(),
+            }
+        )
 
     def _export_reference_audio(
         self,
@@ -285,19 +335,63 @@ class VoiceProfileManager:
         ref_text_path.write_text(candidate.text, encoding="utf-8")
         return ref_audio_path, ref_text_path
 
-
-    def _is_profile_reusable(self, profile: VoiceProfile | None, source_audio: Path, target_model: str) -> bool:
+    def _is_profile_reusable(
+        self,
+        profile: VoiceProfile | None,
+        source_audio: Path,
+        source_audio_fingerprint: str | None,
+        target_model: str,
+        reference_fingerprint: str,
+    ) -> bool:
         if profile is None or profile.status != "completed":
             return False
         if profile.target_model != target_model:
             return False
-        if profile.source_audio_path != str(source_audio):
+        if not profile.asset_identity.strip() or profile.voice_spec is None:
             return False
-        if not profile.voice_token.strip():
+        if profile.source_audio_fingerprint:
+            if profile.source_audio_fingerprint != (source_audio_fingerprint or ""):
+                return False
+        elif profile.source_audio_path and profile.source_audio_path != str(source_audio):
             return False
-        if not profile.ref_audio_path or not Path(profile.ref_audio_path).exists():
+        if profile.reference_fingerprint and profile.reference_fingerprint != reference_fingerprint:
+            return False
+        if profile.reference_audio_path and not Path(profile.reference_audio_path).exists():
             return False
         return True
+
+    def _refresh_profile_paths(
+        self,
+        profile: VoiceProfile,
+        source_audio: Path,
+        source_audio_fingerprint: str | None,
+        reference_fingerprint: str,
+        reference_audio_path: Path,
+        reference_text_path: Path,
+    ) -> VoiceProfile:
+        updated_spec = profile.voice_spec
+        if isinstance(updated_spec, ReferenceCloneSpec):
+            updated_spec = updated_spec.model_copy(
+                update={
+                    "payload": updated_spec.payload.model_copy(
+                        update={
+                            "reference_audio_path": str(reference_audio_path.resolve()),
+                            "reference_text_path": str(reference_text_path.resolve()),
+                            "reference_fingerprint": reference_fingerprint,
+                        }
+                    )
+                }
+            )
+        return profile.model_copy(
+            update={
+                "voice_spec": updated_spec,
+                "reference_fingerprint": reference_fingerprint,
+                "reference_audio_path": str(reference_audio_path.resolve()),
+                "reference_text_path": str(reference_text_path.resolve()),
+                "source_audio_fingerprint": source_audio_fingerprint or profile.source_audio_fingerprint,
+                "source_audio_path": str(source_audio),
+            }
+        )
 
     def _load_profiles(self) -> list[VoiceProfile]:
         if not self.paths.voices_json.exists():
@@ -321,6 +415,7 @@ class VoiceProfileManager:
         if progress_callback is None:
             return
         progress_callback(completed, total, message)
+
     def _voice_cache_key(
         self,
         speaker: str,
@@ -330,15 +425,7 @@ class VoiceProfileManager:
     ) -> str | None:
         if self.cache_store is None or self.fingerprints is None or not source_audio_fingerprint:
             return None
-        reference_fingerprint = self.fingerprints.hash_value(
-            {
-                "speaker": speaker,
-                "source_audio": source_audio_fingerprint,
-                "start": round(candidate.start, 3),
-                "end": round(candidate.end, 3),
-                "text": candidate.text.strip(),
-            }
-        )
+        reference_fingerprint = self._reference_fingerprint(speaker, candidate, source_audio_fingerprint)
         config_fingerprint = self.fingerprints.hash_config_subset(self.config, VOICE_CLONE_CONFIG_KEYS)
         return self.fingerprints.build_stage_cache_key(
             "voice_clone",
@@ -371,15 +458,7 @@ class VoiceProfileManager:
             return
         profile_json = self.paths.temp_dir / f"{profile.speaker}.voice_profile.json"
         write_json(profile_json, profile)
-        reference_fingerprint = self.fingerprints.hash_value(
-            {
-                "speaker": profile.speaker,
-                "source_audio": source_audio_fingerprint,
-                "start": round(candidate.start, 3),
-                "end": round(candidate.end, 3),
-                "text": candidate.text.strip(),
-            }
-        )
+        reference_fingerprint = self._reference_fingerprint(profile.speaker, candidate, source_audio_fingerprint)
         manifest = StageManifest(
             stage="voice_clone",
             status="completed",
@@ -399,21 +478,36 @@ class VoiceProfileManager:
         )
         self.cache_store.publish("voice_clone", cache_key, {"voice_profile": profile_json}, manifest)
 
+    def _clone_spec_from_profile(self, profile: VoiceProfile) -> CloneVoiceSpec:
+        if profile.voice_spec is None:
+            raise RuntimeError(
+                f"Voice profile for {profile.speaker} cannot be reused safely. Re-run the synthesize stage to rebuild voices.json."
+            )
+        return profile.voice_spec
+
 
 def build_preset_targets(segments: list[SegmentRecord]) -> dict[str, ResolvedVoiceTarget]:
     targets: dict[str, ResolvedVoiceTarget] = {}
     for segment in segments:
+        voice_name = segment.voice.strip()
         targets.setdefault(
             segment.speaker,
             ResolvedVoiceTarget(
                 speaker=segment.speaker,
-                provider="",
-                mode="preset",
-                voice=segment.voice,
+                spec=PresetVoiceSpec(
+                    identity=f"preset:{voice_name}",
+                    voice_name=voice_name,
+                ),
             ),
         )
     return targets
 
+
+def resolve_dashscope_api_key(config: AppConfig) -> str:
+    resolved = config.resolve_provider_api_key("dashscope")
+    if resolved:
+        return resolved
+    return os.getenv("DASHSCOPE_API_KEY", "")
 
 
 def select_reference_candidate(
@@ -527,13 +621,15 @@ def _candidate_score(
     return duration_score + text_score + continuity_bonus
 
 
+def _dashscope_clone_url(config: AppConfig) -> str:
+    base_url = config.tts.resolved_base_url()
+    if not base_url:
+        raise RuntimeError("DashScope clone provider requires a TTS base URL.")
+    return base_url.rstrip("/") + "/services/audio/tts/customization"
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-
-
-
-
-
-
+VoiceProfileManager = VoiceResolver

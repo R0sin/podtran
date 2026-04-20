@@ -1,17 +1,24 @@
-import pytest
-
 from pathlib import Path
+
+import pytest
 
 from podtran.artifacts import ArtifactPaths, read_model_list, write_json
 from podtran.cache_store import CacheStore
-from podtran.config import AppConfig, TTSConfig
+from podtran.config import AppConfig, DEFAULT_TTS_ENROLLMENT_MODEL, TTSConfig
 from podtran.fingerprints import FingerprintService
-from podtran.models import SegmentRecord, VoiceProfile
-from podtran.voices import VoiceProfileManager, select_reference_candidate
+from podtran.models import (
+    ProviderClonePayload,
+    ReferenceClonePayload,
+    ReferenceCloneSpec,
+    SegmentRecord,
+    VoiceProfile,
+)
+from podtran.voices import DashScopeCloneProvider, VoiceResolver, resolve_dashscope_api_key, select_reference_candidate
 
 
 class _UnexpectedProvider:
-    def ensure_voice(self, reference_audio: Path, target_model: str, preferred_name: str) -> str:
+    def create_voice_spec(self, reference_audio: Path, reference_text: str, target_model: str, preferred_name: str, reference_fingerprint: str):
+        _ = (reference_audio, reference_text, target_model, preferred_name, reference_fingerprint)
         raise AssertionError("provider should not be called")
 
 
@@ -20,15 +27,22 @@ class _FixedProvider:
         self.token = token
         self.calls = 0
 
-    def ensure_voice(self, reference_audio: Path, target_model: str, preferred_name: str) -> str:
+    def create_voice_spec(self, reference_audio: Path, reference_text: str, target_model: str, preferred_name: str, reference_fingerprint: str):
+        _ = (reference_audio, reference_text, target_model, preferred_name)
         self.calls += 1
-        return self.token
-
+        return ReferenceCloneSpec(
+            identity=f"fake:reference_clone:{reference_fingerprint}",
+            provider="fake",
+            payload=ReferenceClonePayload(
+                reference_fingerprint=reference_fingerprint,
+                reference_audio_path=str(reference_audio),
+                reference_text=reference_text,
+            ),
+        )
 
 
 def _paths(tmp_path: Path, task_id: str = "task-1") -> ArtifactPaths:
     return ArtifactPaths.from_task_id(tmp_path, task_id)
-
 
 
 def _segment(segment_id: str, start: float, end: float, speaker: str = "SPEAKER_00", text: str | None = None) -> SegmentRecord:
@@ -44,9 +58,9 @@ def _segment(segment_id: str, start: float, end: float, speaker: str = "SPEAKER_
     )
 
 
-
 def _stub_export(paths: ArtifactPaths):
     def _export(source_audio: Path, speaker: str, candidate, build_dir: Path) -> tuple[Path, Path]:
+        _ = (source_audio, build_dir)
         ref_audio = paths.refs_dir / f"{speaker}.wav"
         ref_text = paths.refs_dir / f"{speaker}.txt"
         ref_audio.write_bytes(b"ref")
@@ -54,7 +68,6 @@ def _stub_export(paths: ArtifactPaths):
         return ref_audio, ref_text
 
     return _export
-
 
 
 def test_select_reference_candidate_merges_adjacent_segments_to_target_duration() -> None:
@@ -69,7 +82,6 @@ def test_select_reference_candidate_merges_adjacent_segments_to_target_duration(
     assert candidate.start == 0.0
     assert candidate.end == 12.0
     assert len(candidate.segments) == 2
-
 
 
 def test_select_reference_candidate_accepts_shorter_clip_when_it_has_clear_speech() -> None:
@@ -91,17 +103,15 @@ def test_select_reference_candidate_accepts_shorter_clip_when_it_has_clear_speec
     assert candidate.end == 7.5
 
 
-
-def test_voice_profile_manager_preferred_name_uses_normalized_speaker_without_prefix(tmp_path: Path) -> None:
+def test_voice_resolver_preferred_name_uses_normalized_speaker_without_prefix(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    manager = VoiceProfileManager(AppConfig(tts=TTSConfig(voice_mode="clone")), paths)
+    manager = VoiceResolver(AppConfig(tts=TTSConfig(mode="clone")), paths)
 
     assert manager._preferred_name("SPEAKER_00") == "speaker_00"
     assert manager._preferred_name("Host A / Guest B") == "host_a_guest_b"
 
 
-
-def test_voice_profile_manager_reuses_cached_voice_profile(tmp_path: Path) -> None:
+def test_voice_resolver_reuses_cached_voice_profile(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     source_audio = tmp_path / "source.wav"
@@ -113,35 +123,35 @@ def test_voice_profile_manager_reuses_cached_voice_profile(tmp_path: Path) -> No
     write_json(
         paths.voices_json,
         [
-            VoiceProfile(
-                speaker="SPEAKER_00",
-                provider="dashscope",
-                target_model="qwen3-tts-vc-2026-01-22",
-                voice_token="voice-token-1",
-                ref_audio_path=str(ref_audio.resolve()),
-                ref_text_path=str(ref_text.resolve()),
-                source_audio_path=str(source_audio.resolve()),
-                status="completed",
-            )
+            {
+                "speaker": "SPEAKER_00",
+                "provider": "dashscope",
+                "target_model": "qwen3-tts-vc-2026-01-22",
+                "voice_token": "voice-token-1",
+                "ref_audio_path": str(ref_audio.resolve()),
+                "ref_text_path": str(ref_text.resolve()),
+                "source_audio_path": str(source_audio.resolve()),
+                "status": "completed",
+            }
         ],
     )
-    manager = VoiceProfileManager(AppConfig(tts=TTSConfig(voice_mode="clone")), paths)
-    manager._provider = _UnexpectedProvider()
+    manager = VoiceResolver(AppConfig(tts=TTSConfig(mode="clone")), paths)
+    manager._clone_provider = _UnexpectedProvider()
+    manager._export_reference_audio = _stub_export(paths)  # type: ignore[method-assign]
 
     resolved = manager.resolve_voice_targets([_segment("seg_1", 0.0, 12.0)], source_audio)
 
-    assert resolved["SPEAKER_00"].mode == "clone"
-    assert resolved["SPEAKER_00"].voice == "voice-token-1"
+    assert resolved["SPEAKER_00"].spec.kind == "provider_clone"
+    assert resolved["SPEAKER_00"].spec.payload.voice_token == "voice-token-1"
 
 
-
-def test_voice_profile_manager_raises_when_no_reference_is_available(tmp_path: Path) -> None:
+def test_voice_resolver_raises_when_no_reference_is_available(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     source_audio = tmp_path / "source.wav"
     source_audio.write_bytes(b"wav")
-    manager = VoiceProfileManager(AppConfig(tts=TTSConfig(voice_mode="clone")), paths)
-    manager._provider = _UnexpectedProvider()
+    manager = VoiceResolver(AppConfig(tts=TTSConfig(mode="clone")), paths)
+    manager._clone_provider = _UnexpectedProvider()
 
     with pytest.raises(RuntimeError, match="Voice clone failed for 1 speaker"):
         manager.resolve_voice_targets(
@@ -157,8 +167,7 @@ def test_voice_profile_manager_raises_when_no_reference_is_available(tmp_path: P
     assert "No qualifying reference audio" in (voice_profiles[0].error or "")
 
 
-
-def test_voice_profile_manager_reuses_shared_voice_cache(tmp_path: Path) -> None:
+def test_voice_resolver_reuses_shared_voice_cache(tmp_path: Path) -> None:
     source_audio = tmp_path / "source.wav"
     source_audio.write_bytes(b"wav")
     first_paths = _paths(tmp_path, "task-1")
@@ -168,40 +177,40 @@ def test_voice_profile_manager_reuses_shared_voice_cache(tmp_path: Path) -> None
     cache_store = CacheStore(first_paths.cache_dir)
     fingerprints = FingerprintService(first_paths.cache_indexes_dir)
 
-    first_manager = VoiceProfileManager(
-        AppConfig(tts=TTSConfig(voice_mode="clone")),
+    first_manager = VoiceResolver(
+        AppConfig(tts=TTSConfig(mode="clone")),
         first_paths,
         cache_store=cache_store,
         fingerprints=fingerprints,
     )
-    first_manager._provider = _FixedProvider("voice-token-1")
+    first_manager._clone_provider = _FixedProvider("voice-token-1")
     first_manager._export_reference_audio = _stub_export(first_paths)  # type: ignore[method-assign]
 
-    second_manager = VoiceProfileManager(
-        AppConfig(tts=TTSConfig(voice_mode="clone")),
+    second_manager = VoiceResolver(
+        AppConfig(tts=TTSConfig(mode="clone")),
         second_paths,
         cache_store=cache_store,
         fingerprints=fingerprints,
     )
-    second_manager._provider = _UnexpectedProvider()
+    second_manager._clone_provider = _UnexpectedProvider()
     second_manager._export_reference_audio = _stub_export(second_paths)  # type: ignore[method-assign]
 
     segments = [_segment("seg_1", 0.0, 12.0)]
     first_resolved = first_manager.resolve_voice_targets(segments, source_audio, source_audio_fingerprint="audio-1")
     second_resolved = second_manager.resolve_voice_targets(segments, source_audio, source_audio_fingerprint="audio-1")
 
-    assert first_resolved["SPEAKER_00"].voice == "voice-token-1"
-    assert second_resolved["SPEAKER_00"].voice == "voice-token-1"
+    assert first_resolved["SPEAKER_00"].spec.kind == "reference_clone"
+    assert second_resolved["SPEAKER_00"].spec.kind == "reference_clone"
+    assert first_resolved["SPEAKER_00"].spec.identity == second_resolved["SPEAKER_00"].spec.identity
 
 
-
-def test_voice_profile_manager_reports_progress(tmp_path: Path) -> None:
+def test_voice_resolver_reports_progress(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     source_audio = tmp_path / "source.wav"
     source_audio.write_bytes(b"wav")
-    manager = VoiceProfileManager(AppConfig(tts=TTSConfig(voice_mode="clone")), paths)
-    manager._provider = _FixedProvider("voice-token-1")
+    manager = VoiceResolver(AppConfig(tts=TTSConfig(mode="clone")), paths)
+    manager._clone_provider = _FixedProvider("voice-token-1")
     manager._export_reference_audio = _stub_export(paths)  # type: ignore[method-assign]
     events: list[tuple[int, int, str]] = []
 
@@ -214,3 +223,42 @@ def test_voice_profile_manager_reports_progress(tmp_path: Path) -> None:
     assert events[0] == (0, 1, "Resolving cloned voices")
     assert events[-1] == (1, 1, "Voice resolution complete")
     assert any("Enrolled voice" in message for _, _, message in events)
+
+
+def test_dashscope_clone_provider_uses_fixed_enrollment_model_and_derived_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = AppConfig(tts=TTSConfig(base_url="https://tts.example.com/root/"))
+    provider = DashScopeCloneProvider(config)
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"output": {"voice": "voice-token-1"}}
+
+    class _Client:
+        def post(self, url: str, headers: dict[str, str], json: dict[str, object]) -> _Response:
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return _Response()
+
+    provider.client = _Client()  # type: ignore[assignment]
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "env-key")
+    reference_audio = tmp_path / "reference.wav"
+    reference_audio.write_bytes(b"wav")
+
+    spec = provider.create_voice_spec(reference_audio, "ref text", "clone-model", "speaker_00", "ref-1")
+
+    assert spec.kind == "provider_clone"
+    assert spec.payload == ProviderClonePayload(voice_token="voice-token-1")
+    assert captured["url"] == "https://tts.example.com/root/services/audio/tts/customization"
+    assert captured["json"]["model"] == DEFAULT_TTS_ENROLLMENT_MODEL
+
+
+def test_resolve_dashscope_api_key_prefers_provider_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = AppConfig(providers={"dashscope": {"api_key": "dash-key"}})
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "env-key")
+
+    assert resolve_dashscope_api_key(config) == "dash-key"

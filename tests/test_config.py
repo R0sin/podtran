@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from podtran.config import (
     AppConfig,
     DEFAULT_TRANSLATION_BASE_URL,
@@ -10,13 +12,14 @@ from podtran.config import (
     TTSConfig,
     build_init_config,
     load_config,
+    render_config_toml,
     resolve_config_path,
     resolve_workdir,
     write_default_config,
 )
 
 
-def test_load_config_accepts_current_supported_fields(tmp_path: Path) -> None:
+def test_load_config_accepts_new_supported_fields(tmp_path: Path) -> None:
     config_path = tmp_path / "podtran.toml"
     config_path.write_text(
         """
@@ -36,19 +39,21 @@ max_concurrency = 3
 [tts]
 provider = "dashscope"
 base_url = ""
-voice_mode = "clone"
-model = "qwen3-tts-vc-2026-01-22"
-enrollment_model = "qwen-voice-enrollment"
-language_type = "Chinese"
+mode = "clone"
 timeout_seconds = 60
 max_concurrency = 2
-clone_min_ref_seconds = 8
-clone_max_ref_seconds = 18
-customization_url = ""
+
+[tts.preset]
+model = "qwen3-tts-flash"
 fallback_voices = ["Cherry"]
 
-[tts.voice_map]
+[tts.preset.voice_map]
 SPEAKER_00 = "Cherry"
+
+[tts.clone]
+model = "qwen3-tts-vc-2026-01-22"
+min_ref_seconds = 8
+max_ref_seconds = 18
 
 [asr]
 model = "medium"
@@ -77,13 +82,29 @@ output_bitrate = "192k"
     assert config.translation.batch_size == 2
     assert config.translation.max_concurrency == 3
     assert config.tts.provider == "dashscope"
-    assert config.tts.voice_mode == "clone"
+    assert config.tts.mode == "clone"
     assert config.tts.max_concurrency == 2
-    assert config.tts.clone_min_ref_seconds == 8
-    assert config.tts.clone_max_ref_seconds == 18
-    assert config.tts.voice_map == {"SPEAKER_00": "Cherry"}
+    assert config.tts.clone.min_ref_seconds == 8
+    assert config.tts.clone.max_ref_seconds == 18
+    assert config.tts.preset.voice_map == {"SPEAKER_00": "Cherry"}
     assert config.asr.compute_type == "int8"
     assert config.compose.output_bitrate == "192k"
+
+
+def test_load_config_rejects_legacy_tts_fields(tmp_path: Path) -> None:
+    config_path = tmp_path / "podtran.toml"
+    config_path.write_text(
+        """
+[tts]
+voice_mode = "clone"
+model = "old-model"
+clone_min_ref_seconds = 8
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Please run 'podtran init' to rebuild the config"):
+        load_config(config_path)
 
 
 def test_translation_and_tts_resolve_provider_defaults_and_overrides() -> None:
@@ -96,25 +117,26 @@ def test_translation_and_tts_resolve_provider_defaults_and_overrides() -> None:
     assert config.asr.batch_size == 4
     assert config.tts.resolved_base_url() == DEFAULT_TTS_BASE_URL
     assert config.tts.max_concurrency == 4
-    assert config.tts.resolved_customization_url() == "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/customization"
 
     custom = AppConfig(
         translation={"base_url": "https://example.com/v1/"},
-        tts={"base_url": "https://tts.example.com/root/", "customization_url": "https://tts.example.com/custom/"},
+        tts={"base_url": "https://tts.example.com/root/"},
     )
     assert custom.translation.resolved_base_url() == "https://example.com/v1"
     assert custom.tts.resolved_base_url() == "https://tts.example.com/root"
-    assert custom.tts.resolved_customization_url() == "https://tts.example.com/custom"
 
 
 def test_tts_config_resolves_clone_and_preset_defaults() -> None:
     clone_config = AppConfig()
-    preset_config = AppConfig(tts=TTSConfig(voice_mode="preset"))
+    preset_config = AppConfig(tts=TTSConfig(mode="preset"))
 
-    assert clone_config.tts.resolved_model() == DEFAULT_TTS_CLONE_MODEL
-    assert preset_config.tts.resolved_model() == DEFAULT_TTS_PRESET_MODEL
-    assert clone_config.tts.resolved_backend() == "dashscope"
-    assert AppConfig(tts=TTSConfig(provider="custom", voice_mode="preset")).tts.resolved_backend() == "openai_compatible"
+    assert clone_config.tts.clone_model() == DEFAULT_TTS_CLONE_MODEL
+    assert preset_config.tts.preset_model() == DEFAULT_TTS_PRESET_MODEL
+
+
+def test_tts_config_rejects_invalid_mode() -> None:
+    with pytest.raises(ValueError, match="preset|clone"):
+        AppConfig(tts={"mode": "clonee"})
 
 
 def test_build_init_config_sets_provider_managed_auth() -> None:
@@ -130,7 +152,7 @@ def test_build_init_config_sets_provider_managed_auth() -> None:
     assert config.translation.provider == "dashscope"
     assert config.translation.model == "custom-translate"
     assert config.tts.provider == "dashscope"
-    assert config.tts.model == "custom-tts"
+    assert config.tts.clone.model == "custom-tts"
 
 
 def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None:
@@ -148,12 +170,27 @@ def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None
     assert 'model = "qwen-flash"' in rendered
     assert "batch_size = 8" in rendered
     assert rendered.count("max_concurrency = 4") == 2
-    assert 'voice_mode = "clone"' in rendered
+    assert 'mode = "clone"' in rendered
+    assert f'model = "{DEFAULT_TTS_PRESET_MODEL}"' in rendered
     assert f'model = "{DEFAULT_TTS_CLONE_MODEL}"' in rendered
     assert 'api_key = ""' in rendered
+    assert "\n[tts.preset]\n" in rendered
+    assert "\n[tts.clone]\n" in rendered
+    assert "enrollment_model" not in rendered
+    assert "customization_url" not in rendered
     assert "\n[asr]\n" in rendered
-    assert "\n[asr]\nmodel = \"medium\"\ncompute_type = \"int8\"\ndevice = \"cpu\"\nlanguage = \"en\"\nbatch_size = 4\n" in rendered
     assert 'backend = ' not in rendered
+
+
+def test_render_config_toml_uses_new_nested_tts_sections() -> None:
+    rendered = render_config_toml(AppConfig())
+
+    assert "[tts]" in rendered
+    assert "[tts.preset]" in rendered
+    assert "[tts.preset.voice_map]" in rendered
+    assert "[tts.clone]" in rendered
+    assert "voice_mode" not in rendered
+    assert "customization_url" not in rendered
 
 
 def test_resolve_workdir_uses_default_and_override() -> None:

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+from podtran.models import VoiceMode
 
 try:
     import tomllib
@@ -21,6 +22,17 @@ DEFAULT_TTS_ENROLLMENT_MODEL = "qwen-voice-enrollment"
 DEFAULT_TTS_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
 DEFAULT_WORKDIR = Path("~/.podtran")
 DEFAULT_CONFIG_FILENAME = "podtran.toml"
+DEFAULT_FALLBACK_VOICES = ["Cherry", "Serena", "Ethan", "Chelsie"]
+LEGACY_TTS_KEYS = (
+    "voice_mode",
+    "model",
+    "enrollment_model",
+    "clone_min_ref_seconds",
+    "clone_max_ref_seconds",
+    "customization_url",
+    "fallback_voices",
+    "voice_map",
+)
 
 
 class ProviderConfig(BaseModel):
@@ -54,36 +66,32 @@ class TranslationConfig(BaseModel):
         return ""
 
 
+class TTSPresetConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    model: str = DEFAULT_TTS_PRESET_MODEL
+    voice_map: dict[str, str] = Field(default_factory=dict)
+    fallback_voices: list[str] = Field(default_factory=lambda: list(DEFAULT_FALLBACK_VOICES))
+
+
+class TTSCloneConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    model: str = DEFAULT_TTS_CLONE_MODEL
+    min_ref_seconds: int = 10
+    max_ref_seconds: int = 20
+
+
 class TTSConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     provider: str = DEFAULT_TTS_PROVIDER
     base_url: str = ""
-    model: str = DEFAULT_TTS_CLONE_MODEL
-    voice_mode: str = "clone"
-    enrollment_model: str = DEFAULT_TTS_ENROLLMENT_MODEL
-    voice_map: dict[str, str] = Field(default_factory=dict)
-    fallback_voices: list[str] = Field(default_factory=lambda: ["Cherry", "Serena", "Ethan", "Chelsie"])
-    language_type: str = "Chinese"
+    mode: VoiceMode = "clone"
     timeout_seconds: int = 120
     max_concurrency: int = 4
-    clone_min_ref_seconds: int = 10
-    clone_max_ref_seconds: int = 20
-    customization_url: str = ""
-
-    def resolved_model(self) -> str:
-        model = self.model.strip()
-        voice_mode = self.voice_mode.strip().lower()
-        if voice_mode == "clone" and (not model or model == DEFAULT_TTS_PRESET_MODEL):
-            return DEFAULT_TTS_CLONE_MODEL
-        if voice_mode != "clone" and (not model or model == DEFAULT_TTS_CLONE_MODEL):
-            return DEFAULT_TTS_PRESET_MODEL
-        return model
-
-    def resolved_backend(self) -> str:
-        if self.provider.strip().lower() == "dashscope":
-            return "dashscope"
-        return "openai_compatible"
+    preset: TTSPresetConfig = Field(default_factory=TTSPresetConfig)
+    clone: TTSCloneConfig = Field(default_factory=TTSCloneConfig)
 
     def resolved_base_url(self) -> str:
         base_url = self.base_url.strip().rstrip("/")
@@ -93,14 +101,16 @@ class TTSConfig(BaseModel):
             return DEFAULT_TTS_BASE_URL
         return ""
 
-    def resolved_customization_url(self) -> str:
-        customization_url = self.customization_url.strip().rstrip("/")
-        if customization_url:
-            return customization_url
-        base_url = self.resolved_base_url()
-        if not base_url:
-            return ""
-        return base_url + "/services/audio/tts/customization"
+    def normalized_mode(self) -> str:
+        return self.mode.strip().lower()
+
+    def preset_model(self) -> str:
+        model = self.preset.model.strip()
+        return model or DEFAULT_TTS_PRESET_MODEL
+
+    def clone_model(self) -> str:
+        model = self.clone.model.strip()
+        return model or DEFAULT_TTS_CLONE_MODEL
 
 
 class ASRConfig(BaseModel):
@@ -154,15 +164,23 @@ def build_init_config(
     config.translation.provider = DEFAULT_TRANSLATION_PROVIDER
     config.translation.model = translation_model.strip() or DEFAULT_TRANSLATION_MODEL
     config.tts.provider = DEFAULT_TTS_PROVIDER
-    config.tts.model = tts_model.strip() or DEFAULT_TTS_CLONE_MODEL
+    config.tts.clone.model = tts_model.strip() or DEFAULT_TTS_CLONE_MODEL
     return config
 
 
 def load_config(path: Path) -> AppConfig:
     if not path.exists():
         raise FileNotFoundError(f"Config not found: {path}\nRun 'podtran init' to create a default config.")
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    data = load_config_data(path)
+    _raise_for_legacy_tts_config(path, data)
     return AppConfig.model_validate(data)
+
+
+def load_config_data(path: Path) -> dict[str, Any]:
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file must contain a TOML table at the top level: {path}")
+    return data
 
 
 def resolve_workdir(workdir_override: Path | str | None = None, config_path: Path | None = None) -> Path:
@@ -183,7 +201,6 @@ def render_config_toml(config: AppConfig) -> str:
     lines = [
         "# This config lives under ~/.podtran/podtran.toml by default.",
         "# Use --workdir to move config, tasks, and cache into a different directory.",
-        '# Leave base_url and customization_url empty to use the provider defaults.',
         f'hf_token = "{config.hf_token}"',
         "",
         "[providers.dashscope]",
@@ -198,24 +215,25 @@ def render_config_toml(config: AppConfig) -> str:
         f"max_concurrency = {config.translation.max_concurrency}",
         "",
         "[tts]",
-        '# Clone-first defaults. Switch voice_mode to "preset" to use preset voices below.',
+        '# Set mode to "preset" to synthesize with preset voices only.',
         f'provider = "{config.tts.provider}"',
         f'base_url = "{config.tts.base_url}"',
-        f'voice_mode = "{config.tts.voice_mode}"',
-        f'model = "{config.tts.resolved_model()}"',
-        f'enrollment_model = "{config.tts.enrollment_model}"',
-        f'language_type = "{config.tts.language_type}"',
+        f'mode = "{config.tts.mode}"',
         f"timeout_seconds = {config.tts.timeout_seconds}",
         "# Segment-level synthesis concurrency. Lower this if your TTS provider rate-limits aggressively.",
         f"max_concurrency = {config.tts.max_concurrency}",
-        f"clone_min_ref_seconds = {config.tts.clone_min_ref_seconds}",
-        f"clone_max_ref_seconds = {config.tts.clone_max_ref_seconds}",
-        f'customization_url = "{config.tts.customization_url}"',
-        "# Preset-only voice assignment settings.",
-        f"fallback_voices = {_render_list(config.tts.fallback_voices)}",
         "",
-        "[tts.voice_map]",
-        *_render_mapping(config.tts.voice_map),
+        "[tts.preset]",
+        f'model = "{config.tts.preset_model()}"',
+        f"fallback_voices = {_render_list(config.tts.preset.fallback_voices)}",
+        "",
+        "[tts.preset.voice_map]",
+        *_render_mapping(config.tts.preset.voice_map),
+        "",
+        "[tts.clone]",
+        f'model = "{config.tts.clone_model()}"',
+        f"min_ref_seconds = {config.tts.clone.min_ref_seconds}",
+        f"max_ref_seconds = {config.tts.clone.max_ref_seconds}",
         "",
         "[asr]",
         f'model = "{config.asr.model}"',
@@ -256,6 +274,26 @@ def _render_mapping(values: dict[str, str]) -> list[str]:
     if not values:
         return ['# SPEAKER_00 = "Cherry"', '# SPEAKER_01 = "Ethan"']
     return [f'{key} = "{value}"' for key, value in values.items()]
+
+
+def detect_legacy_tts_keys(data: dict[str, Any]) -> list[str]:
+    tts = data.get("tts")
+    if not isinstance(tts, dict):
+        return []
+    return [key for key in LEGACY_TTS_KEYS if key in tts]
+
+
+def _raise_for_legacy_tts_config(path: Path, data: dict[str, Any]) -> None:
+    legacy_keys = detect_legacy_tts_keys(data)
+    if not legacy_keys:
+        return
+
+    formatted_keys = ", ".join(f"tts.{key}" for key in legacy_keys)
+    raise ValueError(
+        f"Legacy TTS config detected in {path}: {formatted_keys}. "
+        "Please run 'podtran init' to rebuild the config. "
+        "The init command will back up the old file and preserve hf_token and provider API keys."
+    )
 
 
 def model_dump(data: BaseModel | list[BaseModel] | dict[str, Any]) -> Any:

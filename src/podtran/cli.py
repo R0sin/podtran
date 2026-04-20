@@ -24,7 +24,9 @@ from podtran.config import (
     DEFAULT_TRANSLATION_MODEL,
     DEFAULT_TTS_PROVIDER,
     DEFAULT_TTS_CLONE_MODEL,
+    detect_legacy_tts_keys,
     load_config,
+    load_config_data,
     render_config_toml,
     resolve_config_path,
     resolve_workdir,
@@ -248,13 +250,25 @@ def init(
 ) -> None:
     config_path = resolve_config_path(config, workdir)
     existing_config: AppConfig | None = None
+    legacy_rebuild = False
     if config_path.exists():
         if force:
             existing_config = None
         else:
-            existing_config = load_config(config_path)
+            raw_config = load_config_data(config_path)
+            if detect_legacy_tts_keys(raw_config):
+                existing_config = _rebuild_config_with_preserved_auth(raw_config)
+                legacy_rebuild = True
+            else:
+                existing_config = AppConfig.model_validate(raw_config)
     config_data = _prompt_init_config(existing_config)
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    if legacy_rebuild:
+        backup_path = _backup_legacy_config(config_path)
+        console.print(
+            f"[yellow]Legacy TTS config detected.[/yellow] Backed up old config to {backup_path} "
+            "and rebuilt a fresh config shape. Only hf_token and provider API keys were preserved."
+        )
     config_path.write_text(render_config_toml(config_data), encoding="utf-8")
     resolved_workdir = resolve_workdir(workdir, config_path=config_path)
     paths = ArtifactPaths.from_task_id(resolved_workdir, "example-run")
@@ -286,11 +300,29 @@ def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
         config.translation.model or DEFAULT_TRANSLATION_MODEL,
     )
     config.tts.provider = DEFAULT_TTS_PROVIDER
-    config.tts.model = _prompt_with_default(
-        "TTS model",
-        config.tts.model or DEFAULT_TTS_CLONE_MODEL,
+    config.tts.clone.model = _prompt_with_default(
+        "TTS clone model",
+        config.tts.clone.model or DEFAULT_TTS_CLONE_MODEL,
     )
     return config
+
+
+def _rebuild_config_with_preserved_auth(raw_config: dict[str, object]) -> AppConfig:
+    rebuilt = AppConfig()
+    rebuilt.hf_token = str(raw_config.get("hf_token", "") or "").strip()
+    providers = raw_config.get("providers")
+    if isinstance(providers, dict):
+        dashscope = providers.get("dashscope")
+        if isinstance(dashscope, dict):
+            rebuilt.providers.dashscope.api_key = str(dashscope.get("api_key", "") or "").strip()
+    return rebuilt
+
+
+def _backup_legacy_config(config_path: Path) -> Path:
+    backup_path = config_path.with_name(f"{config_path.name}.bak")
+    if not backup_path.exists():
+        backup_path.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+    return backup_path
 
 
 def _prompt_required(label: str, *, hide_input: bool = False, current_value: str = "") -> str:
@@ -869,8 +901,8 @@ def _build_segments_from_transcript(transcript: list[TranscriptSegment], cfg: Ap
         transcript,
         pause_threshold=cfg.compose.block_pause_threshold,
         max_block_duration=cfg.compose.max_block_duration,
-        configured_voice_map=cfg.tts.voice_map,
-        fallback_voices=cfg.tts.fallback_voices,
+        configured_voice_map=cfg.tts.preset.voice_map,
+        fallback_voices=cfg.tts.preset.fallback_voices,
     )
 
 
@@ -1144,7 +1176,7 @@ def _synthesize_output_refs(cfg: AppConfig) -> dict[str, str]:
         "tts_dir": "tts",
         "refs_dir": "refs",
     }
-    if cfg.tts.voice_mode.strip().lower() == "clone":
+    if cfg.tts.normalized_mode() == "clone":
         refs["voices_json"] = "voices.json"
     return refs
 

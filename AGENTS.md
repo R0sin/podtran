@@ -21,7 +21,7 @@ ensuring reproducibility and efficient reuse across tasks.
 | Data models | Pydantic v2 (`BaseModel`, `model_dump`, `model_copy`) |
 | ASR | WhisperX (word-level alignment + speaker diarization) |
 | Translation | OpenAI-compatible LLM API (default: Qwen3 via DashScope) |
-| TTS | DashScope Qwen3 TTS (`preset` or `clone` mode) |
+| TTS | DashScope Qwen3 TTS, OpenAI-compatible TTS |
 | Audio toolchain | ffmpeg / ffprobe (external binaries) |
 | HTTP client | httpx (TTS), openai SDK (translation, OpenAI-compat TTS) |
 | Retry | tenacity |
@@ -39,8 +39,8 @@ podtran/
 │   ├── asr.py            # WhisperX transcription with progress callbacks
 │   ├── merge.py          # Transcript → block-aggregated segments
 │   ├── translate.py      # Batch translation via OpenAI-compatible API
-│   ├── tts.py            # TTS backends (DashScope, OpenAI-compatible), segment-level synthesis + cache
-│   ├── voices.py         # Voice clone: reference audio selection, DashScope enrollment, VoiceProfileManager
+│   ├── tts.py            # TTS backends (DashScope, OpenAI-compatible), backend dispatch, segment-level synthesis + cache
+│   ├── voices.py         # Voice clone: reference audio selection, DashScope enrollment, VoiceResolver, clone profile/cache handling
 │   ├── compose.py        # Final audio compositing (interleave / replace modes)
 │   ├── artifacts.py      # ArtifactPaths helper, JSON I/O, atomic writes, copy/remove utilities
 │   ├── tasks.py           # TaskStore: create/load/list/save task manifests under artifacts/tasks/<task_id>/
@@ -175,8 +175,23 @@ It does not perform dry-run planning or predict reruns.
 
 | Mode | Model | Behavior |
 |---|---|---|
-| `preset` | `qwen3-tts-flash` | Uses `voice_map` + `fallback_voices` |
-| `clone` | `qwen3-tts-vc-*` | Extracts reference audio, enrolls voice via DashScope, caches voice profile |
+| `preset` | `qwen3-tts-flash` or provider-specific preset model | Uses `voice_map` + `fallback_voices`; supported by DashScope and explicit `openai_compatible` TTS providers |
+| `clone` | `qwen3-tts-vc-*` | Currently DashScope-only. Extracts reference audio, enrolls a provider-managed clone asset, then caches the resolved voice profile |
+
+### TTS Provider Routing
+
+- **TTS provider routing is explicit** — `tts.provider = "dashscope"` selects DashScope; `tts.provider = "openai_compatible"` selects the OpenAI-compatible backend.
+- **Unknown TTS provider names are rejected** — non-DashScope names no longer implicitly fall back to the OpenAI-compatible backend.
+- **Clone support is backend-specific** — today only DashScope supports production `clone` mode.
+- **Internal clone asset kinds** use `VoiceSpec` variants:
+  - `preset`
+  - `provider_clone` — provider-managed reusable clone asset (used by DashScope enrollment today)
+  - `reference_clone` — reserved for backends that can synthesize directly from reference audio/text
+
+### Clone Persistence Compatibility
+
+- Clone-related cache validity depends on the serialized `VoiceSpec` shape and stage versions.
+- When changing clone asset semantics or serialized `VoiceSpec` structure, bump the relevant stage versions in `stage_versions.py`.
 
 ### Memory Management
 
@@ -212,6 +227,7 @@ It does not perform dry-run planning or predict reruns.
 - **`translate` only runs when `transcript.json` exists** — stage commands do not auto-run prerequisites.
 - **`synthesize` does not use shared cache at the stage level** — only per-segment TTS
   results are cached in `artifacts/cache/tts/`.
+- **Clone cache compatibility is versioned by serialized `VoiceSpec` shape** — renaming clone kinds or changing clone payload structure invalidates prior TTS / voice-clone cache entries.
 - **`compose` only runs when there is at least one completed TTS output** — it does not auto-run synthesize.
 - **WhisperX requires HuggingFace token** — you must accept the `speaker-diarization-community-1`
   model agreement on HuggingFace before diarization will work.

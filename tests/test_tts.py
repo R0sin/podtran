@@ -8,20 +8,32 @@ from podtran.artifacts import ArtifactPaths, read_model_list, write_json
 from podtran.cache_store import CacheStore
 from podtran.config import AppConfig, DEFAULT_TTS_CLONE_MODEL, DEFAULT_TTS_PRESET_MODEL, TTSConfig
 from podtran.fingerprints import FingerprintService
-from podtran.models import ResolvedVoiceTarget, SegmentRecord
-from podtran.tts import _resolve_tts_key, _resolve_tts_model, build_tts_backend, synthesize_segments
+from podtran.models import (
+    PresetVoiceSpec,
+    ProviderClonePayload,
+    ProviderCloneSpec,
+    ReferenceClonePayload,
+    ReferenceCloneSpec,
+    SegmentRecord,
+)
+from podtran.tts import _resolve_openai_compatible_api_key, _resolve_tts_model, build_tts_backend, synthesize_segments
 
 
 class _DummyBackend:
+    supported_voice_kinds = frozenset({"preset", "provider_clone", "reference_clone"})
+
     def __init__(self) -> None:
         self.calls = 0
 
-    def synthesize(self, text: str, target: ResolvedVoiceTarget, output_path: Path) -> None:
+    def synthesize(self, text: str, spec, model: str, output_path: Path) -> None:
+        _ = (text, spec, model)
         self.calls += 1
         output_path.write_bytes(b"wav")
 
 
 class _TrackingBackend:
+    supported_voice_kinds = frozenset({"preset", "provider_clone", "reference_clone"})
+
     def __init__(self, *, fail_texts: set[str] | None = None, sleep_seconds: float = 0.05) -> None:
         self.calls = 0
         self.active_calls = 0
@@ -30,7 +42,8 @@ class _TrackingBackend:
         self.sleep_seconds = sleep_seconds
         self._lock = threading.Lock()
 
-    def synthesize(self, text: str, target: ResolvedVoiceTarget, output_path: Path) -> None:
+    def synthesize(self, text: str, spec, model: str, output_path: Path) -> None:
+        _ = (spec, model)
         with self._lock:
             self.calls += 1
             self.active_calls += 1
@@ -45,10 +58,8 @@ class _TrackingBackend:
                 self.active_calls -= 1
 
 
-
 def _paths(tmp_path: Path, task_id: str = "task-1") -> ArtifactPaths:
     return ArtifactPaths.from_task_id(tmp_path, task_id)
-
 
 
 def _segment() -> SegmentRecord:
@@ -68,49 +79,66 @@ def _segment_with_text(segment_id: str, text_zh: str, voice: str = "Cherry") -> 
     return _segment().model_copy(update={"segment_id": segment_id, "block_id": f"block_{segment_id}", "text_zh": text_zh, "voice": voice})
 
 
+def test_resolve_tts_model_switches_between_clone_and_preset_specs() -> None:
+    config = AppConfig(tts=TTSConfig(mode="clone"))
 
-def test_resolve_tts_model_switches_back_to_preset_model_for_clone_fallback() -> None:
-    config = AppConfig(tts=TTSConfig(voice_mode="clone"))
+    clone_spec = ProviderCloneSpec(
+        identity="dashscope:provider_clone:voice-token",
+        provider="dashscope",
+        payload=ProviderClonePayload(voice_token="voice-token"),
+    )
+    preset_spec = PresetVoiceSpec(identity="preset:Cherry", voice_name="Cherry")
 
-    clone_target = ResolvedVoiceTarget(speaker="SPEAKER_00", provider="dashscope", mode="clone", voice="voice-token")
-    preset_target = ResolvedVoiceTarget(speaker="SPEAKER_00", provider="dashscope", mode="preset", voice="Cherry")
-
-    assert _resolve_tts_model(config, clone_target) == DEFAULT_TTS_CLONE_MODEL
-    assert _resolve_tts_model(config, preset_target) == DEFAULT_TTS_PRESET_MODEL
+    assert _resolve_tts_model(config, clone_spec) == DEFAULT_TTS_CLONE_MODEL
+    assert _resolve_tts_model(config, preset_spec) == DEFAULT_TTS_PRESET_MODEL
 
 
+def test_resolve_tts_model_supports_reference_clone_specs() -> None:
+    config = AppConfig(tts=TTSConfig(mode="clone"))
+    reference_spec = ReferenceCloneSpec(
+        identity="fake:reference_clone:ref-1",
+        provider="fake",
+        payload=ReferenceClonePayload(reference_fingerprint="ref-1"),
+    )
 
-def test_build_tts_backend_rejects_clone_mode_for_non_dashscope_backend() -> None:
-    config = AppConfig(tts=TTSConfig(provider="custom", voice_mode="clone"))
+    assert _resolve_tts_model(config, reference_spec) == DEFAULT_TTS_CLONE_MODEL
+
+
+def test_build_tts_backend_rejects_clone_mode_for_backend_without_clone_capability() -> None:
+    config = AppConfig(tts=TTSConfig(provider="openai_compatible", mode="clone"))
 
     with pytest.raises(RuntimeError, match="Clone mode is not supported"):
         build_tts_backend(config)
 
 
-def test_resolve_tts_key_prefers_provider_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = AppConfig(providers={"dashscope": {"api_key": "dash-key"}})
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "env-key")
+def test_build_tts_backend_rejects_unknown_provider() -> None:
+    config = AppConfig(tts=TTSConfig(provider="custom", mode="preset"))
 
-    assert _resolve_tts_key(config) == "dash-key"
+    with pytest.raises(RuntimeError, match="Unsupported TTS provider"):
+        build_tts_backend(config)
 
+
+def test_resolve_openai_compatible_api_key_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PODTRAN_TTS_API_KEY", "env-key")
+
+    assert _resolve_openai_compatible_api_key() == "env-key"
 
 
 def test_synthesize_segments_requires_source_audio_in_clone_mode(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     write_json(paths.translated_json, [_segment()])
-    config = AppConfig(tts=TTSConfig(voice_mode="clone"))
+    config = AppConfig(tts=TTSConfig(mode="clone"))
 
     with pytest.raises(RuntimeError, match="Clone mode requires source audio"):
         synthesize_segments(paths.translated_json, paths.translated_json, config, paths)
-
 
 
 def test_synthesize_segments_raises_when_clone_voice_target_is_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     write_json(paths.translated_json, [_segment()])
-    config = AppConfig(tts=TTSConfig(voice_mode="clone"))
+    config = AppConfig(tts=TTSConfig(mode="clone"))
 
     monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: _DummyBackend())
     monkeypatch.setattr(
@@ -122,7 +150,6 @@ def test_synthesize_segments_raises_when_clone_voice_target_is_missing(tmp_path:
         synthesize_segments(paths.translated_json, paths.translated_json, config, paths, source_audio=tmp_path / "source.wav")
 
 
-
 def test_synthesize_segments_reuses_shared_tts_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     first_paths = _paths(tmp_path, "task-1")
     second_paths = _paths(tmp_path, "task-2")
@@ -131,7 +158,7 @@ def test_synthesize_segments_reuses_shared_tts_cache(tmp_path: Path, monkeypatch
     write_json(first_paths.translated_json, [_segment()])
     write_json(second_paths.translated_json, [_segment()])
 
-    config = AppConfig(tts=TTSConfig(voice_mode="preset"))
+    config = AppConfig(tts=TTSConfig(mode="preset"))
     cache_store = CacheStore(first_paths.cache_dir)
     fingerprints = FingerprintService(first_paths.cache_indexes_dir)
     backend = _DummyBackend()
@@ -162,7 +189,6 @@ def test_synthesize_segments_reuses_shared_tts_cache(tmp_path: Path, monkeypatch
     assert Path(second_segments[0].tts_audio_path).exists()
 
 
-
 def test_synthesize_segments_does_not_reuse_shared_tts_cache_when_preset_voice_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     first_paths = _paths(tmp_path, "task-1")
     second_paths = _paths(tmp_path, "task-2")
@@ -171,7 +197,7 @@ def test_synthesize_segments_does_not_reuse_shared_tts_cache_when_preset_voice_c
     write_json(first_paths.translated_json, [_segment()])
     write_json(second_paths.translated_json, [_segment().model_copy(update={"voice": "Serena"})])
 
-    config = AppConfig(tts=TTSConfig(voice_mode="preset"))
+    config = AppConfig(tts=TTSConfig(mode="preset"))
     cache_store = CacheStore(first_paths.cache_dir)
     fingerprints = FingerprintService(first_paths.cache_indexes_dir)
     backend = _DummyBackend()
@@ -212,7 +238,7 @@ def test_synthesize_segments_reports_progress_for_preset_mode(tmp_path: Path, mo
     synthesize_segments(
         paths.translated_json,
         paths.translated_json,
-        AppConfig(tts=TTSConfig(voice_mode="preset")),
+        AppConfig(tts=TTSConfig(mode="preset")),
         paths,
         progress_callback=lambda completed, total, message: events.append((completed, total, message)),
     )
@@ -239,7 +265,7 @@ def test_synthesize_segments_runs_distinct_work_items_concurrently(tmp_path: Pat
     synthesize_segments(
         paths.translated_json,
         paths.translated_json,
-        AppConfig(tts=TTSConfig(voice_mode="preset", max_concurrency=2)),
+        AppConfig(tts=TTSConfig(mode="preset", max_concurrency=2)),
         paths,
     )
 
@@ -265,7 +291,7 @@ def test_synthesize_segments_deduplicates_identical_work_items(tmp_path: Path, m
     synthesize_segments(
         paths.translated_json,
         paths.translated_json,
-        AppConfig(tts=TTSConfig(voice_mode="preset", max_concurrency=4)),
+        AppConfig(tts=TTSConfig(mode="preset", max_concurrency=4)),
         paths,
     )
 
@@ -294,7 +320,7 @@ def test_synthesize_segments_isolates_worker_failures(tmp_path: Path, monkeypatc
     synthesized = synthesize_segments(
         paths.translated_json,
         paths.translated_json,
-        AppConfig(tts=TTSConfig(voice_mode="preset", max_concurrency=2)),
+        AppConfig(tts=TTSConfig(mode="preset", max_concurrency=2)),
         paths,
     )
 
@@ -320,7 +346,7 @@ def test_synthesize_segments_respects_max_concurrency_of_one(tmp_path: Path, mon
     synthesize_segments(
         paths.translated_json,
         paths.translated_json,
-        AppConfig(tts=TTSConfig(voice_mode="preset", max_concurrency=1)),
+        AppConfig(tts=TTSConfig(mode="preset", max_concurrency=1)),
         paths,
     )
 

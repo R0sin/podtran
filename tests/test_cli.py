@@ -178,7 +178,7 @@ def test_init_prompts_for_provider_managed_config_and_writes_defaults(tmp_path: 
     assert config.translation.provider == "dashscope"
     assert config.translation.model == "qwen-flash"
     assert config.tts.provider == "dashscope"
-    assert config.tts.model == "qwen3-tts-vc-2026-01-22"
+    assert config.tts.clone.model == "qwen3-tts-vc-2026-01-22"
     assert (tmp_path / "artifacts").exists()
     assert "speaker-diarization-community-1" in result.output
     assert "hf.co/settings/tokens" in result.output
@@ -198,7 +198,7 @@ def test_init_reprompts_required_values(tmp_path: Path) -> None:
     assert config.hf_token == "hf-token"
     assert config.providers.dashscope.api_key == "dash-key"
     assert config.translation.model == "custom-translator"
-    assert config.tts.model == "custom-tts"
+    assert config.tts.clone.model == "custom-tts"
     assert result.output.count("Hugging Face token") >= 2
     assert result.output.count("DashScope API key") >= 2
 
@@ -209,9 +209,9 @@ def test_init_uses_existing_values_as_defaults_and_preserves_other_fields(tmp_pa
     config.hf_token = "hf-existing"
     config.providers.dashscope.api_key = "dash-existing"
     config.translation.model = "existing-translate"
-    config.tts.model = "existing-tts"
-    config.tts.voice_mode = "preset"
-    config.tts.voice_map = {"SPEAKER_00": "Cherry"}
+    config.tts.clone.model = "existing-tts"
+    config.tts.mode = "preset"
+    config.tts.preset.voice_map = {"SPEAKER_00": "Cherry"}
     config.asr.batch_size = 7
     config.compose.output_bitrate = "256k"
     config_path.write_text(cli.render_config_toml(config), encoding="utf-8")
@@ -227,11 +227,64 @@ def test_init_uses_existing_values_as_defaults_and_preserves_other_fields(tmp_pa
     assert updated.hf_token == "hf-existing"
     assert updated.providers.dashscope.api_key == "dash-existing"
     assert updated.translation.model == "updated-translate"
-    assert updated.tts.model == "existing-tts"
-    assert updated.tts.voice_mode == "preset"
-    assert updated.tts.voice_map == {"SPEAKER_00": "Cherry"}
+    assert updated.tts.clone.model == "existing-tts"
+    assert updated.tts.mode == "preset"
+    assert updated.tts.preset.voice_map == {"SPEAKER_00": "Cherry"}
     assert updated.asr.batch_size == 7
     assert updated.compose.output_bitrate == "256k"
+
+
+def test_init_rebuilds_legacy_tts_config_with_backup_and_preserved_auth(tmp_path: Path) -> None:
+    config_path = tmp_path / "podtran.toml"
+    config_path.write_text(
+        """
+hf_token = "hf-legacy"
+
+[providers.dashscope]
+api_key = "dash-legacy"
+
+[translation]
+provider = "dashscope"
+model = "legacy-translate"
+
+[tts]
+provider = "dashscope"
+voice_mode = "clone"
+model = "legacy-tts"
+fallback_voices = ["Cherry"]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
+        input="\n\n\n\n",
+    )
+
+    assert result.exit_code == 0
+    rebuilt = load_config(config_path)
+    backup_path = tmp_path / "podtran.toml.bak"
+    assert backup_path.exists()
+    assert 'voice_mode = "clone"' in backup_path.read_text(encoding="utf-8")
+    assert rebuilt.hf_token == "hf-legacy"
+    assert rebuilt.providers.dashscope.api_key == "dash-legacy"
+    assert rebuilt.translation.model == "qwen-flash"
+    assert rebuilt.tts.clone.model == "qwen3-tts-vc-2026-01-22"
+    assert "Legacy TTS config detected." in result.output
+    assert "Only hf_token and provider API keys were preserved." in _normalize_help_output(result.output)
+
+
+def test_backup_legacy_config_preserves_existing_backup(tmp_path: Path) -> None:
+    config_path = tmp_path / "podtran.toml"
+    config_path.write_text('mode = "new"', encoding="utf-8")
+    backup_path = tmp_path / "podtran.toml.bak"
+    backup_path.write_text('mode = "old"', encoding="utf-8")
+
+    preserved = cli._backup_legacy_config(config_path)
+
+    assert preserved == backup_path
+    assert backup_path.read_text(encoding="utf-8") == 'mode = "old"'
 
 
 @pytest.mark.parametrize(
@@ -400,11 +453,11 @@ def test_translate_shared_cache_ignores_voice_map_and_syncs_current_voice(tmp_pa
     cache_store = CacheStore(tmp_path / "artifacts" / "cache")
 
     first_cfg = AppConfig()
-    first_cfg.tts.voice_mode = "preset"
-    first_cfg.tts.voice_map = {"SPEAKER_00": "Cherry"}
+    first_cfg.tts.mode = "preset"
+    first_cfg.tts.preset.voice_map = {"SPEAKER_00": "Cherry"}
 
     second_cfg = first_cfg.model_copy(deep=True)
-    second_cfg.tts.voice_map = {"SPEAKER_00": "Serena"}
+    second_cfg.tts.preset.voice_map = {"SPEAKER_00": "Serena"}
 
     first_task = store.create_task(audio, first_cfg, f"podtran {audio}")
     second_task = store.create_task(audio, second_cfg, f"podtran {audio}")
@@ -508,7 +561,7 @@ def test_synthesize_is_up_to_date_after_successful_run(tmp_path: Path, monkeypat
     import podtran.tts as tts
 
     cfg, store, task_manifest = _preview_task(tmp_path)
-    cfg.tts.voice_mode = "preset"
+    cfg.tts.mode = "preset"
     paths = store.paths_for(task_manifest)
     executor = StageExecutor(store, task_manifest, paths)
     cache_store = CacheStore(paths.cache_dir)

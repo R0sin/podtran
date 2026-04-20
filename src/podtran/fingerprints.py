@@ -26,20 +26,17 @@ TRANSLATE_CONFIG_KEYS = [
 VOICE_CLONE_CONFIG_KEYS = [
     "tts.provider",
     "tts.base_url",
-    "tts.voice_mode",
-    "tts.model",
-    "tts.enrollment_model",
-    "tts.language_type",
-    "tts.clone_min_ref_seconds",
-    "tts.clone_max_ref_seconds",
-    "tts.customization_url",
+    "tts.mode",
+    "tts.clone.model",
+    "tts.clone.min_ref_seconds",
+    "tts.clone.max_ref_seconds",
 ]
 TTS_CONFIG_KEYS = [
     "tts.provider",
     "tts.base_url",
-    "tts.voice_mode",
-    "tts.model",
-    "tts.language_type",
+    "tts.mode",
+    "tts.preset.model",
+    "tts.clone.model",
 ]
 SYNTHESIZE_CONFIG_KEYS = list(dict.fromkeys([*VOICE_CLONE_CONFIG_KEYS, *TTS_CONFIG_KEYS]))
 COMPOSE_CONFIG_KEYS = [

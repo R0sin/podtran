@@ -27,7 +27,8 @@
 - Python `3.11` 推荐，支持 `>=3.10,<3.13`
 - `ffmpeg` 和 `ffprobe` 需要在 `PATH` 中可执行
 - 需要一个 Hugging Face token 给 WhisperX diarization 使用
-- 需要 DashScope API key 给翻译和 TTS 使用
+- 翻译默认需要 DashScope API key
+- TTS 可选 `dashscope`、`openai-compatible` 或 `vllm-omni`，所需配置取决于 provider
 
 ## 安装
 
@@ -72,9 +73,24 @@ podtran init
 - 先去接受 Hugging Face 的 `speaker-diarization-community-1` 协议
 - 填写 `hf_token`
 - 填写 DashScope API key
-- 确认翻译模型和 TTS 模型
+- 确认翻译模型
+- 选择 TTS provider，并按提示填写对应的 `base_url`、API key、mode 和 model
 
 默认配置会写到 `~/.podtran/podtran.toml`。如果传 `--workdir <path>`，则会写到 `<path>/podtran.toml`，同时任务和缓存也会放到这个目录下。
+
+TTS provider 说明：
+
+- `dashscope`：支持 `preset` 和 `clone`
+- `openai-compatible`：支持 `preset`
+- `vllm-omni`：支持 `preset` 和 `clone`，需要配置 `tts.base_url`
+
+如果你准备自己部署 `vllm-omni` 的 `Qwen3-TTS` 服务，可先看这些官方资料：
+
+- `vLLM-Omni` 文档：[Installation / Quickstart](https://vllm-omni.readthedocs.io/)
+- `vLLM-Omni` 仓库：[vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni)
+- `Qwen3-TTS` 官方说明：[QwenLM/Qwen3-TTS 的 vLLM Usage](https://github.com/QwenLM/Qwen3-TTS)
+
+对 `podtran` 来说，只需要一个可访问的 `vllm-omni` TTS 服务，并把 `tts.base_url` 指向它；默认示例地址是 `http://localhost:8091/v1`。
 
 转录相关设置默认来自 `podtran.toml` 里的 `[asr]` 配置：
 

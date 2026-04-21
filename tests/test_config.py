@@ -9,6 +9,8 @@ from podtran.config import (
     DEFAULT_TTS_BASE_URL,
     DEFAULT_TTS_CLONE_MODEL,
     DEFAULT_TTS_PRESET_MODEL,
+    DEFAULT_TTS_TIMEOUT_SECONDS,
+    DEFAULT_VLLM_OMNI_LANGUAGE,
     TTSConfig,
     build_init_config,
     load_config,
@@ -17,6 +19,7 @@ from podtran.config import (
     resolve_workdir,
     write_default_config,
 )
+from podtran.fingerprints import FingerprintService, TTS_CONFIG_KEYS, VOICE_CLONE_CONFIG_KEYS
 
 
 def test_load_config_accepts_new_supported_fields(tmp_path: Path) -> None:
@@ -55,6 +58,12 @@ model = "qwen3-tts-vc-2026-01-22"
 min_ref_seconds = 8
 max_ref_seconds = 18
 
+[tts.vllm_omni]
+api_key = "local-key"
+language = "zh"
+instructions = "Warm broadcast tone."
+x_vector_only_mode = true
+
 [asr]
 model = "medium"
 compute_type = "int8"
@@ -86,9 +95,43 @@ output_bitrate = "192k"
     assert config.tts.max_concurrency == 2
     assert config.tts.clone.min_ref_seconds == 8
     assert config.tts.clone.max_ref_seconds == 18
+    assert config.tts.vllm_omni.api_key == "local-key"
+    assert config.tts.vllm_omni.language == "zh"
+    assert config.tts.vllm_omni.instructions == "Warm broadcast tone."
+    assert config.tts.vllm_omni.x_vector_only_mode is True
     assert config.tts.preset.voice_map == {"SPEAKER_00": "Cherry"}
     assert config.asr.compute_type == "int8"
     assert config.compose.output_bitrate == "192k"
+
+
+def test_load_config_accepts_openai_compatible_and_vllm_omni_providers(tmp_path: Path) -> None:
+    config_path = tmp_path / "podtran.toml"
+    config_path.write_text(
+        """
+[translation]
+provider = "dashscope"
+
+[tts]
+provider = "openai-compatible"
+base_url = "http://localhost:9000/v1"
+mode = "preset"
+
+[tts.preset]
+model = "tts-1"
+
+[tts.vllm_omni]
+language = "Auto"
+instructions = ""
+x_vector_only_mode = false
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.tts.provider == "openai-compatible"
+    assert config.tts.base_url == "http://localhost:9000/v1"
+    assert config.tts.mode == "preset"
 
 
 def test_load_config_rejects_legacy_tts_fields(tmp_path: Path) -> None:
@@ -116,11 +159,13 @@ def test_translation_and_tts_resolve_provider_defaults_and_overrides() -> None:
     assert config.translation.resolved_base_url() == DEFAULT_TRANSLATION_BASE_URL
     assert config.asr.batch_size == 4
     assert config.tts.resolved_base_url() == DEFAULT_TTS_BASE_URL
+    assert config.tts.timeout_seconds == DEFAULT_TTS_TIMEOUT_SECONDS
     assert config.tts.max_concurrency == 4
+    assert config.tts.vllm_omni.language == DEFAULT_VLLM_OMNI_LANGUAGE
 
     custom = AppConfig(
         translation={"base_url": "https://example.com/v1/"},
-        tts={"base_url": "https://tts.example.com/root/"},
+        tts={"base_url": "https://tts.example.com/root/", "provider": "vllm-omni"},
     )
     assert custom.translation.resolved_base_url() == "https://example.com/v1"
     assert custom.tts.resolved_base_url() == "https://tts.example.com/root"
@@ -169,6 +214,7 @@ def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None
     assert 'provider = "dashscope"' in rendered
     assert 'model = "qwen-flash"' in rendered
     assert "batch_size = 8" in rendered
+    assert f"timeout_seconds = {DEFAULT_TTS_TIMEOUT_SECONDS}" in rendered
     assert rendered.count("max_concurrency = 4") == 2
     assert 'mode = "clone"' in rendered
     assert f'model = "{DEFAULT_TTS_PRESET_MODEL}"' in rendered
@@ -176,6 +222,8 @@ def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None
     assert 'api_key = ""' in rendered
     assert "\n[tts.preset]\n" in rendered
     assert "\n[tts.clone]\n" in rendered
+    assert "\n[tts.vllm_omni]\n" in rendered
+    assert 'language = "Auto"' in rendered
     assert "enrollment_model" not in rendered
     assert "customization_url" not in rendered
     assert "\n[asr]\n" in rendered
@@ -189,8 +237,37 @@ def test_render_config_toml_uses_new_nested_tts_sections() -> None:
     assert "[tts.preset]" in rendered
     assert "[tts.preset.voice_map]" in rendered
     assert "[tts.clone]" in rendered
+    assert "[tts.vllm_omni]" in rendered
     assert "voice_mode" not in rendered
     assert "customization_url" not in rendered
+
+
+def test_vllm_omni_api_key_does_not_affect_tts_or_voice_clone_fingerprints(tmp_path: Path) -> None:
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    first = AppConfig(tts={"provider": "vllm-omni", "vllm_omni": {"api_key": "key-1"}})
+    second = AppConfig(tts={"provider": "vllm-omni", "vllm_omni": {"api_key": "key-2"}})
+
+    assert fingerprints.hash_config_subset(first, TTS_CONFIG_KEYS) == fingerprints.hash_config_subset(second, TTS_CONFIG_KEYS)
+    assert fingerprints.hash_config_subset(first, VOICE_CLONE_CONFIG_KEYS) == fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
+
+
+def test_vllm_omni_runtime_fields_affect_tts_and_voice_clone_fingerprints(tmp_path: Path) -> None:
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    first = AppConfig(
+        tts={
+            "provider": "vllm-omni",
+            "vllm_omni": {"language": "Auto", "instructions": "", "x_vector_only_mode": False},
+        }
+    )
+    second = AppConfig(
+        tts={
+            "provider": "vllm-omni",
+            "vllm_omni": {"language": "zh", "instructions": "Warm", "x_vector_only_mode": True},
+        }
+    )
+
+    assert fingerprints.hash_config_subset(first, TTS_CONFIG_KEYS) != fingerprints.hash_config_subset(second, TTS_CONFIG_KEYS)
+    assert fingerprints.hash_config_subset(first, VOICE_CLONE_CONFIG_KEYS) != fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
 
 
 def test_resolve_workdir_uses_default_and_override() -> None:

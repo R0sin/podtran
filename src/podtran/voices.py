@@ -21,6 +21,7 @@ from podtran.models import (
     PresetVoiceSpec,
     ProviderClonePayload,
     ProviderCloneSpec,
+    ReferenceClonePayload,
     ReferenceCloneSpec,
     ResolvedVoiceTarget,
     SegmentRecord,
@@ -99,6 +100,30 @@ class DashScopeCloneProvider:
             identity=f"dashscope:provider_clone:{voice_token}",
             provider="dashscope",
             payload=ProviderClonePayload(voice_token=voice_token),
+        )
+
+
+class VllmOmniCloneProvider:
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+
+    def create_voice_spec(
+        self,
+        reference_audio: Path,
+        reference_text: str,
+        target_model: str,
+        preferred_name: str,
+        reference_fingerprint: str,
+    ) -> ReferenceCloneSpec:
+        _ = (target_model, preferred_name)
+        return ReferenceCloneSpec(
+            identity=f"vllm-omni:reference_clone:{reference_fingerprint}",
+            provider="vllm-omni",
+            payload=ReferenceClonePayload(
+                reference_fingerprint=reference_fingerprint,
+                reference_audio_path=str(reference_audio.resolve()),
+                reference_text=reference_text.strip(),
+            ),
         )
 
 
@@ -254,7 +279,8 @@ class VoiceResolver:
                 resolved[speaker] = ResolvedVoiceTarget(speaker=speaker, spec=voice_spec)
                 self._publish_cached_profile(cache_key, profile, source_audio_fingerprint, candidate)
                 completed += 1
-                self._emit_progress(progress_callback, completed, total_speakers, f"Enrolled voice for {speaker}")
+                action = "Prepared reference voice" if voice_spec.kind == "reference_clone" else "Enrolled voice"
+                self._emit_progress(progress_callback, completed, total_speakers, f"{action} for {speaker}")
             except Exception as exc:
                 profile_map[speaker] = VoiceProfile(
                     speaker=speaker,
@@ -282,6 +308,8 @@ class VoiceResolver:
         provider = self.config.tts.provider.strip().lower()
         if provider == "dashscope":
             return DashScopeCloneProvider(self.config)
+        if provider == "vllm-omni":
+            return VllmOmniCloneProvider(self.config)
         raise RuntimeError(f"Clone mode is not supported for TTS provider: {self.config.tts.provider}")
 
     def _reference_fingerprint(
@@ -371,6 +399,9 @@ class VoiceResolver:
     ) -> VoiceProfile:
         updated_spec = profile.voice_spec
         if isinstance(updated_spec, ReferenceCloneSpec):
+            reference_text = updated_spec.payload.reference_text
+            if not reference_text and reference_text_path.exists():
+                reference_text = reference_text_path.read_text(encoding="utf-8").strip()
             updated_spec = updated_spec.model_copy(
                 update={
                     "payload": updated_spec.payload.model_copy(
@@ -378,6 +409,7 @@ class VoiceResolver:
                             "reference_audio_path": str(reference_audio_path.resolve()),
                             "reference_text_path": str(reference_text_path.resolve()),
                             "reference_fingerprint": reference_fingerprint,
+                            "reference_text": reference_text,
                         }
                     )
                 }

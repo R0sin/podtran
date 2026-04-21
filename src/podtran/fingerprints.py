@@ -30,6 +30,9 @@ VOICE_CLONE_CONFIG_KEYS = [
     "tts.clone.model",
     "tts.clone.min_ref_seconds",
     "tts.clone.max_ref_seconds",
+    "tts.vllm_omni.language",
+    "tts.vllm_omni.instructions",
+    "tts.vllm_omni.x_vector_only_mode",
 ]
 TTS_CONFIG_KEYS = [
     "tts.provider",
@@ -37,6 +40,9 @@ TTS_CONFIG_KEYS = [
     "tts.mode",
     "tts.preset.model",
     "tts.clone.model",
+    "tts.vllm_omni.language",
+    "tts.vllm_omni.instructions",
+    "tts.vllm_omni.x_vector_only_mode",
 ]
 SYNTHESIZE_CONFIG_KEYS = list(dict.fromkeys([*VOICE_CLONE_CONFIG_KEYS, *TTS_CONFIG_KEYS]))
 COMPOSE_CONFIG_KEYS = [

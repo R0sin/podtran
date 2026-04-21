@@ -1,4 +1,5 @@
 from pathlib import Path
+import signal
 import threading
 import time
 
@@ -16,7 +17,14 @@ from podtran.models import (
     ReferenceCloneSpec,
     SegmentRecord,
 )
-from podtran.tts import _resolve_openai_compatible_api_key, _resolve_tts_model, build_tts_backend, synthesize_segments
+from podtran.tts import (
+    VllmOmniTTSBackend,
+    _resolve_openai_compatible_api_key,
+    _resolve_tts_model,
+    _resolve_vllm_omni_api_key,
+    build_tts_backend,
+    synthesize_segments,
+)
 
 
 class _DummyBackend:
@@ -56,6 +64,21 @@ class _TrackingBackend:
         finally:
             with self._lock:
                 self.active_calls -= 1
+
+
+class _InterruptingBackend:
+    supported_voice_kinds = frozenset({"preset", "provider_clone", "reference_clone"})
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def synthesize(self, text: str, spec, model: str, output_path: Path) -> None:
+        _ = (text, spec, model, output_path)
+        self.calls += 1
+        if self.calls == 1:
+            output_path.write_bytes(b"wav")
+            return
+        raise KeyboardInterrupt()
 
 
 def _paths(tmp_path: Path, task_id: str = "task-1") -> ArtifactPaths:
@@ -105,10 +128,18 @@ def test_resolve_tts_model_supports_reference_clone_specs() -> None:
 
 
 def test_build_tts_backend_rejects_clone_mode_for_backend_without_clone_capability() -> None:
-    config = AppConfig(tts=TTSConfig(provider="openai_compatible", mode="clone"))
+    config = AppConfig(tts=TTSConfig(provider="openai-compatible", mode="clone"))
 
     with pytest.raises(RuntimeError, match="Clone mode is not supported"):
         build_tts_backend(config)
+
+
+def test_build_tts_backend_supports_vllm_omni_clone_mode() -> None:
+    config = AppConfig(tts=TTSConfig(provider="vllm-omni", mode="clone"))
+
+    backend = build_tts_backend(config)
+
+    assert isinstance(backend, VllmOmniTTSBackend)
 
 
 def test_build_tts_backend_rejects_unknown_provider() -> None:
@@ -118,10 +149,119 @@ def test_build_tts_backend_rejects_unknown_provider() -> None:
         build_tts_backend(config)
 
 
+def test_build_tts_backend_rejects_legacy_openai_compatible_provider_name() -> None:
+    config = AppConfig(tts=TTSConfig(provider="openai_compatible", mode="preset"))
+
+    with pytest.raises(RuntimeError, match="Unsupported TTS provider"):
+        build_tts_backend(config)
+
+
 def test_resolve_openai_compatible_api_key_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PODTRAN_TTS_API_KEY", "env-key")
 
     assert _resolve_openai_compatible_api_key() == "env-key"
+
+
+def test_resolve_vllm_omni_api_key_prefers_config_then_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = AppConfig(tts={"vllm_omni": {"api_key": "config-key"}})
+    monkeypatch.setenv("PODTRAN_VLLM_OMNI_API_KEY", "env-key")
+
+    assert _resolve_vllm_omni_api_key(config) == "config-key"
+
+
+def test_vllm_omni_backend_sends_custom_voice_request_body(tmp_path: Path) -> None:
+    config = AppConfig(
+        tts={
+            "provider": "vllm-omni",
+            "mode": "preset",
+            "base_url": "http://localhost:8091/v1",
+            "vllm_omni": {"language": "zh", "instructions": "Warm broadcast tone.", "api_key": "secret"},
+        }
+    )
+    backend = VllmOmniTTSBackend(config)
+    output_path = tmp_path / "speech.wav"
+    captured: dict[str, object] = {}
+
+    class _Response:
+        content = b"wav"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class _Client:
+        def post(self, url: str, headers: dict[str, str], json: dict[str, object]) -> _Response:
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return _Response()
+
+    backend.client = _Client()  # type: ignore[assignment]
+
+    backend.synthesize("你好", PresetVoiceSpec(identity="preset:vivian", voice_name="vivian"), "Qwen/Qwen3-TTS", output_path)
+
+    assert output_path.read_bytes() == b"wav"
+    assert captured["url"] == "http://localhost:8091/v1/audio/speech"
+    assert captured["headers"] == {"Authorization": "Bearer secret"}
+    assert captured["json"] == {
+        "model": "Qwen/Qwen3-TTS",
+        "input": "你好",
+        "response_format": "wav",
+        "language": "zh",
+        "instructions": "Warm broadcast tone.",
+        "voice": "vivian",
+        "task_type": "CustomVoice",
+    }
+
+
+def test_vllm_omni_backend_sends_base_clone_request_body_without_auth_when_key_missing(tmp_path: Path) -> None:
+    reference_audio = tmp_path / "reference.wav"
+    reference_audio.write_bytes(b"wav")
+    config = AppConfig(
+        tts={
+            "provider": "vllm-omni",
+            "mode": "clone",
+            "base_url": "http://localhost:8091/v1",
+            "vllm_omni": {"language": "Auto", "instructions": "", "x_vector_only_mode": True},
+        }
+    )
+    backend = VllmOmniTTSBackend(config)
+    output_path = tmp_path / "speech.wav"
+    captured: dict[str, object] = {}
+
+    class _Response:
+        content = b"wav"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class _Client:
+        def post(self, url: str, headers: dict[str, str], json: dict[str, object]) -> _Response:
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return _Response()
+
+    backend.client = _Client()  # type: ignore[assignment]
+    spec = ReferenceCloneSpec(
+        identity="vllm-omni:reference_clone:ref-1",
+        provider="vllm-omni",
+        payload=ReferenceClonePayload(
+            reference_fingerprint="ref-1",
+            reference_audio_path=str(reference_audio),
+            reference_text="reference text",
+        ),
+    )
+
+    backend.synthesize("你好", spec, "Qwen/Qwen3-TTS-Base", output_path)
+
+    payload = captured["json"]
+    assert output_path.read_bytes() == b"wav"
+    assert captured["url"] == "http://localhost:8091/v1/audio/speech"
+    assert captured["headers"] == {}
+    assert payload["task_type"] == "Base"
+    assert payload["ref_text"] == "reference text"
+    assert payload["x_vector_only_mode"] is True
+    assert str(payload["ref_audio"]).startswith("data:audio/")
 
 
 def test_synthesize_segments_requires_source_audio_in_clone_mode(tmp_path: Path) -> None:
@@ -352,3 +492,96 @@ def test_synthesize_segments_respects_max_concurrency_of_one(tmp_path: Path, mon
 
     assert backend.calls == 2
     assert backend.max_active_calls == 1
+
+
+def test_synthesize_segments_builds_backend_once_per_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "你好一"),
+        _segment_with_text("seg_2", "你好二"),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _TrackingBackend(sleep_seconds=0.01)
+    build_calls = 0
+
+    def build_backend(_config: AppConfig) -> _TrackingBackend:
+        nonlocal build_calls
+        build_calls += 1
+        return backend
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", build_backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(tts=TTSConfig(mode="preset", max_concurrency=1)),
+        paths,
+    )
+
+    assert build_calls == 1
+    assert backend.calls == 2
+
+
+def test_synthesize_segments_preserves_completed_results_when_worker_interrupts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "你好一"),
+        _segment_with_text("seg_2", "你好二"),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _InterruptingBackend()
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    with pytest.raises(KeyboardInterrupt):
+        synthesize_segments(
+            paths.translated_json,
+            paths.translated_json,
+            AppConfig(tts=TTSConfig(mode="preset", max_concurrency=1)),
+            paths,
+        )
+
+    synthesized = read_model_list(paths.translated_json, SegmentRecord)
+    assert backend.calls == 2
+    assert synthesized[0].status == "completed"
+    assert Path(synthesized[0].tts_audio_path).exists()
+    assert synthesized[1].status == "pending"
+    assert synthesized[1].tts_audio_path == ""
+
+
+def test_synthesize_segments_stops_queued_work_quickly_on_sigint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "你好一"),
+        _segment_with_text("seg_2", "你好二"),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _TrackingBackend(sleep_seconds=0.2)
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    timer = threading.Timer(0.05, lambda: signal.raise_signal(signal.SIGINT))
+    timer.start()
+    start = time.perf_counter()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            synthesize_segments(
+                paths.translated_json,
+                paths.translated_json,
+                AppConfig(tts=TTSConfig(mode="preset", max_concurrency=1)),
+                paths,
+            )
+    finally:
+        timer.cancel()
+
+    elapsed = time.perf_counter() - start
+    time.sleep(0.3)
+
+    assert elapsed < 0.35
+    assert backend.calls == 1

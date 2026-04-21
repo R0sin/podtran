@@ -20,6 +20,8 @@ DEFAULT_TTS_PRESET_MODEL = "qwen3-tts-flash"
 DEFAULT_TTS_CLONE_MODEL = "qwen3-tts-vc-2026-01-22"
 DEFAULT_TTS_ENROLLMENT_MODEL = "qwen-voice-enrollment"
 DEFAULT_TTS_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
+DEFAULT_TTS_TIMEOUT_SECONDS = 300
+DEFAULT_VLLM_OMNI_LANGUAGE = "Auto"
 DEFAULT_WORKDIR = Path("~/.podtran")
 DEFAULT_CONFIG_FILENAME = "podtran.toml"
 DEFAULT_FALLBACK_VOICES = ["Cherry", "Serena", "Ethan", "Chelsie"]
@@ -82,16 +84,26 @@ class TTSCloneConfig(BaseModel):
     max_ref_seconds: int = 20
 
 
+class TTSVllmOmniConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    api_key: str = ""
+    language: str = DEFAULT_VLLM_OMNI_LANGUAGE
+    instructions: str = ""
+    x_vector_only_mode: bool = False
+
+
 class TTSConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     provider: str = DEFAULT_TTS_PROVIDER
     base_url: str = ""
     mode: VoiceMode = "clone"
-    timeout_seconds: int = 120
+    timeout_seconds: int = DEFAULT_TTS_TIMEOUT_SECONDS
     max_concurrency: int = 4
     preset: TTSPresetConfig = Field(default_factory=TTSPresetConfig)
     clone: TTSCloneConfig = Field(default_factory=TTSCloneConfig)
+    vllm_omni: TTSVllmOmniConfig = Field(default_factory=TTSVllmOmniConfig)
 
     def resolved_base_url(self) -> str:
         base_url = self.base_url.strip().rstrip("/")
@@ -234,6 +246,12 @@ def render_config_toml(config: AppConfig) -> str:
         f'model = "{config.tts.clone_model()}"',
         f"min_ref_seconds = {config.tts.clone.min_ref_seconds}",
         f"max_ref_seconds = {config.tts.clone.max_ref_seconds}",
+        "",
+        "[tts.vllm_omni]",
+        f'api_key = "{config.tts.vllm_omni.api_key}"',
+        f'language = "{config.tts.vllm_omni.language}"',
+        f'instructions = "{config.tts.vllm_omni.instructions}"',
+        f"x_vector_only_mode = {str(config.tts.vllm_omni.x_vector_only_mode).lower()}",
         "",
         "[asr]",
         f'model = "{config.asr.model}"',

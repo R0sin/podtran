@@ -168,7 +168,7 @@ def test_init_prompts_for_provider_managed_config_and_writes_defaults(tmp_path: 
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="hf-token\ndash-key\n\n\n",
+        input="hf-token\ndash-key\n\n\n\n\n",
     )
 
     assert result.exit_code == 0
@@ -184,13 +184,47 @@ def test_init_prompts_for_provider_managed_config_and_writes_defaults(tmp_path: 
     assert "hf.co/settings/tokens" in result.output
 
 
+def test_init_can_write_openai_compatible_tts_provider(tmp_path: Path) -> None:
+    config_path = tmp_path / "podtran.toml"
+
+    result = runner.invoke(
+        cli.app,
+        ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
+        input="hf-token\ndash-key\n\nopenai-compatible\nhttp://localhost:9000/v1\ntts-1\n",
+    )
+
+    assert result.exit_code == 0
+    config = load_config(config_path)
+    assert config.tts.provider == "openai-compatible"
+    assert config.tts.mode == "preset"
+    assert config.tts.base_url == "http://localhost:9000/v1"
+    assert config.tts.preset.model == "tts-1"
+
+
+def test_init_can_write_vllm_omni_tts_provider(tmp_path: Path) -> None:
+    config_path = tmp_path / "podtran.toml"
+
+    result = runner.invoke(
+        cli.app,
+        ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
+        input="hf-token\ndash-key\n\nvllm-omni\nhttp://localhost:8091/v1\nlocal-key\nclone\n\n",
+    )
+
+    assert result.exit_code == 0
+    config = load_config(config_path)
+    assert config.tts.provider == "vllm-omni"
+    assert config.tts.base_url == "http://localhost:8091/v1"
+    assert config.tts.mode == "clone"
+    assert config.tts.vllm_omni.api_key == "local-key"
+
+
 def test_init_reprompts_required_values(tmp_path: Path) -> None:
     config_path = tmp_path / "podtran.toml"
 
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="\nhf-token\n\ndash-key\ncustom-translator\ncustom-tts\n",
+        input="\nhf-token\n\ndash-key\ncustom-translator\n\n\ncustom-tts\n",
     )
 
     assert result.exit_code == 0
@@ -219,7 +253,7 @@ def test_init_uses_existing_values_as_defaults_and_preserves_other_fields(tmp_pa
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="\n\nupdated-translate\n\n",
+        input="\n\nupdated-translate\n\n\n\n",
     )
 
     assert result.exit_code == 0
@@ -259,7 +293,7 @@ fallback_voices = ["Cherry"]
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="\n\n\n\n",
+        input="\n\n\n\n\n\n",
     )
 
     assert result.exit_code == 0
@@ -1013,6 +1047,36 @@ def test_keyboard_interrupt_sets_interrupted_status(tmp_path: Path, monkeypatch)
         cli._ensure_translate(task, cfg, paths, executor, cache_store, fingerprints)
 
     manifest = read_model(paths.manifest_path("translate"), StageManifest)
+    assert manifest.status == "interrupted"
+    assert manifest.error == "Interrupted by user"
+    reloaded_task = store.load_task(task.task_id)
+    assert reloaded_task.status == "interrupted"
+
+
+def test_synthesize_keyboard_interrupt_sets_interrupted_status(tmp_path: Path, monkeypatch) -> None:
+    import podtran.tts as tts_module
+
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    paths.ensure()
+    write_json(paths.translated_json, [_segment("seg_1", None)])
+
+    def interrupting_synthesize(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(tts_module, "synthesize_segments", interrupting_synthesize)
+    monkeypatch.setattr(cli, "ensure_command", lambda command: None)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli._ensure_synthesize(task, cfg, paths, StageExecutor(store, task, paths), cache_store, fingerprints)
+
+    manifest = read_model(paths.manifest_path("synthesize"), StageManifest)
     assert manifest.status == "interrupted"
     assert manifest.error == "Interrupted by user"
     reloaded_task = store.load_task(task.task_id)

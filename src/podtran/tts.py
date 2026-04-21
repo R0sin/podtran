@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import base64
 from dataclasses import dataclass, field
 import json
+import mimetypes
 import os
 from pathlib import Path
-from typing import Protocol
+import queue
+import threading
+from typing import Callable, Protocol
 
 import httpx
 from openai import OpenAI
@@ -115,6 +118,56 @@ class OpenAICompatibleTTSBackend:
         atomic_write_bytes(output_path, payload)
 
 
+class VllmOmniTTSBackend:
+    supported_voice_kinds = frozenset({"preset", "reference_clone"})
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.client = httpx.Client(timeout=config.tts.timeout_seconds)
+        self.api_key = _resolve_vllm_omni_api_key(config)
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(TTS_RETRY_ATTEMPTS),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        retry=retry_if_exception_type((RuntimeError, httpx.HTTPError)),
+    )
+    def synthesize(self, text: str, spec: VoiceSpec, model: str, output_path: Path) -> None:
+        payload = {
+            "model": model,
+            "input": text,
+            "response_format": "wav",
+            "language": self.config.tts.vllm_omni.language,
+            "instructions": self.config.tts.vllm_omni.instructions,
+        }
+        if isinstance(spec, PresetVoiceSpec):
+            payload.update(
+                {
+                    "voice": spec.voice_name,
+                    "task_type": "CustomVoice",
+                }
+            )
+        elif isinstance(spec, ReferenceCloneSpec):
+            payload.update(
+                {
+                    "task_type": "Base",
+                    "ref_audio": _audio_data_uri(Path(spec.payload.reference_audio_path)),
+                    "ref_text": _resolve_reference_text(spec),
+                    "x_vector_only_mode": self.config.tts.vllm_omni.x_vector_only_mode,
+                }
+            )
+        else:
+            raise RuntimeError(f"vLLM-Omni TTS does not support voice kind: {spec.kind}")
+
+        response = self.client.post(
+            _vllm_omni_speech_url(self.config),
+            headers=_bearer_headers(self.api_key),
+            json=payload,
+        )
+        response.raise_for_status()
+        atomic_write_bytes(output_path, response.content)
+
+
 @dataclass(slots=True)
 class _PendingSegment:
     segment_index: int
@@ -135,6 +188,12 @@ class _SynthesisWorkItem:
 class _SynthesisResult:
     output_path: Path
     duration_ms: int
+
+
+@dataclass(slots=True)
+class _SynthesisWorkerOutcome:
+    item: _SynthesisWorkItem
+    payload: _SynthesisResult | BaseException
 
 
 def synthesize_segments(
@@ -236,43 +295,74 @@ def synthesize_segments(
 
     if work_items:
         max_workers = max(1, config.tts.max_concurrency)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_item = {
-                executor.submit(_synthesize_work_item, config, item): item
-                for item in work_items.values()
-            }
-            for future in as_completed(future_to_item):
-                item = future_to_item[future]
+        work_queue: queue.Queue[_SynthesisWorkItem] = queue.Queue()
+        result_queue: queue.Queue[_SynthesisWorkerOutcome] = queue.Queue()
+        stop_event = threading.Event()
+
+        for item in work_items.values():
+            work_queue.put(item)
+
+        worker_count = min(max_workers, len(work_items))
+        for index in range(worker_count):
+            threading.Thread(
+                target=_synthesis_worker,
+                name=f"podtran-tts-{index + 1}",
+                args=(config, work_queue, result_queue, stop_event),
+                daemon=True,
+            ).start()
+
+        def handle_outcome(outcome: _SynthesisWorkerOutcome) -> None:
+            nonlocal processed_segments
+            item = outcome.item
+            payload = outcome.payload
+            if isinstance(payload, KeyboardInterrupt):
+                raise payload
+            if isinstance(payload, BaseException):
+                for pending in item.segments:
+                    segment = segments[pending.segment_index]
+                    segment.status = "failed"
+                    segment.error = str(payload)
+                    processed_segments += 1
+            else:
+                if item.cache_key and cache_store and fingerprints:
+                    cache_store.publish(
+                        "tts",
+                        item.cache_key,
+                        {"audio": payload.output_path},
+                        _build_tts_manifest(item.text_zh, item.target.spec, item.model, item.cache_key, tts_config_fingerprint, fingerprints),
+                    )
+                for pending in item.segments:
+                    destination = pending.audio_path
+                    if destination.resolve() != payload.output_path.resolve():
+                        copy_path(payload.output_path, destination)
+                    _mark_segment_completed(segments[pending.segment_index], destination, payload.duration_ms)
+                    processed_segments += 1
+            write_json(output_path, segments)
+            _emit_segment_progress(
+                progress_callback,
+                segment_offset + processed_segments,
+                stage_total,
+                processed_segments,
+                segment_units,
+                "Synthesizing audio",
+            )
+
+        completed_items = 0
+        total_items = len(work_items)
+        try:
+            while completed_items < total_items:
                 try:
-                    result = future.result()
-                    if item.cache_key and cache_store and fingerprints:
-                        cache_store.publish(
-                            "tts",
-                            item.cache_key,
-                            {"audio": result.output_path},
-                            _build_tts_manifest(item.text_zh, item.target.spec, item.model, item.cache_key, tts_config_fingerprint, fingerprints),
-                        )
-                    for pending in item.segments:
-                        destination = pending.audio_path
-                        if destination.resolve() != result.output_path.resolve():
-                            copy_path(result.output_path, destination)
-                        _mark_segment_completed(segments[pending.segment_index], destination, result.duration_ms)
-                        processed_segments += 1
-                except Exception as exc:
-                    for pending in item.segments:
-                        segment = segments[pending.segment_index]
-                        segment.status = "failed"
-                        segment.error = str(exc)
-                        processed_segments += 1
-                write_json(output_path, segments)
-                _emit_segment_progress(
-                    progress_callback,
-                    segment_offset + processed_segments,
-                    stage_total,
-                    processed_segments,
-                    segment_units,
-                    "Synthesizing audio",
-                )
+                    outcome = result_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                completed_items += 1
+                handle_outcome(outcome)
+        except KeyboardInterrupt:
+            stop_event.set()
+            completed_items += _drain_ready_synthesis_outcomes(result_queue, handle_outcome)
+            raise
+        finally:
+            stop_event.set()
 
     if progress_callback is not None:
         progress_callback(stage_total, stage_total, "Synthesis complete")
@@ -283,8 +373,10 @@ def build_tts_backend(config: AppConfig) -> TTSBackend:
     provider = config.tts.provider.strip().lower()
     if provider == "dashscope":
         backend: TTSBackend = DashScopeTTSBackend(config)
-    elif provider == "openai_compatible":
+    elif provider == "openai-compatible":
         backend = OpenAICompatibleTTSBackend(config)
+    elif provider == "vllm-omni":
+        backend = VllmOmniTTSBackend(config)
     else:
         raise RuntimeError(f"Unsupported TTS provider: {config.tts.provider}")
 
@@ -369,12 +461,52 @@ def _tts_work_key(segment: SegmentRecord, spec: VoiceSpec, model: str) -> str:
     )
 
 
-def _synthesize_work_item(config: AppConfig, item: _SynthesisWorkItem) -> _SynthesisResult:
-    backend = build_tts_backend(config)
+def _synthesize_work_item(backend: TTSBackend, item: _SynthesisWorkItem) -> _SynthesisResult:
     _ensure_backend_supports_spec(backend, item.target.spec)
     backend.synthesize(item.text_zh, item.target.spec, item.model, item.output_path)
     duration_ms = int(probe_duration(FFPROBE_COMMAND, item.output_path) * 1000)
     return _SynthesisResult(output_path=item.output_path, duration_ms=duration_ms)
+
+
+def _synthesis_worker(
+    config: AppConfig,
+    work_queue: queue.Queue[_SynthesisWorkItem],
+    result_queue: queue.Queue[_SynthesisWorkerOutcome],
+    stop_event: threading.Event,
+) -> None:
+    backend: TTSBackend | None = None
+    while not stop_event.is_set():
+        try:
+            item = work_queue.get_nowait()
+        except queue.Empty:
+            return
+
+        if stop_event.is_set():
+            work_queue.task_done()
+            return
+
+        try:
+            if backend is None:
+                backend = build_tts_backend(config)
+            payload: _SynthesisResult | BaseException = _synthesize_work_item(backend, item)
+        except BaseException as exc:  # pragma: no cover - exercised through main-thread handling
+            payload = exc
+        result_queue.put(_SynthesisWorkerOutcome(item=item, payload=payload))
+        work_queue.task_done()
+
+
+def _drain_ready_synthesis_outcomes(
+    result_queue: queue.Queue[_SynthesisWorkerOutcome],
+    handle_outcome: Callable[[_SynthesisWorkerOutcome], None],
+) -> int:
+    drained = 0
+    while True:
+        try:
+            outcome = result_queue.get_nowait()
+        except queue.Empty:
+            return drained
+        drained += 1
+        handle_outcome(outcome)
 
 
 def _build_tts_manifest(
@@ -450,6 +582,41 @@ def _resolve_tts_model(config: AppConfig, spec: VoiceSpec) -> str:
 
 def _resolve_openai_compatible_api_key() -> str:
     return os.getenv("PODTRAN_TTS_API_KEY", "")
+
+
+def _resolve_vllm_omni_api_key(config: AppConfig) -> str:
+    configured = config.tts.vllm_omni.api_key.strip()
+    if configured:
+        return configured
+    return os.getenv("PODTRAN_VLLM_OMNI_API_KEY", "")
+
+
+def _bearer_headers(api_key: str) -> dict[str, str]:
+    if not api_key.strip():
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def _audio_data_uri(path: Path) -> str:
+    payload = path.read_bytes()
+    mime_type = mimetypes.guess_type(path.name)[0] or "audio/wav"
+    encoded = base64.b64encode(payload).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _resolve_reference_text(spec: ReferenceCloneSpec) -> str:
+    if spec.payload.reference_text.strip():
+        return spec.payload.reference_text
+    if spec.payload.reference_text_path.strip():
+        return Path(spec.payload.reference_text_path).read_text(encoding="utf-8").strip()
+    raise RuntimeError("vLLM-Omni reference_clone specs require reference text.")
+
+
+def _vllm_omni_speech_url(config: AppConfig) -> str:
+    base_url = config.tts.resolved_base_url()
+    if not base_url:
+        raise RuntimeError("vLLM-Omni TTS requires a TTS base URL.")
+    return base_url.rstrip("/") + "/audio/speech"
 
 
 def _ensure_backend_supports_spec(backend: TTSBackend, spec: VoiceSpec) -> None:

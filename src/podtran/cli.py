@@ -22,6 +22,7 @@ from podtran.config import (
     AppConfig,
     DEFAULT_TRANSLATION_PROVIDER,
     DEFAULT_TRANSLATION_MODEL,
+    DEFAULT_TTS_PRESET_MODEL,
     DEFAULT_TTS_PROVIDER,
     DEFAULT_TTS_CLONE_MODEL,
     detect_legacy_tts_keys,
@@ -82,6 +83,9 @@ console = Console()
 KNOWN_COMMANDS = {"run", "resume", "init", "tasks", "status", "version", "transcribe", "translate", "synthesize", "compose", "cache"}
 DEFAULT_MIN_SPEAKERS = 2
 DEFAULT_MAX_SPEAKERS = 5
+TTS_PROVIDER_CHOICES = ("dashscope", "openai-compatible", "vllm-omni")
+TTS_MODE_CHOICES = ("preset", "clone")
+DEFAULT_VLLM_OMNI_BASE_URL = "http://localhost:8091/v1"
 
 
 @dataclass(slots=True)
@@ -282,7 +286,7 @@ def init(
 def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
     config = existing_config.model_copy(deep=True) if existing_config is not None else AppConfig()
     console.print("[bold]podtran init[/bold]")
-    console.print("Provider-managed auth. Translation and TTS default to DashScope; leave advanced endpoint overrides for later edits.")
+    console.print("Translation uses DashScope by default. Choose the TTS provider you want to configure for synthesis.")
     console.print(
         "Before entering your Hugging Face token, accept the model terms at "
         "https://huggingface.co/pyannote/speaker-diarization-community-1 "
@@ -299,11 +303,44 @@ def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
         "Translation model",
         config.translation.model or DEFAULT_TRANSLATION_MODEL,
     )
-    config.tts.provider = DEFAULT_TTS_PROVIDER
-    config.tts.clone.model = _prompt_with_default(
-        "TTS clone model",
-        config.tts.clone.model or DEFAULT_TTS_CLONE_MODEL,
-    )
+    provider = _prompt_choice("TTS provider", TTS_PROVIDER_CHOICES, config.tts.provider or DEFAULT_TTS_PROVIDER)
+    config.tts.provider = provider
+
+    if provider == "openai-compatible":
+        config.tts.mode = "preset"
+        config.tts.base_url = _prompt_required(
+            "OpenAI-compatible TTS base URL",
+            current_value=config.tts.base_url,
+        )
+        config.tts.preset.model = _prompt_with_default(
+            "TTS preset model",
+            config.tts.preset.model or DEFAULT_TTS_PRESET_MODEL,
+        )
+        return config
+
+    if provider == "vllm-omni":
+        config.tts.base_url = _prompt_with_default(
+            "vLLM-Omni TTS base URL",
+            config.tts.base_url or DEFAULT_VLLM_OMNI_BASE_URL,
+        )
+        config.tts.vllm_omni.api_key = _prompt_optional(
+            "vLLM-Omni API key",
+            current_value=config.tts.vllm_omni.api_key,
+        )
+    else:
+        config.tts.base_url = ""
+
+    config.tts.mode = _prompt_choice("TTS mode", TTS_MODE_CHOICES, config.tts.mode)
+    if config.tts.mode == "preset":
+        config.tts.preset.model = _prompt_with_default(
+            "TTS preset model",
+            config.tts.preset.model or DEFAULT_TTS_PRESET_MODEL,
+        )
+    else:
+        config.tts.clone.model = _prompt_with_default(
+            "TTS clone model",
+            config.tts.clone.model or DEFAULT_TTS_CLONE_MODEL,
+        )
     return config
 
 
@@ -338,6 +375,22 @@ def _prompt_required(label: str, *, hide_input: bool = False, current_value: str
 
 def _prompt_with_default(label: str, default: str) -> str:
     return typer.prompt(label, default=default, show_default=True).strip()
+
+
+def _prompt_optional(label: str, current_value: str = "") -> str:
+    prompt_label = label if not current_value.strip() else f"{label} (press Enter to keep existing)"
+    return typer.prompt(prompt_label, default="", show_default=False).strip() or current_value.strip()
+
+
+def _prompt_choice(label: str, options: tuple[str, ...], default: str) -> str:
+    normalized_options = tuple(option.strip() for option in options)
+    fallback = default.strip() if default.strip() in normalized_options else normalized_options[0]
+    while True:
+        prompt = f"{label} ({'/'.join(normalized_options)})"
+        value = typer.prompt(prompt, default=fallback, show_default=True).strip()
+        if value in normalized_options:
+            return value
+        console.print(f"[yellow]{label} must be one of: {', '.join(normalized_options)}[/yellow]")
 
 
 RESUME_HELP = """Resume an existing task and re-run the pipeline from where it left off.

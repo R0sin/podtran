@@ -4,7 +4,6 @@ import pytest
 
 from podtran.config import (
     AppConfig,
-    DEFAULT_TRANSLATION_BASE_URL,
     DEFAULT_TRANSLATION_MODEL,
     DEFAULT_TTS_BASE_URL,
     DEFAULT_TTS_CLONE_MODEL,
@@ -152,11 +151,11 @@ clone_min_ref_seconds = 8
 
 def test_translation_and_tts_resolve_provider_defaults_and_overrides() -> None:
     config = AppConfig()
-    assert config.translation.provider == "dashscope"
+    assert config.translation.provider == "google-free"
     assert config.translation.model == DEFAULT_TRANSLATION_MODEL
     assert config.translation.batch_size == 8
     assert config.translation.max_concurrency == 4
-    assert config.translation.resolved_base_url() == DEFAULT_TRANSLATION_BASE_URL
+    assert config.translation.resolved_base_url() == ""
     assert config.asr.batch_size == 4
     assert config.tts.resolved_base_url() == DEFAULT_TTS_BASE_URL
     assert config.tts.timeout_seconds == DEFAULT_TTS_TIMEOUT_SECONDS
@@ -164,7 +163,7 @@ def test_translation_and_tts_resolve_provider_defaults_and_overrides() -> None:
     assert config.tts.vllm_omni.language == DEFAULT_VLLM_OMNI_LANGUAGE
 
     custom = AppConfig(
-        translation={"base_url": "https://example.com/v1/"},
+        translation={"provider": "dashscope", "base_url": "https://example.com/v1/"},
         tts={"base_url": "https://tts.example.com/root/", "provider": "vllm-omni"},
     )
     assert custom.translation.resolved_base_url() == "https://example.com/v1"
@@ -194,7 +193,7 @@ def test_build_init_config_sets_provider_managed_auth() -> None:
 
     assert config.hf_token == "hf-token"
     assert config.providers.dashscope.api_key == "dash-key"
-    assert config.translation.provider == "dashscope"
+    assert config.translation.provider == "google-free"
     assert config.translation.model == "custom-translate"
     assert config.tts.provider == "dashscope"
     assert config.tts.clone.model == "custom-tts"
@@ -211,7 +210,7 @@ def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None
     assert "\nffprobe_path =" not in rendered
     assert "max_retries" not in rendered
     assert "[providers.dashscope]" in rendered
-    assert 'provider = "dashscope"' in rendered
+    assert 'provider = "google-free"' in rendered
     assert 'model = "qwen-flash"' in rendered
     assert "batch_size = 8" in rendered
     assert f"timeout_seconds = {DEFAULT_TTS_TIMEOUT_SECONDS}" in rendered

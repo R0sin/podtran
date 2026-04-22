@@ -84,6 +84,7 @@ KNOWN_COMMANDS = {"run", "resume", "init", "tasks", "status", "version", "transc
 DEFAULT_MIN_SPEAKERS = 2
 DEFAULT_MAX_SPEAKERS = 5
 TTS_PROVIDER_CHOICES = ("dashscope", "openai-compatible", "vllm-omni")
+TRANSLATION_PROVIDER_CHOICES = ("google-free", "dashscope", "openai-compatible")
 TTS_MODE_CHOICES = ("preset", "clone")
 DEFAULT_VLLM_OMNI_BASE_URL = "http://localhost:8091/v1"
 
@@ -286,25 +287,48 @@ def init(
 def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
     config = existing_config.model_copy(deep=True) if existing_config is not None else AppConfig()
     console.print("[bold]podtran init[/bold]")
-    console.print("Translation uses DashScope by default. Choose the TTS provider you want to configure for synthesis.")
+    console.print(
+        "Translation defaults to google-free. Choose the translation and TTS providers you want to configure."
+    )
     console.print(
         "Before entering your Hugging Face token, accept the model terms at "
         "https://huggingface.co/pyannote/speaker-diarization-community-1 "
         "and create a token at https://hf.co/settings/tokens ."
     )
     config.hf_token = _prompt_required("Hugging Face token", current_value=config.hf_token)
-    config.providers.dashscope.api_key = _prompt_required(
-        "DashScope API key",
-        hide_input=True,
-        current_value=config.providers.dashscope.api_key,
+    config.translation.provider = _prompt_choice(
+        "Translation provider",
+        TRANSLATION_PROVIDER_CHOICES,
+        config.translation.provider or DEFAULT_TRANSLATION_PROVIDER,
     )
-    config.translation.provider = DEFAULT_TRANSLATION_PROVIDER
-    config.translation.model = _prompt_with_default(
-        "Translation model",
-        config.translation.model or DEFAULT_TRANSLATION_MODEL,
-    )
+    if config.translation.provider == "google-free":
+        config.translation.base_url = ""
+    else:
+        if config.translation.provider == "dashscope":
+            config.providers.dashscope.api_key = _prompt_required(
+                "DashScope API key",
+                hide_input=True,
+                current_value=config.providers.dashscope.api_key,
+            )
+        if config.translation.provider == "openai-compatible":
+            config.translation.base_url = _prompt_required(
+                "OpenAI-compatible translation base URL",
+                current_value=config.translation.base_url,
+            )
+        else:
+            config.translation.base_url = ""
+        config.translation.model = _prompt_with_default(
+            "Translation model",
+            config.translation.model or DEFAULT_TRANSLATION_MODEL,
+        )
     provider = _prompt_choice("TTS provider", TTS_PROVIDER_CHOICES, config.tts.provider or DEFAULT_TTS_PROVIDER)
     config.tts.provider = provider
+    if provider == "dashscope" and not config.providers.dashscope.api_key.strip():
+        config.providers.dashscope.api_key = _prompt_required(
+            "DashScope API key",
+            hide_input=True,
+            current_value=config.providers.dashscope.api_key,
+        )
 
     if provider == "openai-compatible":
         config.tts.mode = "preset"

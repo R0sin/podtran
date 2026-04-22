@@ -9,7 +9,7 @@
 特点：
 
 - 本地用 `WhisperX` 做转写、对齐和说话人区分
-- 翻译和 TTS 默认走 DashScope
+- 翻译支持 `google-free`、`dashscope`、`openai-compatible`，默认谷歌翻译；TTS 默认走 DashScope
 - 默认支持 `clone` 音色克隆，也支持 `preset` 预置音色
 - 每次运行都会创建独立 task，避免旧结果污染新结果
 - 共享缓存会自动复用已完成的转写、翻译、声纹和逐段 TTS 结果
@@ -27,7 +27,7 @@
 - Python `3.11` 推荐，支持 `>=3.10,<3.13`
 - `ffmpeg` 和 `ffprobe` 需要在 `PATH` 中可执行
 - 需要一个 Hugging Face token 给 WhisperX diarization 使用
-- 翻译默认需要 DashScope API key
+- 默认翻译不需要 API key；如果用到 `dashscope` 或 `openai-compatible`，再配置对应 provider key
 - TTS 可选 `dashscope`、`openai-compatible` 或 `vllm-omni`，所需配置取决于 provider
 
 ## 安装
@@ -72,9 +72,9 @@ podtran init
 
 - 先去接受 Hugging Face 的 `speaker-diarization-community-1` 协议
 - 填写 `hf_token`
-- 填写 DashScope API key
-- 确认翻译模型
+- 选择翻译 provider；如果选 `google-free`，则不需要翻译 API key，且会忽略 `base_url` 和 `model`
 - 选择 TTS provider，并按提示填写对应的 `base_url`、API key、mode 和 model
+- 只有当翻译或 TTS 实际使用 `dashscope` 时，才会要求填写 DashScope API key
 
 默认配置会写到 `~/.podtran/podtran.toml`。如果传 `--workdir <path>`，则会写到 `<path>/podtran.toml`，同时任务和缓存也会放到这个目录下。
 
@@ -83,6 +83,37 @@ TTS provider 说明：
 - `dashscope`：支持 `preset` 和 `clone`
 - `openai-compatible`：支持 `preset`
 - `vllm-omni`：支持 `preset` 和 `clone`，需要配置 `tts.base_url`
+
+翻译 provider 说明：
+
+- `google-free`：默认选项，免费，无需 API key；走 Google 非公开网页接口，可能受地区、风控、请求频率影响
+- `dashscope`：需要 DashScope API key；`translation.base_url` 留空时会使用内置默认地址
+- `openai-compatible`：适合自建或第三方兼容 OpenAI Chat Completions 的翻译端点；需要设置 `translation.base_url`
+
+如果你手动编辑 `podtran.toml`，最常见的翻译配置是：
+
+```toml
+[translation]
+provider = "google-free"  # 默认；忽略 base_url 和 model
+```
+
+如果你想切到 DashScope，可改成：
+
+```toml
+[translation]
+provider = "dashscope"
+base_url = ""
+model = "qwen-flash"
+```
+
+如果你想切到兼容 OpenAI 的翻译端点，可改成：
+
+```toml
+[translation]
+provider = "openai-compatible"
+base_url = "http://localhost:8000/v1"
+model = "your-chat-model"
+```
 
 如果你准备自己部署 `vllm-omni` 的 `Qwen3-TTS` 服务，可先看这些官方资料：
 

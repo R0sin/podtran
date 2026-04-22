@@ -168,14 +168,14 @@ def test_init_prompts_for_provider_managed_config_and_writes_defaults(tmp_path: 
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="hf-token\ndash-key\n\n\n\n\n",
+        input="hf-token\n\n\ndash-key\n\n\n",
     )
 
     assert result.exit_code == 0
     config = load_config(config_path)
     assert config.hf_token == "hf-token"
     assert config.providers.dashscope.api_key == "dash-key"
-    assert config.translation.provider == "dashscope"
+    assert config.translation.provider == "google-free"
     assert config.translation.model == "qwen-flash"
     assert config.tts.provider == "dashscope"
     assert config.tts.clone.model == "qwen3-tts-vc-2026-01-22"
@@ -190,7 +190,7 @@ def test_init_can_write_openai_compatible_tts_provider(tmp_path: Path) -> None:
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="hf-token\ndash-key\n\nopenai-compatible\nhttp://localhost:9000/v1\ntts-1\n",
+        input="hf-token\n\nopenai-compatible\nhttp://localhost:9000/v1\ntts-1\n",
     )
 
     assert result.exit_code == 0
@@ -199,6 +199,7 @@ def test_init_can_write_openai_compatible_tts_provider(tmp_path: Path) -> None:
     assert config.tts.mode == "preset"
     assert config.tts.base_url == "http://localhost:9000/v1"
     assert config.tts.preset.model == "tts-1"
+    assert "DashScope API key" not in result.output
 
 
 def test_init_can_write_vllm_omni_tts_provider(tmp_path: Path) -> None:
@@ -207,7 +208,7 @@ def test_init_can_write_vllm_omni_tts_provider(tmp_path: Path) -> None:
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="hf-token\ndash-key\n\nvllm-omni\nhttp://localhost:8091/v1\nlocal-key\nclone\n\n",
+        input="hf-token\n\nvllm-omni\nhttp://localhost:8091/v1\nlocal-key\nclone\n\n",
     )
 
     assert result.exit_code == 0
@@ -216,6 +217,7 @@ def test_init_can_write_vllm_omni_tts_provider(tmp_path: Path) -> None:
     assert config.tts.base_url == "http://localhost:8091/v1"
     assert config.tts.mode == "clone"
     assert config.tts.vllm_omni.api_key == "local-key"
+    assert "DashScope API key" not in result.output
 
 
 def test_init_reprompts_required_values(tmp_path: Path) -> None:
@@ -224,14 +226,15 @@ def test_init_reprompts_required_values(tmp_path: Path) -> None:
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="\nhf-token\n\ndash-key\ncustom-translator\n\n\ncustom-tts\n",
+        input="\nhf-token\n\n\n\ndash-key\n\ncustom-tts\n",
     )
 
     assert result.exit_code == 0
     config = load_config(config_path)
     assert config.hf_token == "hf-token"
     assert config.providers.dashscope.api_key == "dash-key"
-    assert config.translation.model == "custom-translator"
+    assert config.translation.provider == "google-free"
+    assert config.translation.model == "qwen-flash"
     assert config.tts.clone.model == "custom-tts"
     assert result.output.count("Hugging Face token") >= 2
     assert result.output.count("DashScope API key") >= 2
@@ -253,14 +256,15 @@ def test_init_uses_existing_values_as_defaults_and_preserves_other_fields(tmp_pa
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="\n\nupdated-translate\n\n\n\n",
+        input="\n\n\n\n\n",
     )
 
     assert result.exit_code == 0
     updated = load_config(config_path)
     assert updated.hf_token == "hf-existing"
     assert updated.providers.dashscope.api_key == "dash-existing"
-    assert updated.translation.model == "updated-translate"
+    assert updated.translation.provider == "google-free"
+    assert updated.translation.model == "existing-translate"
     assert updated.tts.clone.model == "existing-tts"
     assert updated.tts.mode == "preset"
     assert updated.tts.preset.voice_map == {"SPEAKER_00": "Cherry"}
@@ -293,7 +297,7 @@ fallback_voices = ["Cherry"]
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="\n\n\n\n\n\n",
+        input="\n\n\n\n\n",
     )
 
     assert result.exit_code == 0
@@ -303,10 +307,70 @@ fallback_voices = ["Cherry"]
     assert 'voice_mode = "clone"' in backup_path.read_text(encoding="utf-8")
     assert rebuilt.hf_token == "hf-legacy"
     assert rebuilt.providers.dashscope.api_key == "dash-legacy"
+    assert rebuilt.translation.provider == "google-free"
     assert rebuilt.translation.model == "qwen-flash"
     assert rebuilt.tts.clone.model == "qwen3-tts-vc-2026-01-22"
     assert "Legacy TTS config detected." in result.output
     assert "Only hf_token and provider API keys were preserved." in _normalize_help_output(result.output)
+
+
+def test_init_skips_dashscope_key_when_neither_translation_nor_tts_use_dashscope(tmp_path: Path) -> None:
+    config_path = tmp_path / "podtran.toml"
+
+    result = runner.invoke(
+        cli.app,
+        ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
+        input="hf-token\nopenai-compatible\nhttp://localhost:9000/v1\ntranslate-model\nopenai-compatible\nhttp://localhost:9001/v1\ntts-1\n",
+    )
+
+    assert result.exit_code == 0
+    config = load_config(config_path)
+    assert config.translation.provider == "openai-compatible"
+    assert config.translation.base_url == "http://localhost:9000/v1"
+    assert config.translation.model == "translate-model"
+    assert config.tts.provider == "openai-compatible"
+    assert config.tts.base_url == "http://localhost:9001/v1"
+    assert config.tts.preset.model == "tts-1"
+    assert config.providers.dashscope.api_key == ""
+    assert "DashScope API key" not in result.output
+
+
+def test_init_prompts_dashscope_key_immediately_for_dashscope_translation(tmp_path: Path) -> None:
+    config_path = tmp_path / "podtran.toml"
+
+    result = runner.invoke(
+        cli.app,
+        ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
+        input="hf-token\ndashscope\ndash-key\ntranslate-model\nopenai-compatible\nhttp://localhost:9001/v1\ntts-1\n",
+    )
+
+    assert result.exit_code == 0
+    config = load_config(config_path)
+    assert config.translation.provider == "dashscope"
+    assert config.providers.dashscope.api_key == "dash-key"
+    assert config.translation.model == "translate-model"
+    assert config.tts.provider == "openai-compatible"
+    assert result.output.index("Translation provider") < result.output.index("DashScope API key")
+    assert result.output.index("DashScope API key") < result.output.index("Translation model")
+
+
+def test_init_prompts_dashscope_key_immediately_for_dashscope_tts(tmp_path: Path) -> None:
+    config_path = tmp_path / "podtran.toml"
+
+    result = runner.invoke(
+        cli.app,
+        ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
+        input="hf-token\n\n\ndash-key\nclone\ncustom-tts\n",
+    )
+
+    assert result.exit_code == 0
+    config = load_config(config_path)
+    assert config.translation.provider == "google-free"
+    assert config.tts.provider == "dashscope"
+    assert config.providers.dashscope.api_key == "dash-key"
+    assert config.tts.clone.model == "custom-tts"
+    assert result.output.index("TTS provider") < result.output.index("DashScope API key")
+    assert result.output.index("DashScope API key") < result.output.index("TTS mode")
 
 
 def test_backup_legacy_config_preserves_existing_backup(tmp_path: Path) -> None:

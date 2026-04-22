@@ -12,7 +12,7 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib
 
 
-DEFAULT_TRANSLATION_PROVIDER = "dashscope"
+DEFAULT_TRANSLATION_PROVIDER = "google-free"
 DEFAULT_TRANSLATION_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_TRANSLATION_MODEL = "qwen-flash"
 DEFAULT_TTS_PROVIDER = "dashscope"
@@ -219,6 +219,7 @@ def render_config_toml(config: AppConfig) -> str:
         f'api_key = "{config.providers.dashscope.api_key}"',
         "",
         "[translation]",
+        '# google-free uses the unofficial Google Translate web endpoint and ignores base_url/model.',
         f'provider = "{config.translation.provider}"',
         f'base_url = "{config.translation.base_url}"',
         f'model = "{config.translation.model}"',

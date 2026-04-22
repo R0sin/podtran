@@ -420,7 +420,7 @@ def _prompt_choice(label: str, options: tuple[str, ...], default: str) -> str:
 RESUME_HELP = """Resume an existing task and re-run the pipeline from where it left off.
 
 If TASK is omitted, picks the latest task. Completed stages are skipped automatically.
-Interrupted translations resume from the last saved checkpoint.
+Interrupted or failed translate/tts stages resume from the last compatible checkpoint.
 """
 
 
@@ -570,7 +570,7 @@ def translate(
 
 @app.command(
     short_help="Run TTS synthesis for an existing task.",
-    help="Run only the synthesis stage for TASK. Requires `translated.json` to exist for that task.",
+    help="Run only the synthesis stage for TASK. Requires `translated.json` with all translations completed successfully.",
 )
 def synthesize(
     task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
@@ -585,7 +585,7 @@ def synthesize(
 
 @app.command(
     short_help="Compose the final output for an existing task.",
-    help="Run only the compose stage for TASK. Requires `translated.json` and at least one completed TTS output.",
+    help="Run only the compose stage for TASK. Requires `translated.json` and successful TTS output for every segment.",
 )
 def compose(
     task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
@@ -779,6 +779,14 @@ def _execute_pipeline(
         except KeyboardInterrupt:
             console.print(f"\n[yellow]Interrupted.[/yellow] Resume with: podtran resume {task_manifest.task_id}")
             raise typer.Exit(code=1)
+        except typer.Exit:
+            raise
+        except Exception:
+            if task_manifest.status != "failed":
+                raise
+            stage = task_manifest.current_stage or "unknown"
+            console.print(f"\n[red]Task failed at {stage}.[/red] Resume with: podtran resume {task_manifest.task_id}")
+            raise typer.Exit(code=1)
     console.print(f"[green]Task complete:[/green] {task_manifest.task_id}")
     final_output_path = _compose_output_path(task_manifest, cfg, paths)
     if final_output_path.exists():
@@ -824,13 +832,16 @@ def _require_artifact(path: Path, stage_name: str, artifact_name: str) -> None:
 
 def _require_completed_tts(translated_json: Path) -> None:
     segments = read_model_list(translated_json, SegmentRecord)
-    has_completed_audio = any(
-        item.status == "completed" and item.tts_audio_path.strip() and Path(item.tts_audio_path).exists()
-        for item in segments
-    )
-    if has_completed_audio:
+    if _all_segments_synthesized(segments):
         return
-    _abort("Cannot run compose: no completed synthesized audio found.")
+    _abort("Cannot run compose: not all synthesized audio is available.")
+
+
+def _require_translated_segments_ready(translated_json: Path) -> list[SegmentRecord]:
+    segments = read_model_list(translated_json, SegmentRecord)
+    if _all_segments_translated(segments):
+        return segments
+    _abort("Cannot run synthesize: translation is incomplete or contains failed segments.")
 
 
 
@@ -853,14 +864,15 @@ def _can_resume_partial(
     input_fingerprints: dict[str, str],
     config_fingerprint: str,
 ) -> bool:
-    """Check if an interrupted stage can resume with partial results intact.
+    """Check if a non-current stage can resume with partial results intact.
 
-    Returns True only when the previous manifest exists with status 'running'
-    or 'interrupted' AND the stage version, input and config fingerprints all
-    still match, meaning the partial results are compatible with the current run.
+    Returns True only when the previous manifest exists with status 'running',
+    'interrupted', or 'failed' AND the stage version, input and config
+    fingerprints all still match, meaning the partial results are compatible
+    with the current run.
     """
     manifest = executor.load_manifest(stage)
-    if manifest is None or manifest.status not in ("running", "interrupted"):
+    if manifest is None or manifest.status not in ("running", "interrupted", "failed"):
         return False
     if manifest.stage_version != stage_version:
         return False
@@ -1073,12 +1085,10 @@ def _ensure_translate(
             paths.translated_json,
             progress_callback=(lambda completed, total_steps, message: reporter.update_stage("translate", completed, total_steps, message)) if reporter is not None else None,
         )
-        translated_count = sum(1 for item in translated if item.text_zh.strip())
-        if translated_count == 0:
-            _print_stage_failure_summary("translate", translated)
-            raise RuntimeError("All translations failed.")
         write_json(paths.translated_json, translated)
-        _print_stage_failure_summary("translate", translated)
+        if not _all_segments_translated(translated):
+            _print_stage_failure_summary("translate", translated)
+            raise RuntimeError("Translation failed for one or more segments.")
         executor.complete(manifest)
         cache_store.publish("translate", cache_key, {"translated_json": paths.translated_json}, manifest)
         if reporter is not None:
@@ -1108,8 +1118,9 @@ def _ensure_synthesize(
 ) -> StageDecision:
     from podtran.tts import synthesize_segments
 
-    translation_input = _synthesize_input_segments(paths)
-    input_fingerprints = {"translated_json": fingerprints.hash_json(translation_input)}
+    translation_segments = _require_translated_segments_ready(paths.translated_json)
+    synthesis_input = _synthesize_input_segments(translation_segments)
+    input_fingerprints = {"translated_json": fingerprints.hash_json(synthesis_input)}
     config_fingerprint = fingerprints.hash_config_subset(cfg, SYNTHESIZE_CONFIG_KEYS)
     output_refs = _synthesize_output_refs(cfg)
     cache_key = fingerprints.build_stage_cache_key("synthesize", SYNTHESIZE_STAGE_VERSION, input_fingerprints, config_fingerprint)
@@ -1120,19 +1131,23 @@ def _ensure_synthesize(
             reporter.skip_stage("synthesize", "up-to-date")
         return StageDecision("synthesize", "up-to-date", "task outputs current")
 
+    resumable = _can_resume_partial(executor, "synthesize", SYNTHESIZE_STAGE_VERSION, input_fingerprints, config_fingerprint)
     executor.start(manifest)
     try:
         ensure_command(FFMPEG_COMMAND)
         ensure_command(FFPROBE_COMMAND)
         if reporter is not None:
             reporter.start_stage("synthesize", 1, "Resolving voices")
-        remove_path(paths.tts_dir)
-        remove_path(paths.refs_dir)
-        remove_path(paths.voices_json)
+        if not resumable:
+            remove_path(paths.tts_dir)
+            remove_path(paths.refs_dir)
+            remove_path(paths.voices_json)
+            segments = synthesis_input
+            write_json(paths.translated_json, segments)
+        else:
+            segments = translation_segments
         paths.tts_dir.mkdir(parents=True, exist_ok=True)
         paths.refs_dir.mkdir(parents=True, exist_ok=True)
-        segments = translation_input
-        write_json(paths.translated_json, segments)
         synthesized = synthesize_segments(
             paths.translated_json,
             paths.translated_json,
@@ -1144,12 +1159,10 @@ def _ensure_synthesize(
             fingerprints=fingerprints,
             progress_callback=(lambda completed, total_steps, message: reporter.update_stage("synthesize", completed, total_steps, message)) if reporter is not None else None,
         )
-        synthesized_count = sum(1 for item in synthesized if item.status == "completed")
-        if synthesized_count == 0:
-            _print_stage_failure_summary("tts", synthesized)
-            raise RuntimeError("No synthesized audio was produced.")
         write_json(paths.translated_json, synthesized)
-        _print_stage_failure_summary("tts", synthesized)
+        if not _all_segments_synthesized(synthesized):
+            _print_stage_failure_summary("tts", synthesized)
+            raise RuntimeError("Synthesis failed for one or more segments.")
         executor.complete(manifest)
         if reporter is not None:
             reporter.complete_stage("synthesize", _synthesize_stage_summary(synthesized))
@@ -1312,8 +1325,8 @@ def _reset_tts_state(segments: list[SegmentRecord]) -> list[SegmentRecord]:
     return reset
 
 
-def _synthesize_input_segments(paths: ArtifactPaths) -> list[SegmentRecord]:
-    return _reset_tts_state(read_model_list(paths.translated_json, SegmentRecord))
+def _synthesize_input_segments(segments: list[SegmentRecord]) -> list[SegmentRecord]:
+    return _reset_tts_state(segments)
 
 
 
@@ -1353,6 +1366,17 @@ def _synthesize_stage_summary(segments: list[SegmentRecord]) -> str:
     completed = sum(1 for item in segments if item.status == "completed")
     failed = sum(1 for item in segments if item.status == "failed")
     return f"synthesize done: {completed}/{len(segments)} audio ready, {failed} failed"
+
+
+def _all_segments_translated(segments: list[SegmentRecord]) -> bool:
+    return bool(segments) and all(item.text_zh.strip() for item in segments)
+
+
+def _all_segments_synthesized(segments: list[SegmentRecord]) -> bool:
+    return bool(segments) and all(
+        item.status == "completed" and item.tts_audio_path.strip() and Path(item.tts_audio_path).exists()
+        for item in segments
+    )
 
 
 

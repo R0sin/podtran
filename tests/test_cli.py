@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 
+from click.exceptions import Exit as ClickExit
 import pytest
 from rich.console import Console
 from typer.testing import CliRunner
@@ -23,7 +24,13 @@ def _normalize_help_output(output: str) -> str:
     return " ".join(without_ansi.split())
 
 
-def _segment(segment_id: str, error: str | None, status: str = "pending", tts_audio_path: str = "") -> SegmentRecord:
+def _segment(
+    segment_id: str,
+    error: str | None,
+    status: str = "pending",
+    tts_audio_path: str = "",
+    text_zh: str = "",
+) -> SegmentRecord:
     return SegmentRecord(
         segment_id=segment_id,
         block_id="b1",
@@ -32,6 +39,7 @@ def _segment(segment_id: str, error: str | None, status: str = "pending", tts_au
         text="hello",
         speaker="SPEAKER_00",
         voice="Cherry",
+        text_zh=text_zh,
         status=status,
         tts_audio_path=tts_audio_path,
         error=error,
@@ -142,6 +150,8 @@ def test_stage_help_documents_task_requirements() -> None:
     synthesize_result = runner.invoke(cli.app, ["synthesize", "--help"])
     compose_result = runner.invoke(cli.app, ["compose", "--help"])
     cache_clean_result = runner.invoke(cli.app, ["cache", "clean", "--help"])
+    normalized_synthesize = _normalize_help_output(synthesize_result.output)
+    normalized_compose = _normalize_help_output(compose_result.output)
 
     assert status_result.exit_code == 0
     assert "If TASK is omitted" in status_result.output
@@ -151,11 +161,12 @@ def test_stage_help_documents_task_requirements() -> None:
     assert "Requires `transcript.json`" in translate_result.output
 
     assert synthesize_result.exit_code == 0
-    assert "Requires `translated.json`" in synthesize_result.output
+    assert "Requires `translated.json`" in normalized_synthesize
+    assert "all translations completed successfully" in normalized_synthesize
 
     assert compose_result.exit_code == 0
-    assert "Requires `translated.json`" in compose_result.output
-    assert "completed TTS output" in compose_result.output
+    assert "Requires `translated.json`" in normalized_compose
+    assert "successful TTS output for every segment" in normalized_compose
 
     assert cache_clean_result.exit_code == 0
     assert "2026-04-01" in cache_clean_result.output
@@ -637,13 +648,22 @@ def test_preview_synthesize_uses_processing_audio(tmp_path: Path, monkeypatch) -
     executor = StageExecutor(store, task_manifest, paths)
     cache_store = CacheStore(paths.cache_dir)
     fingerprints = FingerprintService(paths.cache_indexes_dir)
-    write_json(paths.translated_json, [_segment("seg_1", None)])
+    write_json(paths.translated_json, [_segment("seg_1", None, text_zh="你好")])
     captured: dict[str, object] = {}
 
     def fake_synthesize_segments(*args, **kwargs):
         captured["source_audio"] = kwargs["source_audio"]
         captured["source_audio_fingerprint"] = kwargs["source_audio_fingerprint"]
-        completed = _segment("seg_1", None, status="completed", tts_audio_path=str(paths.tts_dir / "seg_1.wav"))
+        output = paths.tts_dir / "seg_1.wav"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"tts")
+        completed = _segment(
+            "seg_1",
+            None,
+            status="completed",
+            tts_audio_path=str(output.resolve()),
+            text_zh="你好",
+        )
         return [completed]
 
     monkeypatch.setattr(cli, "ensure_command", lambda command: None)
@@ -664,13 +684,13 @@ def test_synthesize_is_up_to_date_after_successful_run(tmp_path: Path, monkeypat
     executor = StageExecutor(store, task_manifest, paths)
     cache_store = CacheStore(paths.cache_dir)
     fingerprints = FingerprintService(paths.cache_indexes_dir)
-    write_json(paths.translated_json, [_segment("seg_1", None)])
+    write_json(paths.translated_json, [_segment("seg_1", None, text_zh="你好")])
 
     def fake_synthesize_segments(*args, **kwargs):
         output = paths.tts_dir / "seg_1.wav"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"tts")
-        return [_segment("seg_1", None, status="completed", tts_audio_path=str(output.resolve()))]
+        return [_segment("seg_1", None, status="completed", tts_audio_path=str(output.resolve()), text_zh="你好")]
 
     monkeypatch.setattr(cli, "ensure_command", lambda command: None)
     monkeypatch.setattr(tts, "synthesize_segments", fake_synthesize_segments)
@@ -690,7 +710,10 @@ def test_preview_compose_uses_processing_audio_and_preview_output_name(tmp_path:
     synthesized_audio = paths.tts_dir / "seg_1.wav"
     synthesized_audio.parent.mkdir(parents=True, exist_ok=True)
     synthesized_audio.write_bytes(b"tts")
-    write_json(paths.translated_json, [_segment("seg_1", None, status="completed", tts_audio_path=str(synthesized_audio))])
+    write_json(
+        paths.translated_json,
+        [_segment("seg_1", None, status="completed", tts_audio_path=str(synthesized_audio), text_zh="你好")],
+    )
     captured: dict[str, Path] = {}
 
     def fake_compose_output(source_audio: Path, segments, config, temp_dir: Path, output_path: Path, mode: str | None = None, progress_callback=None) -> Path:
@@ -850,7 +873,7 @@ def test_resume_help_documents_task_argument_and_latest_default() -> None:
     assert result.exit_code == 0
     assert "TASK" in result.output
     assert "latest" in result.output.lower()
-    assert "Interrupted translations resume" in result.output
+    assert "Interrupted or failed translate/tts stages resume" in result.output
 
 
 def test_resume_loads_latest_task_and_executes_pipeline(tmp_path: Path, monkeypatch) -> None:
@@ -1031,6 +1054,48 @@ def test_ensure_translate_preserves_partial_results_on_resume(tmp_path: Path, mo
     assert restored[0].text_zh == "你好"
 
 
+def test_ensure_translate_fails_when_any_segment_fails_and_preserves_output(tmp_path: Path, monkeypatch) -> None:
+    import podtran.translate as translate_module
+
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    segments = [_segment("seg_1", None), _segment("seg_2", None)]
+
+    def fake_write_segments(_paths: Path, _cfg: AppConfig) -> list[SegmentRecord]:
+        write_json(paths.segments_json, segments)
+        return segments
+
+    class FakeTranslator:
+        def __init__(self, config: AppConfig) -> None:
+            self.config = config
+
+        def translate_segments(self, input_path, output_path, progress_callback=None):
+            return [
+                segments[0].model_copy(update={"text_zh": "你好"}),
+                segments[1].model_copy(update={"error": "RuntimeError: boom"}),
+            ]
+
+    monkeypatch.setattr(cli, "_write_segments", fake_write_segments)
+    monkeypatch.setattr(translate_module, "Translator", FakeTranslator)
+
+    with pytest.raises(RuntimeError, match="Translation failed for one or more segments."):
+        cli._ensure_translate(task, cfg, paths, executor, cache_store, fingerprints)
+
+    manifest = read_model(paths.manifest_path("translate"), StageManifest)
+    translated = read_model_list(paths.translated_json, SegmentRecord)
+    assert manifest.status == "failed"
+    assert translated[0].text_zh == "你好"
+    assert translated[1].error == "RuntimeError: boom"
+    assert cache_store.lookup("translate", manifest.cache_key) is None
+
+
 def test_can_resume_partial_returns_true_for_interrupted_status(tmp_path: Path) -> None:
     audio = tmp_path / "episode.mp3"
     audio.write_bytes(b"audio")
@@ -1049,6 +1114,30 @@ def test_can_resume_partial_returns_true_for_interrupted_status(tmp_path: Path) 
         config_fingerprint=config_fp,
         output_refs={"translated_json": "translated.json"},
         error="Interrupted by user",
+    )
+    write_json(paths.manifest_path("translate"), manifest)
+
+    assert cli._can_resume_partial(executor, "translate", 1, input_fps, config_fp) is True
+
+
+def test_can_resume_partial_returns_true_for_failed_status(tmp_path: Path) -> None:
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    input_fps = {"segments_json": "abc123"}
+    config_fp = "cfg-hash"
+    manifest = StageManifest(
+        stage="translate",
+        status="failed",
+        input_fingerprints=input_fps,
+        config_fingerprint=config_fp,
+        output_refs={"translated_json": "translated.json"},
+        error="Translation failed for one or more segments.",
     )
     write_json(paths.manifest_path("translate"), manifest)
 
@@ -1129,7 +1218,7 @@ def test_synthesize_keyboard_interrupt_sets_interrupted_status(tmp_path: Path, m
     task = store.create_task(audio, cfg, f"podtran {audio}")
     paths = store.paths_for(task)
     paths.ensure()
-    write_json(paths.translated_json, [_segment("seg_1", None)])
+    write_json(paths.translated_json, [_segment("seg_1", None, text_zh="你好")])
 
     def interrupting_synthesize(*args, **kwargs):
         raise KeyboardInterrupt()
@@ -1145,6 +1234,156 @@ def test_synthesize_keyboard_interrupt_sets_interrupted_status(tmp_path: Path, m
     assert manifest.error == "Interrupted by user"
     reloaded_task = store.load_task(task.task_id)
     assert reloaded_task.status == "interrupted"
+
+
+def test_ensure_synthesize_rejects_incomplete_translation_without_mutating_output(tmp_path: Path) -> None:
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    paths.ensure()
+    write_json(paths.translated_json, [_segment("seg_1", "RuntimeError: boom")])
+    original = paths.translated_json.read_text(encoding="utf-8")
+
+    with pytest.raises(ClickExit):
+        cli._ensure_synthesize(task, cfg, paths, StageExecutor(store, task, paths), cache_store, fingerprints)
+
+    assert paths.translated_json.read_text(encoding="utf-8") == original
+    assert not paths.manifest_path("synthesize").exists()
+
+
+def test_require_completed_tts_rejects_partial_outputs(tmp_path: Path) -> None:
+    translated_json = tmp_path / "translated.json"
+    audio = tmp_path / "seg_1.wav"
+    audio.write_bytes(b"tts")
+    write_json(
+        translated_json,
+        [
+            _segment("seg_1", None, status="completed", tts_audio_path=str(audio.resolve()), text_zh="你好一"),
+            _segment("seg_2", "boom: bad", status="failed", text_zh="你好二"),
+        ],
+    )
+
+    with pytest.raises(ClickExit):
+        cli._require_completed_tts(translated_json)
+
+
+def test_ensure_synthesize_fails_when_any_segment_fails_and_preserves_output(tmp_path: Path, monkeypatch) -> None:
+    import podtran.tts as tts_module
+
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    paths.ensure()
+    translated = [_segment("seg_1", None, text_zh="你好一"), _segment("seg_2", None, text_zh="你好二")]
+    write_json(paths.translated_json, translated)
+
+    def fake_synthesize_segments(*args, **kwargs):
+        completed_audio = paths.tts_dir / "seg_1_SPEAKER_00.wav"
+        completed_audio.parent.mkdir(parents=True, exist_ok=True)
+        completed_audio.write_bytes(b"tts-1")
+        return [
+            translated[0].model_copy(
+                update={
+                    "status": "completed",
+                    "tts_audio_path": str(completed_audio.resolve()),
+                    "tts_duration_ms": 1000,
+                }
+            ),
+            translated[1].model_copy(update={"status": "failed", "error": "boom: bad"}),
+        ]
+
+    monkeypatch.setattr(cli, "ensure_command", lambda command: None)
+    monkeypatch.setattr(tts_module, "synthesize_segments", fake_synthesize_segments)
+
+    with pytest.raises(RuntimeError, match="Synthesis failed for one or more segments."):
+        cli._ensure_synthesize(task, cfg, paths, StageExecutor(store, task, paths), cache_store, fingerprints)
+
+    manifest = read_model(paths.manifest_path("synthesize"), StageManifest)
+    synthesized = read_model_list(paths.translated_json, SegmentRecord)
+    assert manifest.status == "failed"
+    assert synthesized[0].status == "completed"
+    assert synthesized[1].status == "failed"
+    assert synthesized[1].error == "boom: bad"
+
+
+def test_ensure_synthesize_resumes_failed_stage_and_reuses_completed_audio(tmp_path: Path, monkeypatch) -> None:
+    import podtran.tts as tts_module
+
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    paths.ensure()
+    existing_audio = paths.tts_dir / "seg_1_SPEAKER_00.wav"
+    existing_audio.parent.mkdir(parents=True, exist_ok=True)
+    existing_audio.write_bytes(b"tts-1")
+    translated = [
+        _segment("seg_1", None, status="completed", tts_audio_path=str(existing_audio.resolve()), text_zh="你好一"),
+        _segment("seg_2", "boom: bad", status="failed", text_zh="你好二"),
+    ]
+    write_json(paths.translated_json, translated)
+    input_fps = {"translated_json": fingerprints.hash_json(cli._synthesize_input_segments(translated))}
+    config_fp = fingerprints.hash_config_subset(cfg, cli.SYNTHESIZE_CONFIG_KEYS)
+    write_json(
+        paths.manifest_path("synthesize"),
+        StageManifest(
+            stage="synthesize",
+            status="failed",
+            stage_version=cli.SYNTHESIZE_STAGE_VERSION,
+            input_fingerprints=input_fps,
+            config_fingerprint=config_fp,
+            output_refs=cli._synthesize_output_refs(cfg),
+            error="Synthesis failed for one or more segments.",
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_synthesize_segments(input_path, output_path, *args, **kwargs):
+        loaded = read_model_list(output_path, SegmentRecord)
+        captured["loaded"] = loaded
+        new_audio = paths.tts_dir / "seg_2_SPEAKER_00.wav"
+        new_audio.write_bytes(b"tts-2")
+        return [
+            loaded[0],
+            loaded[1].model_copy(
+                update={
+                    "status": "completed",
+                    "error": None,
+                    "tts_audio_path": str(new_audio.resolve()),
+                    "tts_duration_ms": 1000,
+                }
+            ),
+        ]
+
+    monkeypatch.setattr(cli, "ensure_command", lambda command: None)
+    monkeypatch.setattr(tts_module, "synthesize_segments", fake_synthesize_segments)
+
+    result = cli._ensure_synthesize(task, cfg, paths, StageExecutor(store, task, paths), cache_store, fingerprints)
+
+    manifest = read_model(paths.manifest_path("synthesize"), StageManifest)
+    synthesized = read_model_list(paths.translated_json, SegmentRecord)
+    loaded = captured["loaded"]
+    assert result.action == "run"
+    assert manifest.status == "completed"
+    assert loaded[0].status == "completed"
+    assert loaded[0].tts_audio_path == str(existing_audio.resolve())
+    assert synthesized[0].tts_audio_path == str(existing_audio.resolve())
+    assert synthesized[1].status == "completed"
+    assert Path(synthesized[1].tts_audio_path).exists()
 
 
 def test_execute_pipeline_prints_resume_hint_on_interrupt(tmp_path: Path, monkeypatch) -> None:
@@ -1167,5 +1406,33 @@ def test_execute_pipeline_prints_resume_hint_on_interrupt(tmp_path: Path, monkey
         cli.console = previous_console
 
     assert "Interrupted" in rendered
+    assert f"podtran resume {task_manifest.task_id}" in rendered
+    assert "Task complete" not in rendered
+
+
+def test_execute_pipeline_prints_resume_hint_on_stage_failure(tmp_path: Path, monkeypatch) -> None:
+    cfg, store, task_manifest = _preview_task(tmp_path)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    recorded_console = Console(record=True, width=160)
+    previous_console = cli.console
+
+    monkeypatch.setattr(cli, "_ensure_transcribe", lambda *args, **kwargs: cli.StageDecision("transcribe", "up-to-date", "test"))
+
+    def failing_translate(*args, **kwargs):
+        task_manifest.current_stage = "translate"
+        task_manifest.status = "failed"
+        raise RuntimeError("Translation failed for one or more segments.")
+
+    monkeypatch.setattr(cli, "_ensure_translate", failing_translate)
+    cli.console = recorded_console
+    try:
+        with pytest.raises(ClickExit):
+            cli._execute_pipeline(task_manifest, cfg, store, cache_store, fingerprints)
+        rendered = recorded_console.export_text()
+    finally:
+        cli.console = previous_console
+
+    assert "Task failed at translate." in rendered
     assert f"podtran resume {task_manifest.task_id}" in rendered
     assert "Task complete" not in rendered

@@ -227,6 +227,37 @@ podtran status
 
 `interleave` 是默认模式，表示保留英文原声并穿插中文配音。
 
+## 常见问题
+
+### transcribe 在 Loading ASR model 阶段下载模型失败
+
+如果新环境首次运行时报错类似：
+
+```text
+An error happened while trying to locate the files on the Hub and we cannot find the appropriate snapshot folder for the specified revision on the local disk.
+```
+
+通常表示本地还没有 Hugging Face 模型缓存，同时当前网络无法直接访问 Hugging Face Hub。这个错误发生在 WhisperX 加载 ASR 模型阶段，通常不是 `hf_token` 配错导致的。
+
+在 PowerShell 中可以尝试把 Hugging Face Hub endpoint 切到镜像：
+
+```powershell
+$env:HF_ENDPOINT = "https://hf-mirror.com"
+podtran resume <task_id>
+```
+
+如果希望长期生效：
+
+```powershell
+[Environment]::SetEnvironmentVariable("HF_ENDPOINT", "https://hf-mirror.com", "User")
+```
+
+重新打开 PowerShell 后确认变量已生效：
+
+```powershell
+echo $env:HF_ENDPOINT
+```
+
 ## License
 
 本项目采用 MIT License，详见 [LICENSE](LICENSE)。

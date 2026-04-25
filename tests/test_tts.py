@@ -1,7 +1,9 @@
 from pathlib import Path
 import signal
+import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -18,7 +20,10 @@ from podtran.models import (
     SegmentRecord,
 )
 from podtran.tts import (
+    QwenLocalTTSBackend,
     VllmOmniTTSBackend,
+    _resolve_reference_text,
+    _resolve_qwen_local_torch_dtype,
     _resolve_openai_compatible_api_key,
     _resolve_tts_model,
     _resolve_vllm_omni_api_key,
@@ -127,6 +132,19 @@ def test_resolve_tts_model_supports_reference_clone_specs() -> None:
     assert _resolve_tts_model(config, reference_spec) == DEFAULT_TTS_CLONE_MODEL
 
 
+def test_resolve_tts_model_uses_qwen_local_model_identity() -> None:
+    config = AppConfig(tts=TTSConfig(provider="qwen-local", mode="clone"))
+    reference_spec = ReferenceCloneSpec(
+        identity="qwen-local:reference_clone:ref-1",
+        provider="qwen-local",
+        payload=ReferenceClonePayload(reference_fingerprint="ref-1"),
+    )
+    preset_spec = PresetVoiceSpec(identity="preset:Vivian", voice_name="Vivian")
+
+    assert _resolve_tts_model(config, reference_spec) == "qwen-local:base:0.6B"
+    assert _resolve_tts_model(config, preset_spec) == "qwen-local:customvoice:0.6B"
+
+
 def test_build_tts_backend_rejects_clone_mode_for_backend_without_clone_capability() -> None:
     config = AppConfig(tts=TTSConfig(provider="openai-compatible", mode="clone"))
 
@@ -140,6 +158,14 @@ def test_build_tts_backend_supports_vllm_omni_clone_mode() -> None:
     backend = build_tts_backend(config)
 
     assert isinstance(backend, VllmOmniTTSBackend)
+
+
+def test_build_tts_backend_supports_qwen_local_clone_mode() -> None:
+    config = AppConfig(tts=TTSConfig(provider="qwen-local", mode="clone"))
+
+    backend = build_tts_backend(config)
+
+    assert isinstance(backend, QwenLocalTTSBackend)
 
 
 def test_build_tts_backend_rejects_unknown_provider() -> None:
@@ -163,7 +189,7 @@ def test_resolve_openai_compatible_api_key_reads_env(monkeypatch: pytest.MonkeyP
 
 
 def test_resolve_vllm_omni_api_key_prefers_config_then_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = AppConfig(tts={"vllm_omni": {"api_key": "config-key"}})
+    config = AppConfig(providers={"vllm_omni": {"api_key": "config-key"}})
     monkeypatch.setenv("PODTRAN_VLLM_OMNI_API_KEY", "env-key")
 
     assert _resolve_vllm_omni_api_key(config) == "config-key"
@@ -174,9 +200,15 @@ def test_vllm_omni_backend_sends_custom_voice_request_body(tmp_path: Path) -> No
         tts={
             "provider": "vllm-omni",
             "mode": "preset",
-            "base_url": "http://localhost:8091/v1",
-            "vllm_omni": {"language": "zh", "instructions": "Warm broadcast tone.", "api_key": "secret"},
-        }
+        },
+        providers={
+            "vllm_omni": {
+                "base_url": "http://localhost:8091/v1",
+                "language": "zh",
+                "instructions": "Warm broadcast tone.",
+                "api_key": "secret",
+            }
+        },
     )
     backend = VllmOmniTTSBackend(config)
     output_path = tmp_path / "speech.wav"
@@ -220,9 +252,15 @@ def test_vllm_omni_backend_sends_base_clone_request_body_without_auth_when_key_m
         tts={
             "provider": "vllm-omni",
             "mode": "clone",
-            "base_url": "http://localhost:8091/v1",
-            "vllm_omni": {"language": "Auto", "instructions": "", "x_vector_only_mode": True},
-        }
+        },
+        providers={
+            "vllm_omni": {
+                "base_url": "http://localhost:8091/v1",
+                "language": "Auto",
+                "instructions": "",
+                "x_vector_only_mode": True,
+            }
+        },
     )
     backend = VllmOmniTTSBackend(config)
     output_path = tmp_path / "speech.wav"
@@ -492,6 +530,224 @@ def test_synthesize_segments_respects_max_concurrency_of_one(tmp_path: Path, mon
 
     assert backend.calls == 2
     assert backend.max_active_calls == 1
+
+
+def test_synthesize_segments_forces_qwen_local_concurrency_to_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "你好一"),
+        _segment_with_text("seg_2", "你好二"),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _TrackingBackend()
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(tts=TTSConfig(provider="qwen-local", mode="preset", max_concurrency=4)),
+        paths,
+    )
+
+    assert backend.calls == 2
+    assert backend.max_active_calls == 1
+
+
+def test_qwen_local_backend_generates_preset_audio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class _Model:
+        @classmethod
+        def from_pretrained(cls, repo: str, **kwargs):
+            calls.append({"repo": repo, "kwargs": kwargs})
+            return cls()
+
+        def generate_custom_voice(self, **kwargs):
+            calls.append(kwargs)
+            return [[0.0, 0.0]], 24000
+
+    monkeypatch.setitem(sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=_Model))
+    monkeypatch.setattr("podtran.tts._write_wav", lambda output_path, audio, sample_rate: output_path.write_bytes(b"wav"))
+
+    backend = QwenLocalTTSBackend(AppConfig(tts={"provider": "qwen-local", "mode": "preset"}))
+    output_path = tmp_path / "speech.wav"
+    backend.synthesize("你好", PresetVoiceSpec(identity="preset:Vivian", voice_name="Vivian"), "qwen-local:customvoice:0.6B", output_path)
+
+    assert output_path.read_bytes() == b"wav"
+    assert calls[0]["repo"] == "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+    assert calls[1]["speaker"] == "Vivian"
+    assert calls[1]["language"] == "Chinese"
+
+
+def test_qwen_local_backend_passes_dtype_and_attention_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import torch
+
+    calls: list[dict[str, object]] = []
+
+    class _Model:
+        @classmethod
+        def from_pretrained(cls, repo: str, **kwargs):
+            calls.append({"repo": repo, "kwargs": kwargs})
+            return cls()
+
+        def generate_custom_voice(self, **kwargs):
+            calls.append(kwargs)
+            return [[0.0, 0.0]], 24000
+
+    monkeypatch.setitem(sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=_Model))
+    monkeypatch.setattr("podtran.tts._write_wav", lambda output_path, audio, sample_rate: output_path.write_bytes(b"wav"))
+
+    backend = QwenLocalTTSBackend(
+        AppConfig(
+            tts={"provider": "qwen-local", "mode": "preset"},
+            providers={
+                "qwen_local": {
+                    "device": "cuda",
+                    "torch_dtype": "float16",
+                    "attn_implementation": "flash_attention_2",
+                }
+            },
+        )
+    )
+    output_path = tmp_path / "speech.wav"
+    backend.synthesize("你好", PresetVoiceSpec(identity="preset:Vivian", voice_name="Vivian"), "qwen-local:customvoice:0.6B", output_path)
+
+    assert output_path.read_bytes() == b"wav"
+    assert calls[0]["repo"] == "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+    assert calls[0]["kwargs"] == {
+        "device_map": "cuda",
+        "dtype": torch.float16,
+        "attn_implementation": "flash_attention_2",
+    }
+
+
+def test_qwen_local_auto_dtype_prefers_bfloat16_when_supported() -> None:
+    import torch
+
+    class _Cuda:
+        @staticmethod
+        def is_bf16_supported() -> bool:
+            return True
+
+    fake_torch = types.SimpleNamespace(
+        cuda=_Cuda(),
+        bfloat16=torch.bfloat16,
+        float16=torch.float16,
+        float32=torch.float32,
+    )
+
+    assert _resolve_qwen_local_torch_dtype(fake_torch, "auto", "cuda") == torch.bfloat16
+
+
+def test_qwen_local_auto_dtype_falls_back_to_float16_without_bfloat16() -> None:
+    import torch
+
+    class _Cuda:
+        @staticmethod
+        def is_bf16_supported() -> bool:
+            return False
+
+    fake_torch = types.SimpleNamespace(
+        cuda=_Cuda(),
+        bfloat16=torch.bfloat16,
+        float16=torch.float16,
+        float32=torch.float32,
+    )
+
+    assert _resolve_qwen_local_torch_dtype(fake_torch, "auto", "cuda") == torch.float16
+
+
+def test_qwen_local_backend_generates_clone_audio_and_caches_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reference_audio = tmp_path / "reference.wav"
+    reference_audio.write_bytes(b"ref")
+    prompt_calls = 0
+    generate_calls = 0
+
+    class _Model:
+        @classmethod
+        def from_pretrained(cls, repo: str, **kwargs):
+            _ = kwargs
+            assert repo == "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+            return cls()
+
+        def create_voice_clone_prompt(self, **kwargs):
+            nonlocal prompt_calls
+            prompt_calls += 1
+            assert kwargs["ref_audio"] == str(reference_audio)
+            assert kwargs["ref_text"] == "reference text"
+            return {"prompt": "cached"}
+
+        def generate_voice_clone(self, **kwargs):
+            nonlocal generate_calls
+            generate_calls += 1
+            assert kwargs["voice_clone_prompt"] == {"prompt": "cached"}
+            return [[0.0, 0.0]], 24000
+
+    monkeypatch.setitem(sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=_Model))
+    monkeypatch.setattr("podtran.tts._write_wav", lambda output_path, audio, sample_rate: output_path.write_bytes(b"wav"))
+
+    backend = QwenLocalTTSBackend(AppConfig(tts={"provider": "qwen-local", "mode": "clone"}))
+    spec = ReferenceCloneSpec(
+        identity="qwen-local:reference_clone:ref-1",
+        provider="qwen-local",
+        payload=ReferenceClonePayload(
+            reference_fingerprint="ref-1",
+            reference_audio_path=str(reference_audio),
+            reference_text="reference text",
+        ),
+    )
+    backend.synthesize("你好一", spec, "qwen-local:base:0.6B", tmp_path / "one.wav")
+    backend.synthesize("你好二", spec, "qwen-local:base:0.6B", tmp_path / "two.wav")
+
+    assert prompt_calls == 1
+    assert generate_calls == 2
+
+
+def test_reference_clone_missing_text_error_is_provider_agnostic() -> None:
+    spec = ReferenceCloneSpec(
+        identity="qwen-local:reference_clone:ref-1",
+        provider="qwen-local",
+        payload=ReferenceClonePayload(reference_fingerprint="ref-1"),
+    )
+
+    with pytest.raises(RuntimeError, match="reference_clone specs require reference text"):
+        _resolve_reference_text(spec)
+
+
+def test_qwen_local_backend_collects_garbage_when_unloading_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    collect_calls = 0
+    backend = QwenLocalTTSBackend(AppConfig(tts={"provider": "qwen-local", "mode": "preset"}))
+    backend.model = object()
+    backend.model_kind = "base"
+    backend.model_size = "0.6B"
+    backend._prompt_cache["ref"] = object()
+
+    def _collect() -> None:
+        nonlocal collect_calls
+        collect_calls += 1
+
+    monkeypatch.setattr("podtran.tts.gc.collect", _collect)
+    backend._unload_model()
+
+    assert collect_calls == 1
+    assert backend.model is None
+    assert backend._prompt_cache == {}
+
+
+def test_qwen_local_backend_reports_missing_dependencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "qwen_tts", None)
+    backend = QwenLocalTTSBackend(AppConfig(tts={"provider": "qwen-local", "mode": "preset"}))
+
+    with pytest.raises(RuntimeError, match="uv sync --extra qwen-local"):
+        backend.synthesize(
+            "你好",
+            PresetVoiceSpec(identity="preset:Vivian", voice_name="Vivian"),
+            "qwen-local:customvoice:0.6B",
+            tmp_path / "speech.wav",
+        )
 
 
 def test_synthesize_segments_builds_backend_once_per_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -166,7 +166,7 @@ def test_stage_help_documents_task_requirements() -> None:
 
     assert compose_result.exit_code == 0
     assert "Requires `translated.json`" in normalized_compose
-    assert "successful TTS output for every segment" in normalized_compose
+    assert "successful TTS output for every required segment" in normalized_compose
 
     assert cache_clean_result.exit_code == 0
     assert "2026-04-01" in cache_clean_result.output
@@ -1312,6 +1312,26 @@ def test_require_completed_tts_rejects_partial_outputs(tmp_path: Path) -> None:
         cli._require_completed_tts(translated_json)
 
 
+def test_require_completed_tts_allows_skipped_unknown_segments(tmp_path: Path) -> None:
+    translated_json = tmp_path / "translated.json"
+    audio = tmp_path / "seg_1.wav"
+    audio.write_bytes(b"tts")
+    write_json(
+        translated_json,
+        [
+            _segment("seg_1", None, status="completed", tts_audio_path=str(audio.resolve()), text_zh="你好一"),
+            _segment(
+                "seg_2",
+                f"{cli.UNKNOWN_SPEAKER_TTS_SKIP_PREFIX}: speaker diarization did not identify this segment.",
+                status="failed",
+                text_zh="你好二",
+            ).model_copy(update={"speaker": "UNKNOWN"}),
+        ],
+    )
+
+    cli._require_completed_tts(translated_json)
+
+
 def test_ensure_synthesize_fails_when_any_segment_fails_and_preserves_output(tmp_path: Path, monkeypatch) -> None:
     import podtran.tts as tts_module
 
@@ -1354,6 +1374,65 @@ def test_ensure_synthesize_fails_when_any_segment_fails_and_preserves_output(tmp
     assert synthesized[0].status == "completed"
     assert synthesized[1].status == "failed"
     assert synthesized[1].error == "boom: bad"
+
+
+def test_ensure_synthesize_warns_when_unknown_segments_are_skipped(tmp_path: Path, monkeypatch) -> None:
+    import podtran.tts as tts_module
+
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    cfg = AppConfig(tts={"mode": "clone"})
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    paths.ensure()
+    translated = [
+        _segment("seg_1", None, text_zh="你好一"),
+        _segment("seg_2", None, text_zh="你好二").model_copy(update={"speaker": "UNKNOWN"}),
+    ]
+    write_json(paths.translated_json, translated)
+    recorded_console = Console(record=True, width=160)
+    previous_console = cli.console
+
+    def fake_synthesize_segments(*args, **kwargs):
+        completed_audio = paths.tts_dir / "seg_1_SPEAKER_00.wav"
+        completed_audio.parent.mkdir(parents=True, exist_ok=True)
+        completed_audio.write_bytes(b"tts-1")
+        paths.voices_json.write_text("[]", encoding="utf-8")
+        return [
+            translated[0].model_copy(
+                update={
+                    "status": "completed",
+                    "tts_audio_path": str(completed_audio.resolve()),
+                    "tts_duration_ms": 1000,
+                }
+            ),
+            translated[1].model_copy(
+                update={
+                    "status": "failed",
+                    "error": f"{cli.UNKNOWN_SPEAKER_TTS_SKIP_PREFIX}: speaker diarization did not identify this segment.",
+                }
+            ),
+        ]
+
+    monkeypatch.setattr(cli, "ensure_command", lambda command: None)
+    monkeypatch.setattr(tts_module, "synthesize_segments", fake_synthesize_segments)
+    cli.console = recorded_console
+    try:
+        result = cli._ensure_synthesize(task, cfg, paths, StageExecutor(store, task, paths), cache_store, fingerprints)
+        rendered = recorded_console.export_text()
+    finally:
+        cli.console = previous_console
+
+    manifest = read_model(paths.manifest_path("synthesize"), StageManifest)
+    synthesized = read_model_list(paths.translated_json, SegmentRecord)
+    assert result.action == "run"
+    assert manifest.status == "completed"
+    assert synthesized[1].status == "failed"
+    assert "tts warnings:" in rendered
+    assert "skipped 1 UNKNOWN segment" in rendered
 
 
 def test_ensure_synthesize_resumes_failed_stage_and_reuses_completed_audio(tmp_path: Path, monkeypatch) -> None:

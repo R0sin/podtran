@@ -19,6 +19,7 @@ from podtran.models import (
     ReferenceCloneSpec,
     SegmentRecord,
 )
+from podtran.voices import UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE
 from podtran.tts import (
     QwenLocalTTSBackend,
     VllmOmniTTSBackend,
@@ -326,6 +327,41 @@ def test_synthesize_segments_raises_when_clone_voice_target_is_missing(tmp_path:
 
     with pytest.raises(RuntimeError, match="Missing resolved clone voice target"):
         synthesize_segments(paths.translated_json, paths.translated_json, config, paths, source_audio=tmp_path / "source.wav")
+
+
+def test_synthesize_segments_skips_unknown_speaker_in_clone_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    source_audio = tmp_path / "source.wav"
+    source_audio.write_bytes(b"wav")
+    write_json(
+        paths.translated_json,
+        [
+            _segment().model_copy(
+                update={
+                    "segment_id": "seg_unknown",
+                    "block_id": "block_unknown",
+                    "speaker": "UNKNOWN",
+                    "text_zh": "你好",
+                }
+            )
+        ],
+    )
+    config = AppConfig(tts=TTSConfig(mode="clone"))
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: pytest.fail("TTS backend should not be used for UNKNOWN speaker"))
+
+    synthesized = synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        config,
+        paths,
+        source_audio=source_audio,
+    )
+
+    assert synthesized[0].status == "failed"
+    assert synthesized[0].tts_audio_path == ""
+    assert synthesized[0].error == UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE
 
 
 def test_synthesize_segments_reuses_shared_tts_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

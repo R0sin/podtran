@@ -89,6 +89,8 @@ TTS_PROVIDER_CHOICES = ("dashscope", "openai-compatible", "vllm-omni", "qwen-loc
 TRANSLATION_PROVIDER_CHOICES = ("google-free", "openai-compatible")
 TTS_MODE_CHOICES = ("preset", "clone")
 DEFAULT_VLLM_OMNI_BASE_URL = "http://localhost:8091/v1"
+UNKNOWN_SPEAKER = "UNKNOWN"
+UNKNOWN_SPEAKER_TTS_SKIP_PREFIX = "Skipped TTS for UNKNOWN speaker"
 
 
 @dataclass(slots=True)
@@ -613,7 +615,7 @@ def synthesize(
 
 @app.command(
     short_help="Compose the final output for an existing task.",
-    help="Run only the compose stage for TASK. Requires `translated.json` and successful TTS output for every segment.",
+    help="Run only the compose stage for TASK. Requires `translated.json` and successful TTS output for every required segment.",
 )
 def compose(
     task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
@@ -862,7 +864,7 @@ def _require_completed_tts(translated_json: Path) -> None:
     segments = read_model_list(translated_json, SegmentRecord)
     if _all_segments_synthesized(segments):
         return
-    _abort("Cannot run compose: not all synthesized audio is available.")
+    _abort("Cannot run compose: not all required synthesized audio is available.")
 
 
 def _require_translated_segments_ready(translated_json: Path) -> list[SegmentRecord]:
@@ -1189,8 +1191,9 @@ def _ensure_synthesize(
         )
         write_json(paths.translated_json, synthesized)
         if not _all_segments_synthesized(synthesized):
-            _print_stage_failure_summary("tts", synthesized)
+            _print_stage_failure_summary("tts", _non_skipped_synthesis_failures(synthesized))
             raise RuntimeError("Synthesis failed for one or more segments.")
+        _print_synthesis_warning_summary(synthesized)
         executor.complete(manifest)
         if reporter is not None:
             reporter.complete_stage("synthesize", _synthesize_stage_summary(synthesized))
@@ -1392,8 +1395,9 @@ def _translate_stage_summary(segments: list[SegmentRecord]) -> str:
 
 def _synthesize_stage_summary(segments: list[SegmentRecord]) -> str:
     completed = sum(1 for item in segments if item.status == "completed")
-    failed = sum(1 for item in segments if item.status == "failed")
-    return f"synthesize done: {completed}/{len(segments)} audio ready, {failed} failed"
+    skipped = sum(1 for item in segments if _is_unknown_speaker_tts_skip(item))
+    failed = sum(1 for item in segments if item.status == "failed" and not _is_unknown_speaker_tts_skip(item))
+    return f"synthesize done: {completed}/{len(segments)} audio ready, {skipped} skipped, {failed} failed"
 
 
 def _all_segments_translated(segments: list[SegmentRecord]) -> bool:
@@ -1402,9 +1406,36 @@ def _all_segments_translated(segments: list[SegmentRecord]) -> bool:
 
 def _all_segments_synthesized(segments: list[SegmentRecord]) -> bool:
     return bool(segments) and all(
-        item.status == "completed" and item.tts_audio_path.strip() and Path(item.tts_audio_path).exists()
+        _segment_has_tts_audio(item) or _is_unknown_speaker_tts_skip(item)
         for item in segments
     )
+
+
+def _segment_has_tts_audio(segment: SegmentRecord) -> bool:
+    return segment.status == "completed" and segment.tts_audio_path.strip() and Path(segment.tts_audio_path).exists()
+
+
+def _is_unknown_speaker_tts_skip(segment: SegmentRecord) -> bool:
+    return (
+        segment.status == "failed"
+        and segment.speaker.strip().upper() == UNKNOWN_SPEAKER
+        and bool(segment.error)
+        and segment.error.startswith(UNKNOWN_SPEAKER_TTS_SKIP_PREFIX)
+    )
+
+
+def _non_skipped_synthesis_failures(segments: list[SegmentRecord]) -> list[SegmentRecord]:
+    return [item for item in segments if item.error and not _is_unknown_speaker_tts_skip(item)]
+
+
+def _print_synthesis_warning_summary(segments: list[SegmentRecord]) -> None:
+    skipped = [item for item in segments if _is_unknown_speaker_tts_skip(item)]
+    if not skipped:
+        return
+    console.print(f"[yellow]tts warnings:[/yellow] skipped {len(skipped)} UNKNOWN segment(s) without TTS audio.")
+    messages = {item.error for item in skipped if item.error}
+    for message in sorted(messages):
+        console.print(f"[yellow]-[/yellow] {_truncate(message)}")
 
 
 

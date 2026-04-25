@@ -35,6 +35,11 @@ MAX_CLONE_REFERENCE_DURATION = 60.0
 MAX_CLONE_REFERENCE_PAUSE = 2.0
 MIN_CLONE_CONTIGUOUS_SPEECH = 3.0
 VOICE_ENROLLMENT_RETRY_ATTEMPTS = 3
+UNKNOWN_SPEAKER = "UNKNOWN"
+UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE = (
+    "Skipped TTS for UNKNOWN speaker: speaker diarization did not identify this segment, "
+    "so clone voice cannot be resolved."
+)
 
 
 class VoiceCloneProvider(Protocol):
@@ -196,6 +201,20 @@ class VoiceResolver:
             progress_callback(0, total_speakers, "Resolving cloned voices")
 
         for speaker in speakers:
+            if is_unknown_speaker(speaker):
+                profile_map[speaker] = VoiceProfile(
+                    speaker=speaker,
+                    provider=self.config.tts.provider,
+                    target_model=target_model,
+                    status="failed",
+                    error=UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE,
+                    source_audio_fingerprint=source_audio_fingerprint or "",
+                    source_audio_path=str(source_path),
+                )
+                completed += 1
+                self._emit_progress(progress_callback, completed, total_speakers, f"Skipping voice reference for {speaker}")
+                continue
+
             candidate = select_reference_candidate(
                 segments,
                 speaker,
@@ -557,6 +576,10 @@ def build_preset_targets(segments: list[SegmentRecord]) -> dict[str, ResolvedVoi
             ),
         )
     return targets
+
+
+def is_unknown_speaker(speaker: str) -> bool:
+    return speaker.strip().upper() == UNKNOWN_SPEAKER
 
 
 def resolve_dashscope_api_key(config: AppConfig) -> str:

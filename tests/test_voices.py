@@ -13,7 +13,13 @@ from podtran.models import (
     SegmentRecord,
     VoiceProfile,
 )
-from podtran.voices import DashScopeCloneProvider, VoiceResolver, resolve_dashscope_api_key, select_reference_candidate
+from podtran.voices import (
+    UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE,
+    DashScopeCloneProvider,
+    VoiceResolver,
+    resolve_dashscope_api_key,
+    select_reference_candidate,
+)
 
 
 class _UnexpectedProvider:
@@ -165,6 +171,29 @@ def test_voice_resolver_raises_when_no_reference_is_available(tmp_path: Path) ->
     voice_profiles = read_model_list(paths.voices_json, VoiceProfile)
     assert voice_profiles[0].status == "failed"
     assert "No qualifying reference audio" in (voice_profiles[0].error or "")
+
+
+def test_voice_resolver_skips_unknown_speaker_without_raising(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    source_audio = tmp_path / "source.wav"
+    source_audio.write_bytes(b"wav")
+    manager = VoiceResolver(AppConfig(tts=TTSConfig(mode="clone")), paths)
+    manager._clone_provider = _UnexpectedProvider()
+
+    resolved = manager.resolve_voice_targets(
+        [
+            _segment("seg_1", 0.0, 2.4, speaker="UNKNOWN", text="short speech here"),
+            _segment("seg_2", 3.5, 5.7, speaker="UNKNOWN", text="still not enough contiguous speech"),
+        ],
+        source_audio,
+    )
+
+    voice_profiles = read_model_list(paths.voices_json, VoiceProfile)
+    assert resolved == {}
+    assert voice_profiles[0].speaker == "UNKNOWN"
+    assert voice_profiles[0].status == "failed"
+    assert voice_profiles[0].error == UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE
 
 
 def test_voice_resolver_uses_reference_clone_specs_for_vllm_omni(tmp_path: Path) -> None:

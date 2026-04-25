@@ -32,7 +32,13 @@ from podtran.models import (
     VoiceSpec,
 )
 from podtran.stage_versions import TTS_STAGE_VERSION
-from podtran.voices import VoiceResolver, build_preset_targets, resolve_dashscope_api_key
+from podtran.voices import (
+    UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE,
+    VoiceResolver,
+    build_preset_targets,
+    is_unknown_speaker,
+    resolve_dashscope_api_key,
+)
 
 TTS_RETRY_ATTEMPTS = 3
 CLONE_VOICE_KINDS = frozenset({"provider_clone", "reference_clone"})
@@ -394,6 +400,20 @@ def synthesize_segments(
         target = voice_targets.get(segment.speaker)
         if target is None:
             if config.tts.normalized_mode() == "clone":
+                if is_unknown_speaker(segment.speaker):
+                    segment.status = "failed"
+                    segment.error = UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE
+                    write_json(output_path, segments)
+                    processed_segments += 1
+                    _emit_segment_progress(
+                        progress_callback,
+                        segment_offset + processed_segments,
+                        stage_total,
+                        processed_segments,
+                        segment_units,
+                        "Skipping UNKNOWN speaker",
+                    )
+                    continue
                 raise RuntimeError(f"Missing resolved clone voice target for {segment.speaker}.")
             target = ResolvedVoiceTarget(
                 speaker=segment.speaker,

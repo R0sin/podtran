@@ -33,7 +33,7 @@ class OpenAICompatibleTranslationBackend:
         self.config = config
         self.client = OpenAI(
             api_key=_resolve_translation_key(config),
-            base_url=config.translation.resolved_base_url(),
+            base_url=config.resolved_translation_base_url(),
             timeout=config.translation.timeout_seconds,
         )
 
@@ -54,7 +54,7 @@ class OpenAICompatibleTranslationBackend:
         )
         user_prompt = json.dumps(payload, ensure_ascii=False)
         response = self.client.chat.completions.create(
-            model=self.config.translation.model,
+            model=self.config.translation_model(),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -62,10 +62,6 @@ class OpenAICompatibleTranslationBackend:
         )
         content = response.choices[0].message.content or ""
         return _parse_translation_response(content, batch)
-
-
-class DashScopeTranslationBackend(OpenAICompatibleTranslationBackend):
-    pass
 
 
 class GoogleFreeTranslationBackend:
@@ -166,8 +162,6 @@ def build_translation_backend(config: AppConfig) -> TranslationBackend:
     provider = config.translation.provider.strip().lower()
     if provider == "google-free":
         return GoogleFreeTranslationBackend(config)
-    if provider == "dashscope":
-        return DashScopeTranslationBackend(config)
     if provider == "openai-compatible":
         return OpenAICompatibleTranslationBackend(config)
     raise RuntimeError(f"Unsupported translation provider: {config.translation.provider}")
@@ -352,7 +346,7 @@ def _excerpt(text: str, limit: int = 240) -> str:
 
 
 def _resolve_translation_key(config: AppConfig) -> str:
-    resolved = config.resolve_provider_api_key(config.translation.provider)
+    resolved = config.resolve_provider_api_key(config.translation.provider, purpose="translation")
     if resolved:
         return resolved
     return os.getenv("OPENAI_API_KEY", "")

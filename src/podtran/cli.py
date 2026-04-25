@@ -25,7 +25,9 @@ from podtran.config import (
     DEFAULT_TTS_PRESET_MODEL,
     DEFAULT_TTS_PROVIDER,
     DEFAULT_TTS_CLONE_MODEL,
+    DEFAULT_QWEN_LOCAL_MODEL_SIZE,
     detect_legacy_tts_keys,
+    detect_legacy_translation_keys,
     load_config,
     load_config_data,
     render_config_toml,
@@ -83,8 +85,8 @@ console = Console()
 KNOWN_COMMANDS = {"run", "resume", "init", "tasks", "status", "version", "transcribe", "translate", "synthesize", "compose", "cache"}
 DEFAULT_MIN_SPEAKERS = 2
 DEFAULT_MAX_SPEAKERS = 5
-TTS_PROVIDER_CHOICES = ("dashscope", "openai-compatible", "vllm-omni")
-TRANSLATION_PROVIDER_CHOICES = ("google-free", "dashscope", "openai-compatible")
+TTS_PROVIDER_CHOICES = ("dashscope", "openai-compatible", "vllm-omni", "qwen-local")
+TRANSLATION_PROVIDER_CHOICES = ("google-free", "openai-compatible")
 TTS_MODE_CHOICES = ("preset", "clone")
 DEFAULT_VLLM_OMNI_BASE_URL = "http://localhost:8091/v1"
 
@@ -261,7 +263,7 @@ def init(
             existing_config = None
         else:
             raw_config = load_config_data(config_path)
-            if detect_legacy_tts_keys(raw_config):
+            if detect_legacy_tts_keys(raw_config) or detect_legacy_translation_keys(raw_config):
                 existing_config = _rebuild_config_with_preserved_auth(raw_config)
                 legacy_rebuild = True
             else:
@@ -301,25 +303,18 @@ def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
         TRANSLATION_PROVIDER_CHOICES,
         config.translation.provider or DEFAULT_TRANSLATION_PROVIDER,
     )
-    if config.translation.provider == "google-free":
-        config.translation.base_url = ""
-    else:
-        if config.translation.provider == "dashscope":
-            config.providers.dashscope.api_key = _prompt_required(
-                "DashScope API key",
-                hide_input=True,
-                current_value=config.providers.dashscope.api_key,
-            )
-        if config.translation.provider == "openai-compatible":
-            config.translation.base_url = _prompt_required(
-                "OpenAI-compatible translation base URL",
-                current_value=config.translation.base_url,
-            )
-        else:
-            config.translation.base_url = ""
-        config.translation.model = _prompt_with_default(
+    if config.translation.provider == "openai-compatible":
+        config.providers.openai_compatible.translation_base_url = _prompt_required(
+            "OpenAI-compatible translation base URL",
+            current_value=config.providers.openai_compatible.translation_base_url,
+        )
+        config.providers.openai_compatible.translation_api_key = _prompt_optional(
+            "OpenAI-compatible translation API key",
+            current_value=config.providers.openai_compatible.translation_api_key,
+        )
+        config.providers.openai_compatible.translation_model = _prompt_with_default(
             "Translation model",
-            config.translation.model or DEFAULT_TRANSLATION_MODEL,
+            config.providers.openai_compatible.translation_model or DEFAULT_TRANSLATION_MODEL,
         )
     provider = _prompt_choice("TTS provider", TTS_PROVIDER_CHOICES, config.tts.provider or DEFAULT_TTS_PROVIDER)
     config.tts.provider = provider
@@ -332,39 +327,58 @@ def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
 
     if provider == "openai-compatible":
         config.tts.mode = "preset"
-        config.tts.base_url = _prompt_required(
+        config.providers.openai_compatible.tts_base_url = _prompt_required(
             "OpenAI-compatible TTS base URL",
-            current_value=config.tts.base_url,
+            current_value=config.providers.openai_compatible.tts_base_url,
         )
-        config.tts.preset.model = _prompt_with_default(
+        config.providers.openai_compatible.tts_api_key = _prompt_optional(
+            "OpenAI-compatible TTS API key",
+            current_value=config.providers.openai_compatible.tts_api_key,
+        )
+        config.providers.openai_compatible.tts_model = _prompt_with_default(
             "TTS preset model",
-            config.tts.preset.model or DEFAULT_TTS_PRESET_MODEL,
+            config.providers.openai_compatible.tts_model or DEFAULT_TTS_PRESET_MODEL,
         )
         return config
 
     if provider == "vllm-omni":
-        config.tts.base_url = _prompt_with_default(
+        config.providers.vllm_omni.base_url = _prompt_with_default(
             "vLLM-Omni TTS base URL",
-            config.tts.base_url or DEFAULT_VLLM_OMNI_BASE_URL,
+            config.providers.vllm_omni.base_url or DEFAULT_VLLM_OMNI_BASE_URL,
         )
-        config.tts.vllm_omni.api_key = _prompt_optional(
+        config.providers.vllm_omni.api_key = _prompt_optional(
             "vLLM-Omni API key",
-            current_value=config.tts.vllm_omni.api_key,
+            current_value=config.providers.vllm_omni.api_key,
         )
-    else:
-        config.tts.base_url = ""
 
     config.tts.mode = _prompt_choice("TTS mode", TTS_MODE_CHOICES, config.tts.mode)
     if config.tts.mode == "preset":
-        config.tts.preset.model = _prompt_with_default(
-            "TTS preset model",
-            config.tts.preset.model or DEFAULT_TTS_PRESET_MODEL,
-        )
+        if provider == "qwen-local":
+            config.providers.qwen_local.preset_model_size = _prompt_with_default(
+                "Qwen local preset model size",
+                config.providers.qwen_local.preset_model_size or DEFAULT_QWEN_LOCAL_MODEL_SIZE,
+            )
+        else:
+            config.providers.dashscope.tts_preset_model = _prompt_with_default(
+                "TTS preset model",
+                config.providers.dashscope.tts_preset_model or DEFAULT_TTS_PRESET_MODEL,
+            )
     else:
-        config.tts.clone.model = _prompt_with_default(
-            "TTS clone model",
-            config.tts.clone.model or DEFAULT_TTS_CLONE_MODEL,
-        )
+        if provider == "qwen-local":
+            config.providers.qwen_local.clone_model_size = _prompt_with_default(
+                "Qwen local clone model size",
+                config.providers.qwen_local.clone_model_size or DEFAULT_QWEN_LOCAL_MODEL_SIZE,
+            )
+        elif provider == "vllm-omni":
+            config.providers.vllm_omni.model = _prompt_optional(
+                "vLLM-Omni model",
+                current_value=config.providers.vllm_omni.model,
+            )
+        else:
+            config.providers.dashscope.tts_clone_model = _prompt_with_default(
+                "TTS clone model",
+                config.providers.dashscope.tts_clone_model or DEFAULT_TTS_CLONE_MODEL,
+            )
     return config
 
 
@@ -376,6 +390,20 @@ def _rebuild_config_with_preserved_auth(raw_config: dict[str, object]) -> AppCon
         dashscope = providers.get("dashscope")
         if isinstance(dashscope, dict):
             rebuilt.providers.dashscope.api_key = str(dashscope.get("api_key", "") or "").strip()
+        openai_compatible = providers.get("openai_compatible")
+        if isinstance(openai_compatible, dict):
+            rebuilt.providers.openai_compatible.translation_api_key = str(
+                openai_compatible.get("translation_api_key", "") or ""
+            ).strip()
+            rebuilt.providers.openai_compatible.tts_api_key = str(openai_compatible.get("tts_api_key", "") or "").strip()
+        vllm_omni = providers.get("vllm_omni")
+        if isinstance(vllm_omni, dict):
+            rebuilt.providers.vllm_omni.api_key = str(vllm_omni.get("api_key", "") or "").strip()
+    tts = raw_config.get("tts")
+    if isinstance(tts, dict):
+        legacy_vllm_omni = tts.get("vllm_omni")
+        if isinstance(legacy_vllm_omni, dict) and not rebuilt.providers.vllm_omni.api_key:
+            rebuilt.providers.vllm_omni.api_key = str(legacy_vllm_omni.get("api_key", "") or "").strip()
     return rebuilt
 
 

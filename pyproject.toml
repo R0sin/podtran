@@ -19,6 +19,11 @@ dependencies = [
     "whisperx>=3.3",
 ]
 
+[project.optional-dependencies]
+qwen-local = [
+    "qwen-tts>=0.1.1,<0.2",
+]
+
 [project.scripts]
 podtran = "podtran.cli:main"
 

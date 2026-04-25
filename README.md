@@ -27,8 +27,8 @@
 - Python `3.11` 推荐，支持 `>=3.10,<3.13`
 - `ffmpeg` 和 `ffprobe` 需要在 `PATH` 中可执行
 - 需要一个 Hugging Face token 给 WhisperX diarization 使用
-- 默认翻译不需要 API key；如果用到 `dashscope` 或 `openai-compatible`，再配置对应 provider key
-- TTS 可选 `dashscope`、`openai-compatible` 或 `vllm-omni`，所需配置取决于 provider
+- 默认翻译不需要 API key；如果用到 `openai-compatible`，再配置对应 provider key
+- TTS 可选 `dashscope`、`openai-compatible`、`vllm-omni` 或 `qwen-local`，所需配置取决于 provider
 
 ## 安装
 
@@ -36,6 +36,18 @@
 
 ```powershell
 uv tool install git+https://github.com/R0sin/podtran
+```
+
+如果你要在 CLI 安装版中使用 `qwen-local`，安装时需要启用可选依赖：
+
+```powershell
+uv tool install "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
+```
+
+如果已经安装过普通版本，可以用同一条命令加 `--force` 重新安装：
+
+```powershell
+uv tool install --force "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
 ```
 
 安装完成后可以先确认命令已可用：
@@ -72,9 +84,9 @@ podtran init
 
 - 先去接受 Hugging Face 的 `speaker-diarization-community-1` 协议
 - 填写 `hf_token`
-- 选择翻译 provider；如果选 `google-free`，则不需要翻译 API key，且会忽略 `base_url` 和 `model`
+- 选择翻译 provider；如果选 `google-free`，则不需要翻译 API key
 - 选择 TTS provider，并按提示填写对应的 `base_url`、API key、mode 和 model
-- 只有当翻译或 TTS 实际使用 `dashscope` 时，才会要求填写 DashScope API key
+- 只有当 TTS 实际使用 `dashscope` 时，才会要求填写 DashScope API key
 
 默认配置会写到 `~/.podtran/podtran.toml`。如果传 `--workdir <path>`，则会写到 `<path>/podtran.toml`，同时任务和缓存也会放到这个目录下。
 
@@ -82,13 +94,13 @@ TTS provider 说明：
 
 - `dashscope`：支持 `preset` 和 `clone`
 - `openai-compatible`：支持 `preset`
-- `vllm-omni`：支持 `preset` 和 `clone`，需要配置 `tts.base_url`
+- `vllm-omni`：支持 `preset` 和 `clone`，需要配置 `providers.vllm_omni.base_url`
+- `qwen-local`：支持 `preset` 和 `clone`，需要安装 `qwen-local` extra，默认使用 0.6B 模型
 
 翻译 provider 说明：
 
 - `google-free`：默认选项，免费，无需 API key；走 Google 非公开网页接口，可能受地区、风控、请求频率影响
-- `dashscope`：需要 DashScope API key；`translation.base_url` 留空时会使用内置默认地址
-- `openai-compatible`：适合自建或第三方兼容 OpenAI Chat Completions 的翻译端点；需要设置 `translation.base_url`
+- `openai-compatible`：适合自建或第三方兼容 OpenAI Chat Completions 的翻译端点；需要设置 `providers.openai_compatible.translation_base_url`
 
 如果你手动编辑 `podtran.toml`，最常见的翻译配置是：
 
@@ -101,18 +113,11 @@ provider = "google-free"  # 默认；忽略 base_url 和 model
 
 ```toml
 [translation]
-provider = "dashscope"
-base_url = ""
-model = "qwen-flash"
-```
-
-如果你想切到兼容 OpenAI 的翻译端点，可改成：
-
-```toml
-[translation]
 provider = "openai-compatible"
-base_url = "http://localhost:8000/v1"
-model = "your-chat-model"
+
+[providers.openai_compatible]
+translation_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+translation_model = "qwen-flash"
 ```
 
 如果你准备自己部署 `vllm-omni` 的 `Qwen3-TTS` 服务，可先看这些官方资料：
@@ -121,7 +126,30 @@ model = "your-chat-model"
 - `vLLM-Omni` 仓库：[vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni)
 - `Qwen3-TTS` 官方说明：[QwenLM/Qwen3-TTS 的 vLLM Usage](https://github.com/QwenLM/Qwen3-TTS)
 
-对 `podtran` 来说，只需要一个可访问的 `vllm-omni` TTS 服务，并把 `tts.base_url` 指向它；默认示例地址是 `http://localhost:8091/v1`。
+对 `podtran` 来说，只需要一个可访问的 `vllm-omni` TTS 服务，并把 `providers.vllm_omni.base_url` 指向它；默认示例地址是 `http://localhost:8091/v1`。
+
+如果你想直接在 podtran 进程内运行 Qwen3-TTS，需要安装 `qwen-local` 可选依赖。使用 `uv tool install` 安装 CLI 时，请按前面的安装命令启用 `podtran[qwen-local]`。
+
+如果是在源码 checkout 中开发或运行，可同步 extra：
+
+```powershell
+uv sync --extra qwen-local
+```
+
+然后配置：
+
+```toml
+[tts]
+provider = "qwen-local"
+mode = "clone"
+max_concurrency = 1
+
+[providers.qwen_local]
+clone_model_size = "0.6B"
+preset_model_size = "0.6B"
+device = "auto"
+language = "Chinese"
+```
 
 转录相关设置默认来自 `podtran.toml` 里的 `[asr]` 配置：
 

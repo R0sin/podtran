@@ -9,7 +9,6 @@ from podtran.artifacts import read_model_list
 from podtran.config import AppConfig
 from podtran.models import SegmentRecord
 from podtran.translate import (
-    DashScopeTranslationBackend,
     GoogleFreeTranslationBackend,
     OpenAICompatibleTranslationBackend,
     Translator,
@@ -41,17 +40,24 @@ class _FakeBackend:
 
 
 def test_resolve_translation_key_prefers_provider_credentials(monkeypatch) -> None:
-    config = AppConfig(providers={"dashscope": {"api_key": "dash-key"}}, translation={"provider": "dashscope"})
+    config = AppConfig(
+        providers={"openai_compatible": {"translation_api_key": "provider-key"}},
+        translation={"provider": "openai-compatible"},
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "env-key")
 
-    assert _resolve_translation_key(config) == "dash-key"
+    assert _resolve_translation_key(config) == "provider-key"
 
 
 def test_build_translation_backend_supports_known_providers() -> None:
     assert isinstance(build_translation_backend(AppConfig()), GoogleFreeTranslationBackend)
-    assert isinstance(build_translation_backend(AppConfig(translation={"provider": "dashscope"})), DashScopeTranslationBackend)
     assert isinstance(
-        build_translation_backend(AppConfig(translation={"provider": "openai-compatible", "base_url": "http://localhost:9000/v1"})),
+        build_translation_backend(
+            AppConfig(
+                translation={"provider": "openai-compatible"},
+                providers={"openai_compatible": {"translation_base_url": "http://localhost:9000/v1"}},
+            )
+        ),
         OpenAICompatibleTranslationBackend,
     )
 

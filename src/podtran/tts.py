@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
+import gc
+import io
 import json
 import mimetypes
 import os
@@ -34,6 +36,16 @@ from podtran.voices import VoiceResolver, build_preset_targets, resolve_dashscop
 
 TTS_RETRY_ATTEMPTS = 3
 CLONE_VOICE_KINDS = frozenset({"provider_clone", "reference_clone"})
+QWEN_LOCAL_INSTALL_HINT = "Install local Qwen support with: uv sync --extra qwen-local"
+QWEN_LOCAL_BASE_MODELS = {
+    "1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    "0.6B": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+}
+QWEN_LOCAL_CUSTOM_VOICE_MODELS = {
+    "1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "0.6B": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+}
+QWEN_LOCAL_ATTN_IMPLEMENTATIONS = frozenset({"flash_attention_2", "sdpa", "eager"})
 
 
 class TTSBackend(Protocol):
@@ -59,7 +71,7 @@ class DashScopeTTSBackend:
     )
     def synthesize(self, text: str, spec: VoiceSpec, model: str, output_path: Path) -> None:
         response = self.client.post(
-            f"{self.config.tts.resolved_base_url()}/services/aigc/multimodal-generation/generation",
+            f"{self.config.resolved_tts_base_url()}/services/aigc/multimodal-generation/generation",
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": model,
@@ -93,8 +105,8 @@ class OpenAICompatibleTTSBackend:
 
     def __init__(self, config: AppConfig) -> None:
         self.client = OpenAI(
-            api_key=_resolve_openai_compatible_api_key(),
-            base_url=config.tts.resolved_base_url(),
+            api_key=_resolve_openai_compatible_api_key(config),
+            base_url=config.resolved_tts_base_url(),
             timeout=config.tts.timeout_seconds,
         )
         self.config = config
@@ -137,8 +149,8 @@ class VllmOmniTTSBackend:
             "model": model,
             "input": text,
             "response_format": "wav",
-            "language": self.config.tts.vllm_omni.language,
-            "instructions": self.config.tts.vllm_omni.instructions,
+            "language": self.config.providers.vllm_omni.language,
+            "instructions": self.config.providers.vllm_omni.instructions,
         }
         if isinstance(spec, PresetVoiceSpec):
             payload.update(
@@ -153,7 +165,7 @@ class VllmOmniTTSBackend:
                     "task_type": "Base",
                     "ref_audio": _audio_data_uri(Path(spec.payload.reference_audio_path)),
                     "ref_text": _resolve_reference_text(spec),
-                    "x_vector_only_mode": self.config.tts.vllm_omni.x_vector_only_mode,
+                    "x_vector_only_mode": self.config.providers.vllm_omni.x_vector_only_mode,
                 }
             )
         else:
@@ -166,6 +178,126 @@ class VllmOmniTTSBackend:
         )
         response.raise_for_status()
         atomic_write_bytes(output_path, response.content)
+
+
+class QwenLocalTTSBackend:
+    supported_voice_kinds = frozenset({"preset", "reference_clone"})
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.model: object | None = None
+        self.model_kind = ""
+        self.model_size = ""
+        self.device = self._resolve_device()
+        self._prompt_cache: dict[str, object] = {}
+
+    def synthesize(self, text: str, spec: VoiceSpec, model: str, output_path: Path) -> None:
+        if isinstance(spec, PresetVoiceSpec):
+            self._synthesize_preset(text, spec, output_path)
+            return
+        if isinstance(spec, ReferenceCloneSpec):
+            self._synthesize_clone(text, spec, output_path)
+            return
+        raise RuntimeError(f"Qwen local TTS does not support voice kind: {spec.kind}")
+
+    def _synthesize_preset(self, text: str, spec: PresetVoiceSpec, output_path: Path) -> None:
+        model = self._load_model("customvoice", self.config.providers.qwen_local.preset_model_size)
+        wavs, sample_rate = model.generate_custom_voice(
+            text=text,
+            language=self.config.providers.qwen_local.language,
+            speaker=spec.voice_name,
+            instruct=self.config.providers.qwen_local.instructions or None,
+        )
+        _write_wav(output_path, wavs[0], sample_rate)
+
+    def _synthesize_clone(self, text: str, spec: ReferenceCloneSpec, output_path: Path) -> None:
+        model = self._load_model("base", self.config.providers.qwen_local.clone_model_size)
+        prompt = self._voice_prompt(model, spec)
+        wavs, sample_rate = model.generate_voice_clone(
+            text=text,
+            language=self.config.providers.qwen_local.language,
+            voice_clone_prompt=prompt,
+            instruct=self.config.providers.qwen_local.instructions or None,
+        )
+        _write_wav(output_path, wavs[0], sample_rate)
+
+    def _voice_prompt(self, model: object, spec: ReferenceCloneSpec) -> object:
+        key = spec.payload.reference_fingerprint.strip() or spec.identity
+        cached = self._prompt_cache.get(key)
+        if cached is not None:
+            return cached
+        reference_text = _resolve_reference_text(spec)
+        prompt = model.create_voice_clone_prompt(
+            ref_audio=spec.payload.reference_audio_path,
+            ref_text=reference_text,
+            x_vector_only_mode=self.config.providers.qwen_local.x_vector_only_mode,
+        )
+        self._prompt_cache[key] = prompt
+        return prompt
+
+    def _load_model(self, kind: str, size: str) -> object:
+        normalized_size = _normalize_qwen_model_size(size)
+        if self.model is not None and self.model_kind == kind and self.model_size == normalized_size:
+            return self.model
+        self._unload_model()
+        repo = _qwen_local_model_repo(kind, normalized_size)
+        self.model = self._from_pretrained(repo)
+        self.model_kind = kind
+        self.model_size = normalized_size
+        self._prompt_cache.clear()
+        return self.model
+
+    def _from_pretrained(self, repo: str) -> object:
+        try:
+            import torch
+            from qwen_tts import Qwen3TTSModel
+        except ImportError as exc:
+            raise RuntimeError(f"qwen-local dependencies are not installed. {QWEN_LOCAL_INSTALL_HINT}") from exc
+
+        if self.device == "cpu":
+            kwargs = {"dtype": torch.float32, "low_cpu_mem_usage": False}
+        else:
+            kwargs = {
+                "device_map": self.device,
+                "dtype": _resolve_qwen_local_torch_dtype(torch, self.config.providers.qwen_local.torch_dtype, self.device),
+            }
+            attn_implementation = _resolve_qwen_local_attn_implementation(
+                self.config.providers.qwen_local.attn_implementation
+            )
+            if attn_implementation:
+                kwargs["attn_implementation"] = attn_implementation
+        return _qwen_local_from_pretrained(Qwen3TTSModel, repo, kwargs)
+
+    def _unload_model(self) -> None:
+        if self.model is None:
+            return
+        self.model = None
+        self.model_kind = ""
+        self.model_size = ""
+        self._prompt_cache.clear()
+        gc.collect()
+        try:
+            import torch
+        except ImportError:
+            return
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif self.device == "xpu" and hasattr(torch, "xpu"):
+            torch.xpu.empty_cache()
+
+    def _resolve_device(self) -> str:
+        requested = self.config.providers.qwen_local.device.strip().lower()
+        if requested and requested != "auto":
+            return requested
+        try:
+            import torch
+        except ImportError:
+            return "cpu"
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return "xpu"
+        return "cpu"
 
 
 @dataclass(slots=True)
@@ -294,7 +426,7 @@ def synthesize_segments(
         work_item.segments.append(_PendingSegment(segment_index=index, audio_path=audio_path))
 
     if work_items:
-        max_workers = max(1, config.tts.max_concurrency)
+        max_workers = _synthesis_worker_count(config, len(work_items))
         work_queue: queue.Queue[_SynthesisWorkItem] = queue.Queue()
         result_queue: queue.Queue[_SynthesisWorkerOutcome] = queue.Queue()
         stop_event = threading.Event()
@@ -302,7 +434,7 @@ def synthesize_segments(
         for item in work_items.values():
             work_queue.put(item)
 
-        worker_count = min(max_workers, len(work_items))
+        worker_count = max_workers
         for index in range(worker_count):
             threading.Thread(
                 target=_synthesis_worker,
@@ -377,6 +509,8 @@ def build_tts_backend(config: AppConfig) -> TTSBackend:
         backend = OpenAICompatibleTTSBackend(config)
     elif provider == "vllm-omni":
         backend = VllmOmniTTSBackend(config)
+    elif provider == "qwen-local":
+        backend = QwenLocalTTSBackend(config)
     else:
         raise RuntimeError(f"Unsupported TTS provider: {config.tts.provider}")
 
@@ -576,16 +710,20 @@ def _read_binary_response(response: object) -> bytes:
 
 def _resolve_tts_model(config: AppConfig, spec: VoiceSpec) -> str:
     if spec.kind == "preset":
-        return config.tts.preset_model()
-    return config.tts.clone_model()
+        return config.tts_preset_model()
+    return config.tts_clone_model()
 
 
-def _resolve_openai_compatible_api_key() -> str:
+def _resolve_openai_compatible_api_key(config: AppConfig | None = None) -> str:
+    if config is not None:
+        configured = config.resolve_provider_api_key("openai-compatible", purpose="tts")
+        if configured:
+            return configured
     return os.getenv("PODTRAN_TTS_API_KEY", "")
 
 
 def _resolve_vllm_omni_api_key(config: AppConfig) -> str:
-    configured = config.tts.vllm_omni.api_key.strip()
+    configured = config.providers.vllm_omni.api_key.strip()
     if configured:
         return configured
     return os.getenv("PODTRAN_VLLM_OMNI_API_KEY", "")
@@ -609,11 +747,11 @@ def _resolve_reference_text(spec: ReferenceCloneSpec) -> str:
         return spec.payload.reference_text
     if spec.payload.reference_text_path.strip():
         return Path(spec.payload.reference_text_path).read_text(encoding="utf-8").strip()
-    raise RuntimeError("vLLM-Omni reference_clone specs require reference text.")
+    raise RuntimeError("reference_clone specs require reference text.")
 
 
 def _vllm_omni_speech_url(config: AppConfig) -> str:
-    base_url = config.tts.resolved_base_url()
+    base_url = config.resolved_tts_base_url()
     if not base_url:
         raise RuntimeError("vLLM-Omni TTS requires a TTS base URL.")
     return base_url.rstrip("/") + "/audio/speech"
@@ -623,3 +761,101 @@ def _ensure_backend_supports_spec(backend: TTSBackend, spec: VoiceSpec) -> None:
     if spec.kind in backend.supported_voice_kinds:
         return
     raise RuntimeError(f"TTS provider does not support voice kind: {spec.kind}")
+
+
+def _synthesis_worker_count(config: AppConfig, work_item_count: int) -> int:
+    if config.tts.provider.strip().lower() == "qwen-local":
+        return 1
+    return min(max(1, config.tts.max_concurrency), work_item_count)
+
+
+def _normalize_qwen_model_size(size: str) -> str:
+    normalized = size.strip() or "0.6B"
+    if normalized not in QWEN_LOCAL_BASE_MODELS:
+        raise RuntimeError(f"Unsupported qwen-local model size: {size}. Expected one of: 0.6B, 1.7B")
+    return normalized
+
+
+def _resolve_qwen_local_torch_dtype(torch: object, value: str, device: str) -> object:
+    normalized = value.strip().lower().replace("-", "").replace("_", "")
+    if normalized in {"", "auto"}:
+        if device == "cpu":
+            return torch.float32
+        if _qwen_local_bf16_supported(torch):
+            return torch.bfloat16
+        return torch.float16
+    if normalized in {"float16", "fp16", "half"}:
+        return torch.float16
+    if normalized in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    if normalized in {"float32", "fp32", "full"}:
+        return torch.float32
+    raise RuntimeError("Unsupported qwen-local torch_dtype: " f"{value}. Expected one of: auto, float16, bfloat16, float32")
+
+
+def _qwen_local_bf16_supported(torch: object) -> bool:
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None or not hasattr(cuda, "is_bf16_supported"):
+        return False
+    try:
+        return bool(cuda.is_bf16_supported())
+    except Exception:
+        return False
+
+
+def _resolve_qwen_local_attn_implementation(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"", "auto"}:
+        return ""
+    if normalized not in QWEN_LOCAL_ATTN_IMPLEMENTATIONS:
+        raise RuntimeError(
+            "Unsupported qwen-local attn_implementation: "
+            f"{value}. Expected one of: auto, flash_attention_2, sdpa, eager"
+        )
+    return normalized
+
+
+def _qwen_local_from_pretrained(model_cls: object, repo: str, kwargs: dict[str, object]) -> object:
+    candidates = [dict(kwargs)]
+    if "attn_implementation" in kwargs:
+        without_attn = dict(kwargs)
+        without_attn.pop("attn_implementation", None)
+        candidates.append(without_attn)
+
+    last_error: TypeError | None = None
+    for candidate in candidates:
+        for compatible_kwargs in _qwen_local_dtype_key_candidates(candidate):
+            try:
+                return model_cls.from_pretrained(repo, **compatible_kwargs)
+            except TypeError as exc:
+                last_error = exc
+    if last_error is not None:
+        raise last_error
+    return model_cls.from_pretrained(repo, **kwargs)
+
+
+def _qwen_local_dtype_key_candidates(kwargs: dict[str, object]) -> list[dict[str, object]]:
+    candidates = [dict(kwargs)]
+    if "dtype" in kwargs:
+        compatible = dict(kwargs)
+        compatible["torch_dtype"] = compatible.pop("dtype")
+        candidates.append(compatible)
+    return candidates
+
+
+def _qwen_local_model_repo(kind: str, size: str) -> str:
+    if kind == "base":
+        return QWEN_LOCAL_BASE_MODELS[_normalize_qwen_model_size(size)]
+    if kind == "customvoice":
+        return QWEN_LOCAL_CUSTOM_VOICE_MODELS[_normalize_qwen_model_size(size)]
+    raise RuntimeError(f"Unsupported qwen-local model kind: {kind}")
+
+
+def _write_wav(output_path: Path, audio: object, sample_rate: int) -> None:
+    try:
+        import soundfile as sf
+    except ImportError as exc:
+        raise RuntimeError(f"qwen-local dependencies are not installed. {QWEN_LOCAL_INSTALL_HINT}") from exc
+    buffer = io.BytesIO()
+    sf.write(buffer, audio, sample_rate, format="WAV")
+    atomic_write_bytes(output_path, buffer.getvalue())

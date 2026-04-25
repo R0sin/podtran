@@ -14,7 +14,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from podtran.artifacts import ArtifactPaths, read_model, read_model_list, write_json
 from podtran.audio import FFMPEG_COMMAND, concat_wav_chunks, extract_audio_chunk, reset_temp_dir
 from podtran.cache_store import CacheStore
-from podtran.config import AppConfig, DEFAULT_TTS_ENROLLMENT_MODEL
+from podtran.config import AppConfig
 from podtran.fingerprints import FingerprintService, VOICE_CLONE_CONFIG_KEYS
 from podtran.models import (
     CloneVoiceSpec,
@@ -50,8 +50,6 @@ class VoiceCloneProvider(Protocol):
 
 
 class DashScopeCloneProvider:
-    ENROLLMENT_MODEL = DEFAULT_TTS_ENROLLMENT_MODEL
-
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.client = httpx.Client(timeout=config.tts.timeout_seconds)
@@ -82,7 +80,7 @@ class DashScopeCloneProvider:
                 "Content-Type": "application/json",
             },
             json={
-                "model": self.ENROLLMENT_MODEL,
+                "model": self.config.tts_enrollment_model(),
                 "input": {
                     "action": "create",
                     "target_model": target_model,
@@ -127,6 +125,30 @@ class VllmOmniCloneProvider:
         )
 
 
+class QwenLocalCloneProvider:
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+
+    def create_voice_spec(
+        self,
+        reference_audio: Path,
+        reference_text: str,
+        target_model: str,
+        preferred_name: str,
+        reference_fingerprint: str,
+    ) -> ReferenceCloneSpec:
+        _ = (target_model, preferred_name)
+        return ReferenceCloneSpec(
+            identity=f"qwen-local:reference_clone:{reference_fingerprint}",
+            provider="qwen-local",
+            payload=ReferenceClonePayload(
+                reference_fingerprint=reference_fingerprint,
+                reference_audio_path=str(reference_audio.resolve()),
+                reference_text=reference_text.strip(),
+            ),
+        )
+
+
 @dataclass(slots=True)
 class ReferenceCandidate:
     start: float
@@ -161,7 +183,7 @@ class VoiceResolver:
         progress_callback: StageProgressCallback | None = None,
     ) -> dict[str, ResolvedVoiceTarget]:
         source_path = source_audio.resolve()
-        target_model = self.config.tts.clone_model()
+        target_model = self.config.tts_clone_model()
         profile_map = {profile.speaker: profile for profile in self._load_profiles()}
         build_dir = self.paths.temp_dir / "voice_refs"
         reset_temp_dir(build_dir, self.paths.task_dir)
@@ -310,6 +332,8 @@ class VoiceResolver:
             return DashScopeCloneProvider(self.config)
         if provider == "vllm-omni":
             return VllmOmniCloneProvider(self.config)
+        if provider == "qwen-local":
+            return QwenLocalCloneProvider(self.config)
         raise RuntimeError(f"Clone mode is not supported for TTS provider: {self.config.tts.provider}")
 
     def _reference_fingerprint(
@@ -654,7 +678,7 @@ def _candidate_score(
 
 
 def _dashscope_clone_url(config: AppConfig) -> str:
-    base_url = config.tts.resolved_base_url()
+    base_url = config.resolved_tts_base_url()
     if not base_url:
         raise RuntimeError("DashScope clone provider requires a TTS base URL.")
     return base_url.rstrip("/") + "/services/audio/tts/customization"

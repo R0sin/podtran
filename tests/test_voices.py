@@ -177,8 +177,8 @@ def test_voice_resolver_uses_reference_clone_specs_for_vllm_omni(tmp_path: Path)
             tts=TTSConfig(
                 provider="vllm-omni",
                 mode="clone",
-                base_url="http://localhost:8091/v1",
-            )
+            ),
+            providers={"vllm_omni": {"base_url": "http://localhost:8091/v1"}},
         ),
         paths,
     )
@@ -189,6 +189,23 @@ def test_voice_resolver_uses_reference_clone_specs_for_vllm_omni(tmp_path: Path)
     spec = resolved["SPEAKER_00"].spec
     assert spec.kind == "reference_clone"
     assert spec.provider == "vllm-omni"
+    assert spec.payload.reference_text == "this is a suitable reference sentence for cloning quality"
+    assert Path(spec.payload.reference_audio_path).exists()
+
+
+def test_voice_resolver_uses_reference_clone_specs_for_qwen_local(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    source_audio = tmp_path / "source.wav"
+    source_audio.write_bytes(b"wav")
+    manager = VoiceResolver(AppConfig(tts=TTSConfig(provider="qwen-local", mode="clone")), paths)
+    manager._export_reference_audio = _stub_export(paths)  # type: ignore[method-assign]
+
+    resolved = manager.resolve_voice_targets([_segment("seg_1", 0.0, 12.0)], source_audio)
+
+    spec = resolved["SPEAKER_00"].spec
+    assert spec.kind == "reference_clone"
+    assert spec.provider == "qwen-local"
     assert spec.payload.reference_text == "this is a suitable reference sentence for cloning quality"
     assert Path(spec.payload.reference_audio_path).exists()
 
@@ -252,7 +269,7 @@ def test_voice_resolver_reports_progress(tmp_path: Path) -> None:
 
 
 def test_dashscope_clone_provider_uses_fixed_enrollment_model_and_derived_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = AppConfig(tts=TTSConfig(base_url="https://tts.example.com/root/"))
+    config = AppConfig(providers={"dashscope": {"tts_base_url": "https://tts.example.com/root/"}})
     provider = DashScopeCloneProvider(config)
     captured: dict[str, object] = {}
 

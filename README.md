@@ -35,19 +35,27 @@
 标准方式是直接从 Git 仓库安装 CLI，然后使用 `podtran` 命令：
 
 ```powershell
-uv tool install git+https://github.com/R0sin/podtran
+uv tool install --torch-backend auto git+https://github.com/R0sin/podtran
 ```
+
+`--torch-backend auto` 会让 `uv` 为 PyTorch 生态依赖自动选择合适后端；有可用 NVIDIA CUDA 驱动时会优先安装 CUDA 版，否则使用 CPU 版。这会同时影响 WhisperX 转写和本地 TTS 依赖。
 
 如果你要在 CLI 安装版中使用 `qwen-local`，安装时需要启用可选依赖：
 
 ```powershell
-uv tool install "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
+uv tool install --torch-backend auto "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
 ```
 
-如果已经安装过普通版本，可以用同一条命令加 `--force` 重新安装：
+如果已经安装过，可以用同一条命令加 `--force` 重新安装：
 
 ```powershell
-uv tool install --force "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
+uv tool install --force --torch-backend auto git+https://github.com/R0sin/podtran
+```
+
+`qwen-local` 版本则使用：
+
+```powershell
+uv tool install --force --torch-backend auto "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
 ```
 
 安装完成后可以先确认命令已可用：
@@ -61,7 +69,7 @@ podtran --help
 升级：
 
 ```powershell
-uv tool install git+https://github.com/R0sin/podtran
+uv tool install --force --torch-backend auto git+https://github.com/R0sin/podtran
 ```
 
 卸载：
@@ -69,8 +77,6 @@ uv tool install git+https://github.com/R0sin/podtran
 ```powershell
 uv tool uninstall podtran
 ```
-
-如果你希望优先使用 CPU-only PyTorch，可以先准备对应依赖环境，再安装 CLI。
 
 ## 快速开始
 

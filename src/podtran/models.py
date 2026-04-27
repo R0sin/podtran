@@ -84,7 +84,10 @@ class ReferenceCloneSpec(BaseModel):
     payload: ReferenceClonePayload
 
 
-VoiceSpec = Annotated[PresetVoiceSpec | ProviderCloneSpec | ReferenceCloneSpec, Field(discriminator="kind")]
+VoiceSpec = Annotated[
+    PresetVoiceSpec | ProviderCloneSpec | ReferenceCloneSpec,
+    Field(discriminator="kind"),
+]
 CloneVoiceSpec = ProviderCloneSpec | ReferenceCloneSpec
 
 
@@ -134,11 +137,22 @@ class VoiceProfile(BaseModel):
         }
         migrated.setdefault("asset_kind", "provider_clone")
         migrated.setdefault("asset_identity", identity)
-        migrated.setdefault("reference_audio_path", str(data.get("ref_audio_path", "") or ""))
-        migrated.setdefault("reference_text_path", str(data.get("ref_text_path", "") or ""))
-        migrated.setdefault("source_audio_path", str(data.get("source_audio_path", "") or ""))
-        migrated.setdefault("source_audio_fingerprint", str(data.get("source_audio_fingerprint", "") or ""))
-        migrated.setdefault("reference_fingerprint", str(data.get("reference_fingerprint", "") or ""))
+        migrated.setdefault(
+            "reference_audio_path", str(data.get("ref_audio_path", "") or "")
+        )
+        migrated.setdefault(
+            "reference_text_path", str(data.get("ref_text_path", "") or "")
+        )
+        migrated.setdefault(
+            "source_audio_path", str(data.get("source_audio_path", "") or "")
+        )
+        migrated.setdefault(
+            "source_audio_fingerprint",
+            str(data.get("source_audio_fingerprint", "") or ""),
+        )
+        migrated.setdefault(
+            "reference_fingerprint", str(data.get("reference_fingerprint", "") or "")
+        )
         return migrated
 
     @model_validator(mode="after")

@@ -96,7 +96,9 @@ class ProvidersConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     dashscope: DashScopeProviderConfig = Field(default_factory=DashScopeProviderConfig)
-    openai_compatible: OpenAICompatibleProviderConfig = Field(default_factory=OpenAICompatibleProviderConfig)
+    openai_compatible: OpenAICompatibleProviderConfig = Field(
+        default_factory=OpenAICompatibleProviderConfig
+    )
     vllm_omni: VllmOmniProviderConfig = Field(default_factory=VllmOmniProviderConfig)
     qwen_local: QwenLocalProviderConfig = Field(default_factory=QwenLocalProviderConfig)
 
@@ -114,7 +116,9 @@ class TTSPresetConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     voice_map: dict[str, str] = Field(default_factory=dict)
-    fallback_voices: list[str] = Field(default_factory=lambda: list(DEFAULT_FALLBACK_VOICES))
+    fallback_voices: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_FALLBACK_VOICES)
+    )
 
 
 class TTSCloneConfig(BaseModel):
@@ -186,7 +190,9 @@ class AppConfig(BaseModel):
     def resolved_translation_base_url(self) -> str:
         provider = self.translation.provider.strip().lower()
         if provider == "openai-compatible":
-            return self.providers.openai_compatible.translation_base_url.strip().rstrip("/")
+            return self.providers.openai_compatible.translation_base_url.strip().rstrip(
+                "/"
+            )
         return ""
 
     def translation_model(self) -> str:
@@ -196,7 +202,10 @@ class AppConfig(BaseModel):
     def resolved_tts_base_url(self) -> str:
         provider = self.tts.provider.strip().lower()
         if provider == "dashscope":
-            return self.providers.dashscope.tts_base_url.strip().rstrip("/") or DEFAULT_TTS_BASE_URL
+            return (
+                self.providers.dashscope.tts_base_url.strip().rstrip("/")
+                or DEFAULT_TTS_BASE_URL
+            )
         if provider == "openai-compatible":
             return self.providers.openai_compatible.tts_base_url.strip().rstrip("/")
         if provider == "vllm-omni":
@@ -206,9 +215,15 @@ class AppConfig(BaseModel):
     def tts_preset_model(self) -> str:
         provider = self.tts.provider.strip().lower()
         if provider == "dashscope":
-            return self.providers.dashscope.tts_preset_model.strip() or DEFAULT_TTS_PRESET_MODEL
+            return (
+                self.providers.dashscope.tts_preset_model.strip()
+                or DEFAULT_TTS_PRESET_MODEL
+            )
         if provider == "openai-compatible":
-            return self.providers.openai_compatible.tts_model.strip() or DEFAULT_TTS_PRESET_MODEL
+            return (
+                self.providers.openai_compatible.tts_model.strip()
+                or DEFAULT_TTS_PRESET_MODEL
+            )
         if provider == "vllm-omni":
             return self.providers.vllm_omni.model.strip()
         if provider == "qwen-local":
@@ -218,7 +233,10 @@ class AppConfig(BaseModel):
     def tts_clone_model(self) -> str:
         provider = self.tts.provider.strip().lower()
         if provider == "dashscope":
-            return self.providers.dashscope.tts_clone_model.strip() or DEFAULT_TTS_CLONE_MODEL
+            return (
+                self.providers.dashscope.tts_clone_model.strip()
+                or DEFAULT_TTS_CLONE_MODEL
+            )
         if provider == "vllm-omni":
             return self.providers.vllm_omni.model.strip()
         if provider == "qwen-local":
@@ -226,7 +244,10 @@ class AppConfig(BaseModel):
         return ""
 
     def tts_enrollment_model(self) -> str:
-        return self.providers.dashscope.tts_enrollment_model.strip() or DEFAULT_TTS_ENROLLMENT_MODEL
+        return (
+            self.providers.dashscope.tts_enrollment_model.strip()
+            or DEFAULT_TTS_ENROLLMENT_MODEL
+        )
 
 
 def build_init_config(
@@ -239,15 +260,21 @@ def build_init_config(
     config.hf_token = hf_token.strip()
     config.providers.dashscope.api_key = dashscope_api_key.strip()
     config.translation.provider = DEFAULT_TRANSLATION_PROVIDER
-    config.providers.openai_compatible.translation_model = translation_model.strip() or DEFAULT_TRANSLATION_MODEL
+    config.providers.openai_compatible.translation_model = (
+        translation_model.strip() or DEFAULT_TRANSLATION_MODEL
+    )
     config.tts.provider = DEFAULT_TTS_PROVIDER
-    config.providers.dashscope.tts_clone_model = tts_model.strip() or DEFAULT_TTS_CLONE_MODEL
+    config.providers.dashscope.tts_clone_model = (
+        tts_model.strip() or DEFAULT_TTS_CLONE_MODEL
+    )
     return config
 
 
 def load_config(path: Path) -> AppConfig:
     if not path.exists():
-        raise FileNotFoundError(f"Config not found: {path}\nRun 'podtran init' to create a default config.")
+        raise FileNotFoundError(
+            f"Config not found: {path}\nRun 'podtran init' to create a default config."
+        )
     data = load_config_data(path)
     _raise_for_legacy_translation_config(path, data)
     _raise_for_legacy_tts_config(path, data)
@@ -257,11 +284,15 @@ def load_config(path: Path) -> AppConfig:
 def load_config_data(path: Path) -> dict[str, Any]:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        raise ValueError(f"Config file must contain a TOML table at the top level: {path}")
+        raise ValueError(
+            f"Config file must contain a TOML table at the top level: {path}"
+        )
     return data
 
 
-def resolve_workdir(workdir_override: Path | str | None = None, config_path: Path | None = None) -> Path:
+def resolve_workdir(
+    workdir_override: Path | str | None = None, config_path: Path | None = None
+) -> Path:
     if workdir_override is not None:
         return Path(workdir_override).expanduser().resolve()
     if config_path is not None:
@@ -269,7 +300,10 @@ def resolve_workdir(workdir_override: Path | str | None = None, config_path: Pat
     return DEFAULT_WORKDIR.expanduser().resolve()
 
 
-def resolve_config_path(config_override: Path | str | None = None, workdir_override: Path | str | None = None) -> Path:
+def resolve_config_path(
+    config_override: Path | str | None = None,
+    workdir_override: Path | str | None = None,
+) -> Path:
     if config_override is not None:
         return Path(config_override).expanduser().resolve()
     return resolve_workdir(workdir_override) / DEFAULT_CONFIG_FILENAME
@@ -315,7 +349,7 @@ def render_config_toml(config: AppConfig) -> str:
         f"x_vector_only_mode = {str(config.providers.qwen_local.x_vector_only_mode).lower()}",
         "",
         "[translation]",
-        '# google-free uses the unofficial Google Translate web endpoint and ignores base_url/model.',
+        "# google-free uses the unofficial Google Translate web endpoint and ignores base_url/model.",
         f'provider = "{config.translation.provider}"',
         f"timeout_seconds = {config.translation.timeout_seconds}",
         f"batch_size = {config.translation.batch_size}",

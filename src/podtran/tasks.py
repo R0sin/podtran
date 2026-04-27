@@ -17,7 +17,9 @@ class TaskStore:
         self.tasks_dir = self.artifacts_dir / "tasks"
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
 
-    def create_task(self, audio: Path, config_snapshot: AppConfig, entry_command: str) -> TaskManifest:
+    def create_task(
+        self, audio: Path, config_snapshot: AppConfig, entry_command: str
+    ) -> TaskManifest:
         resolved_audio = audio.resolve()
         source_audio_sha256 = self.fingerprints.hash_audio(resolved_audio)
         task_id = self._build_unique_task_id(source_audio_sha256)
@@ -118,7 +120,13 @@ class TaskStore:
             return [exact]
         if not self.tasks_dir.exists():
             return []
-        return sorted([child for child in self.tasks_dir.iterdir() if child.is_dir() and child.name.startswith(id_or_prefix)])
+        return sorted(
+            [
+                child
+                for child in self.tasks_dir.iterdir()
+                if child.is_dir() and child.name.startswith(id_or_prefix)
+            ]
+        )
 
     def _build_unique_task_id(self, source_audio_sha256: str) -> str:
         base_time = datetime.now(timezone.utc).replace(microsecond=0)
@@ -129,7 +137,6 @@ class TaskStore:
             if not (self.tasks_dir / task_id).exists():
                 return task_id
         raise RuntimeError("Unable to allocate a unique task id.")
-
 
 
 def _utc_now() -> str:

@@ -7,7 +7,6 @@ from podtran.cache_store import CacheStore
 from podtran.models import StageManifest
 
 
-
 def test_cache_store_publish_lookup_and_restore(tmp_path: Path) -> None:
     cache = CacheStore(tmp_path / "cache")
     source = tmp_path / "source.json"
@@ -53,7 +52,10 @@ def test_cache_store_publish_keeps_existing_completed_entry(tmp_path: Path) -> N
     entry = cache.lookup("translate", "abc123")
 
     assert entry is not None
-    assert entry.output_path("translated_json").read_text(encoding="utf-8") == '{"version":1}'
+    assert (
+        entry.output_path("translated_json").read_text(encoding="utf-8")
+        == '{"version":1}'
+    )
 
 
 def test_cache_store_publish_handles_same_key_race(tmp_path: Path, monkeypatch) -> None:
@@ -81,8 +83,20 @@ def test_cache_store_publish_handles_same_key_race(tmp_path: Path, monkeypatch) 
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
-            executor.submit(cache.publish, "translate", "race-key", {"translated_json": source_a}, manifest),
-            executor.submit(cache.publish, "translate", "race-key", {"translated_json": source_b}, manifest),
+            executor.submit(
+                cache.publish,
+                "translate",
+                "race-key",
+                {"translated_json": source_a},
+                manifest,
+            ),
+            executor.submit(
+                cache.publish,
+                "translate",
+                "race-key",
+                {"translated_json": source_b},
+                manifest,
+            ),
         ]
         entries = [future.result() for future in futures]
 
@@ -90,4 +104,7 @@ def test_cache_store_publish_handles_same_key_race(tmp_path: Path, monkeypatch) 
 
     assert all(item.cache_key == "race-key" for item in entries)
     assert entry is not None
-    assert entry.output_path("translated_json").read_text(encoding="utf-8") in {'{"source":"a"}', '{"source":"b"}'}
+    assert entry.output_path("translated_json").read_text(encoding="utf-8") in {
+        '{"source":"a"}',
+        '{"source":"b"}',
+    }

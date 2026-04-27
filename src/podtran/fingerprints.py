@@ -63,7 +63,9 @@ TTS_CONFIG_KEYS = [
     "providers.qwen_local.instructions",
     "providers.qwen_local.x_vector_only_mode",
 ]
-SYNTHESIZE_CONFIG_KEYS = list(dict.fromkeys([*VOICE_CLONE_CONFIG_KEYS, *TTS_CONFIG_KEYS]))
+SYNTHESIZE_CONFIG_KEYS = list(
+    dict.fromkeys([*VOICE_CLONE_CONFIG_KEYS, *TTS_CONFIG_KEYS])
+)
 COMPOSE_CONFIG_KEYS = [
     "compose.mode",
     "compose.gap_en_to_cn_ms",
@@ -77,7 +79,12 @@ def normalize_text(text: str) -> str:
 
 
 def stable_hash(value: Any) -> str:
-    payload = json.dumps(_normalize_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(
+        _normalize_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -172,4 +179,3 @@ def _resolve_dotted_key(data: dict[str, Any], key: str) -> Any:
             return None
         current = current.get(part)
     return current
-

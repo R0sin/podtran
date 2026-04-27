@@ -63,7 +63,17 @@ def extract_audio_chunk(
 
 
 def normalize_audio(ffmpeg_path: str, source: Path, output: Path) -> Path:
-    args = ["-i", str(source), "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le", str(output)]
+    args = [
+        "-i",
+        str(source),
+        "-ar",
+        "24000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        str(output),
+    ]
     run_ffmpeg(ffmpeg_path, args)
     return output
 
@@ -113,7 +123,9 @@ def concat_wav_chunks(ffmpeg_path: str, chunks: list[Path], output: Path) -> Pat
     return output
 
 
-def concat_audio(ffmpeg_path: str, chunks: list[Path], output: Path, bitrate: str) -> Path:
+def concat_audio(
+    ffmpeg_path: str, chunks: list[Path], output: Path, bitrate: str
+) -> Path:
     list_file = output.parent / f"{output.stem}.concat.txt"
     list_file.write_text(
         "".join(f"file '{chunk.as_posix()}'\n" for chunk in chunks),
@@ -147,5 +159,3 @@ def reset_temp_dir(path: Path, workspace_root: Path) -> None:
     if resolved.exists():
         shutil.rmtree(resolved)
     resolved.mkdir(parents=True, exist_ok=True)
-
-

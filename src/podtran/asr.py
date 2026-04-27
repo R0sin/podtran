@@ -100,7 +100,11 @@ def transcribe_audio(
                 start=_to_float(word.get("start")),
                 end=_to_float(word.get("end")),
                 score=_to_float(word.get("score")),
-                speaker=(str(word.get("speaker")) if word.get("speaker") is not None else None),
+                speaker=(
+                    str(word.get("speaker"))
+                    if word.get("speaker") is not None
+                    else None
+                ),
             )
             for word in segment.get("words", [])
             if str(word.get("word", "")).strip()
@@ -112,7 +116,9 @@ def transcribe_audio(
                 end=float(segment.get("end", 0.0)),
                 text=text,
                 language=language_code,
-                speaker=str(segment.get("speaker") or infer_speaker(words) or "UNKNOWN"),
+                speaker=str(
+                    segment.get("speaker") or infer_speaker(words) or "UNKNOWN"
+                ),
                 words=words,
             )
         )
@@ -132,10 +138,14 @@ def transcription_stage_count() -> int:
     return len(_TRANSCRIPTION_STAGE_LABELS)
 
 
-def _build_asr_options(transcription_options_type: type | None = None) -> dict[str, object]:
+def _build_asr_options(
+    transcription_options_type: type | None = None,
+) -> dict[str, object]:
     if transcription_options_type is None:
         try:
-            from faster_whisper.transcribe import TranscriptionOptions as transcription_options_type
+            from faster_whisper.transcribe import (
+                TranscriptionOptions as transcription_options_type,
+            )
         except Exception:
             return {"condition_on_previous_text": False}
 

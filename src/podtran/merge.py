@@ -39,20 +39,34 @@ def merge_transcript_segments(
         last_speaker = last_segment.speaker or "UNKNOWN"
         gap = segment.start - last_segment.end
         duration = segment.end - block_start
-        if speaker != last_speaker or gap > pause_threshold or duration > max_block_duration:
-            blocks.append(build_block(current, resolve_voice(current[0].speaker or "UNKNOWN"), len(blocks)))
+        if (
+            speaker != last_speaker
+            or gap > pause_threshold
+            or duration > max_block_duration
+        ):
+            blocks.append(
+                build_block(
+                    current, resolve_voice(current[0].speaker or "UNKNOWN"), len(blocks)
+                )
+            )
             current = [segment]
             block_start = segment.start
         else:
             current.append(segment)
 
     if current:
-        blocks.append(build_block(current, resolve_voice(current[0].speaker or "UNKNOWN"), len(blocks)))
+        blocks.append(
+            build_block(
+                current, resolve_voice(current[0].speaker or "UNKNOWN"), len(blocks)
+            )
+        )
 
     return blocks
 
 
-def build_block(entries: list[TranscriptSegment], voice: str, index: int) -> SegmentRecord:
+def build_block(
+    entries: list[TranscriptSegment], voice: str, index: int
+) -> SegmentRecord:
     words: list[WordAlignment] = []
     for entry in entries:
         words.extend(entry.words)

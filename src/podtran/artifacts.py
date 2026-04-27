@@ -82,7 +82,9 @@ class ArtifactPaths:
         return self.manifests_dir / f"{stage}.json"
 
     def relative_to_task(self, path: Path) -> str:
-        return str(path.resolve().relative_to(self.task_dir.resolve())).replace("\\", "/")
+        return str(path.resolve().relative_to(self.task_dir.resolve())).replace(
+            "\\", "/"
+        )
 
 
 def atomic_write_text(path: Path, content: str) -> None:

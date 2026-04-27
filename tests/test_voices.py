@@ -23,8 +23,21 @@ from podtran.voices import (
 
 
 class _UnexpectedProvider:
-    def create_voice_spec(self, reference_audio: Path, reference_text: str, target_model: str, preferred_name: str, reference_fingerprint: str):
-        _ = (reference_audio, reference_text, target_model, preferred_name, reference_fingerprint)
+    def create_voice_spec(
+        self,
+        reference_audio: Path,
+        reference_text: str,
+        target_model: str,
+        preferred_name: str,
+        reference_fingerprint: str,
+    ):
+        _ = (
+            reference_audio,
+            reference_text,
+            target_model,
+            preferred_name,
+            reference_fingerprint,
+        )
         raise AssertionError("provider should not be called")
 
 
@@ -33,7 +46,14 @@ class _FixedProvider:
         self.token = token
         self.calls = 0
 
-    def create_voice_spec(self, reference_audio: Path, reference_text: str, target_model: str, preferred_name: str, reference_fingerprint: str):
+    def create_voice_spec(
+        self,
+        reference_audio: Path,
+        reference_text: str,
+        target_model: str,
+        preferred_name: str,
+        reference_fingerprint: str,
+    ):
         _ = (reference_audio, reference_text, target_model, preferred_name)
         self.calls += 1
         return ReferenceCloneSpec(
@@ -51,7 +71,13 @@ def _paths(tmp_path: Path, task_id: str = "task-1") -> ArtifactPaths:
     return ArtifactPaths.from_task_id(tmp_path, task_id)
 
 
-def _segment(segment_id: str, start: float, end: float, speaker: str = "SPEAKER_00", text: str | None = None) -> SegmentRecord:
+def _segment(
+    segment_id: str,
+    start: float,
+    end: float,
+    speaker: str = "SPEAKER_00",
+    text: str | None = None,
+) -> SegmentRecord:
     return SegmentRecord(
         segment_id=segment_id,
         block_id=f"block_{segment_id}",
@@ -65,7 +91,9 @@ def _segment(segment_id: str, start: float, end: float, speaker: str = "SPEAKER_
 
 
 def _stub_export(paths: ArtifactPaths):
-    def _export(source_audio: Path, speaker: str, candidate, build_dir: Path) -> tuple[Path, Path]:
+    def _export(
+        source_audio: Path, speaker: str, candidate, build_dir: Path
+    ) -> tuple[Path, Path]:
         _ = (source_audio, build_dir)
         ref_audio = paths.refs_dir / f"{speaker}.wav"
         ref_text = paths.refs_dir / f"{speaker}.txt"
@@ -76,13 +104,25 @@ def _stub_export(paths: ArtifactPaths):
     return _export
 
 
-def test_select_reference_candidate_merges_adjacent_segments_to_target_duration() -> None:
+def test_select_reference_candidate_merges_adjacent_segments_to_target_duration() -> (
+    None
+):
     segments = [
-        _segment("seg_1", 0.0, 6.0, text="this speaker says something useful for cloning"),
-        _segment("seg_2", 6.2, 12.0, text="and keeps talking with enough words to qualify"),
+        _segment(
+            "seg_1", 0.0, 6.0, text="this speaker says something useful for cloning"
+        ),
+        _segment(
+            "seg_2", 6.2, 12.0, text="and keeps talking with enough words to qualify"
+        ),
     ]
 
-    candidate = select_reference_candidate(segments, "SPEAKER_00", pause_threshold=0.8, preferred_min_duration=10.0, preferred_max_duration=20.0)
+    candidate = select_reference_candidate(
+        segments,
+        "SPEAKER_00",
+        pause_threshold=0.8,
+        preferred_min_duration=10.0,
+        preferred_max_duration=20.0,
+    )
 
     assert candidate is not None
     assert candidate.start == 0.0
@@ -90,9 +130,13 @@ def test_select_reference_candidate_merges_adjacent_segments_to_target_duration(
     assert len(candidate.segments) == 2
 
 
-def test_select_reference_candidate_accepts_shorter_clip_when_it_has_clear_speech() -> None:
+def test_select_reference_candidate_accepts_shorter_clip_when_it_has_clear_speech() -> (
+    None
+):
     segments = [
-        _segment("seg_1", 0.0, 3.2, text="this opening phrase is clear enough for enrollment"),
+        _segment(
+            "seg_1", 0.0, 3.2, text="this opening phrase is clear enough for enrollment"
+        ),
         _segment("seg_2", 4.8, 7.5, text="and the speaker resumes after a short pause"),
     ]
 
@@ -109,7 +153,9 @@ def test_select_reference_candidate_accepts_shorter_clip_when_it_has_clear_speec
     assert candidate.end == 7.5
 
 
-def test_voice_resolver_preferred_name_uses_normalized_speaker_without_prefix(tmp_path: Path) -> None:
+def test_voice_resolver_preferred_name_uses_normalized_speaker_without_prefix(
+    tmp_path: Path,
+) -> None:
     paths = _paths(tmp_path)
     manager = VoiceResolver(AppConfig(tts=TTSConfig(mode="clone")), paths)
 
@@ -145,7 +191,9 @@ def test_voice_resolver_reuses_cached_voice_profile(tmp_path: Path) -> None:
     manager._clone_provider = _UnexpectedProvider()
     manager._export_reference_audio = _stub_export(paths)  # type: ignore[method-assign]
 
-    resolved = manager.resolve_voice_targets([_segment("seg_1", 0.0, 12.0)], source_audio)
+    resolved = manager.resolve_voice_targets(
+        [_segment("seg_1", 0.0, 12.0)], source_audio
+    )
 
     assert resolved["SPEAKER_00"].spec.kind == "provider_clone"
     assert resolved["SPEAKER_00"].spec.payload.voice_token == "voice-token-1"
@@ -184,7 +232,13 @@ def test_voice_resolver_skips_unknown_speaker_without_raising(tmp_path: Path) ->
     resolved = manager.resolve_voice_targets(
         [
             _segment("seg_1", 0.0, 2.4, speaker="UNKNOWN", text="short speech here"),
-            _segment("seg_2", 3.5, 5.7, speaker="UNKNOWN", text="still not enough contiguous speech"),
+            _segment(
+                "seg_2",
+                3.5,
+                5.7,
+                speaker="UNKNOWN",
+                text="still not enough contiguous speech",
+            ),
         ],
         source_audio,
     )
@@ -196,7 +250,9 @@ def test_voice_resolver_skips_unknown_speaker_without_raising(tmp_path: Path) ->
     assert voice_profiles[0].error == UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE
 
 
-def test_voice_resolver_uses_reference_clone_specs_for_vllm_omni(tmp_path: Path) -> None:
+def test_voice_resolver_uses_reference_clone_specs_for_vllm_omni(
+    tmp_path: Path,
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     source_audio = tmp_path / "source.wav"
@@ -213,29 +269,43 @@ def test_voice_resolver_uses_reference_clone_specs_for_vllm_omni(tmp_path: Path)
     )
     manager._export_reference_audio = _stub_export(paths)  # type: ignore[method-assign]
 
-    resolved = manager.resolve_voice_targets([_segment("seg_1", 0.0, 12.0)], source_audio)
+    resolved = manager.resolve_voice_targets(
+        [_segment("seg_1", 0.0, 12.0)], source_audio
+    )
 
     spec = resolved["SPEAKER_00"].spec
     assert spec.kind == "reference_clone"
     assert spec.provider == "vllm-omni"
-    assert spec.payload.reference_text == "this is a suitable reference sentence for cloning quality"
+    assert (
+        spec.payload.reference_text
+        == "this is a suitable reference sentence for cloning quality"
+    )
     assert Path(spec.payload.reference_audio_path).exists()
 
 
-def test_voice_resolver_uses_reference_clone_specs_for_qwen_local(tmp_path: Path) -> None:
+def test_voice_resolver_uses_reference_clone_specs_for_qwen_local(
+    tmp_path: Path,
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     source_audio = tmp_path / "source.wav"
     source_audio.write_bytes(b"wav")
-    manager = VoiceResolver(AppConfig(tts=TTSConfig(provider="qwen-local", mode="clone")), paths)
+    manager = VoiceResolver(
+        AppConfig(tts=TTSConfig(provider="qwen-local", mode="clone")), paths
+    )
     manager._export_reference_audio = _stub_export(paths)  # type: ignore[method-assign]
 
-    resolved = manager.resolve_voice_targets([_segment("seg_1", 0.0, 12.0)], source_audio)
+    resolved = manager.resolve_voice_targets(
+        [_segment("seg_1", 0.0, 12.0)], source_audio
+    )
 
     spec = resolved["SPEAKER_00"].spec
     assert spec.kind == "reference_clone"
     assert spec.provider == "qwen-local"
-    assert spec.payload.reference_text == "this is a suitable reference sentence for cloning quality"
+    assert (
+        spec.payload.reference_text
+        == "this is a suitable reference sentence for cloning quality"
+    )
     assert Path(spec.payload.reference_audio_path).exists()
 
 
@@ -268,12 +338,19 @@ def test_voice_resolver_reuses_shared_voice_cache(tmp_path: Path) -> None:
     second_manager._export_reference_audio = _stub_export(second_paths)  # type: ignore[method-assign]
 
     segments = [_segment("seg_1", 0.0, 12.0)]
-    first_resolved = first_manager.resolve_voice_targets(segments, source_audio, source_audio_fingerprint="audio-1")
-    second_resolved = second_manager.resolve_voice_targets(segments, source_audio, source_audio_fingerprint="audio-1")
+    first_resolved = first_manager.resolve_voice_targets(
+        segments, source_audio, source_audio_fingerprint="audio-1"
+    )
+    second_resolved = second_manager.resolve_voice_targets(
+        segments, source_audio, source_audio_fingerprint="audio-1"
+    )
 
     assert first_resolved["SPEAKER_00"].spec.kind == "reference_clone"
     assert second_resolved["SPEAKER_00"].spec.kind == "reference_clone"
-    assert first_resolved["SPEAKER_00"].spec.identity == second_resolved["SPEAKER_00"].spec.identity
+    assert (
+        first_resolved["SPEAKER_00"].spec.identity
+        == second_resolved["SPEAKER_00"].spec.identity
+    )
 
 
 def test_voice_resolver_reports_progress(tmp_path: Path) -> None:
@@ -289,16 +366,25 @@ def test_voice_resolver_reports_progress(tmp_path: Path) -> None:
     manager.resolve_voice_targets(
         [_segment("seg_1", 0.0, 12.0)],
         source_audio,
-        progress_callback=lambda completed, total, message: events.append((completed, total, message)),
+        progress_callback=lambda completed, total, message: events.append(
+            (completed, total, message)
+        ),
     )
 
     assert events[0] == (0, 1, "Resolving cloned voices")
     assert events[-1] == (1, 1, "Voice resolution complete")
-    assert any(("Enrolled voice" in message) or ("Prepared reference voice" in message) for _, _, message in events)
+    assert any(
+        ("Enrolled voice" in message) or ("Prepared reference voice" in message)
+        for _, _, message in events
+    )
 
 
-def test_dashscope_clone_provider_uses_fixed_enrollment_model_and_derived_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = AppConfig(providers={"dashscope": {"tts_base_url": "https://tts.example.com/root/"}})
+def test_dashscope_clone_provider_uses_fixed_enrollment_model_and_derived_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = AppConfig(
+        providers={"dashscope": {"tts_base_url": "https://tts.example.com/root/"}}
+    )
     provider = DashScopeCloneProvider(config)
     captured: dict[str, object] = {}
 
@@ -310,7 +396,9 @@ def test_dashscope_clone_provider_uses_fixed_enrollment_model_and_derived_url(tm
             return {"output": {"voice": "voice-token-1"}}
 
     class _Client:
-        def post(self, url: str, headers: dict[str, str], json: dict[str, object]) -> _Response:
+        def post(
+            self, url: str, headers: dict[str, str], json: dict[str, object]
+        ) -> _Response:
             captured["url"] = url
             captured["headers"] = headers
             captured["json"] = json
@@ -321,15 +409,22 @@ def test_dashscope_clone_provider_uses_fixed_enrollment_model_and_derived_url(tm
     reference_audio = tmp_path / "reference.wav"
     reference_audio.write_bytes(b"wav")
 
-    spec = provider.create_voice_spec(reference_audio, "ref text", "clone-model", "speaker_00", "ref-1")
+    spec = provider.create_voice_spec(
+        reference_audio, "ref text", "clone-model", "speaker_00", "ref-1"
+    )
 
     assert spec.kind == "provider_clone"
     assert spec.payload == ProviderClonePayload(voice_token="voice-token-1")
-    assert captured["url"] == "https://tts.example.com/root/services/audio/tts/customization"
+    assert (
+        captured["url"]
+        == "https://tts.example.com/root/services/audio/tts/customization"
+    )
     assert captured["json"]["model"] == DEFAULT_TTS_ENROLLMENT_MODEL
 
 
-def test_resolve_dashscope_api_key_prefers_provider_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_dashscope_api_key_prefers_provider_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = AppConfig(providers={"dashscope": {"api_key": "dash-key"}})
     monkeypatch.setenv("DASHSCOPE_API_KEY", "env-key")
 

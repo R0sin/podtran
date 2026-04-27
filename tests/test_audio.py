@@ -3,7 +3,9 @@ from pathlib import Path
 from podtran.audio import extract_audio_chunk
 
 
-def test_extract_audio_chunk_uses_relative_duration_when_start_and_end_are_provided(monkeypatch) -> None:
+def test_extract_audio_chunk_uses_relative_duration_when_start_and_end_are_provided(
+    monkeypatch,
+) -> None:
     captured: dict[str, object] = {}
 
     def fake_run_ffmpeg(ffmpeg_path: str, args: list[str]) -> None:

@@ -9,7 +9,9 @@ from podtran.tasks import TaskStore
 
 
 class StageExecutor:
-    def __init__(self, task_store: TaskStore, task_manifest: TaskManifest, paths: ArtifactPaths) -> None:
+    def __init__(
+        self, task_store: TaskStore, task_manifest: TaskManifest, paths: ArtifactPaths
+    ) -> None:
         self.task_store = task_store
         self.task_manifest = task_manifest
         self.paths = paths
@@ -104,7 +106,6 @@ class StageExecutor:
         self.task_manifest.status = status
         self.task_manifest.updated_at = _utc_now()
         self.task_store.save_task(self.task_manifest)
-
 
 
 def _utc_now() -> str:

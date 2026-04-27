@@ -22,7 +22,11 @@ from podtran.config import (
     resolve_workdir,
     write_default_config,
 )
-from podtran.fingerprints import FingerprintService, TTS_CONFIG_KEYS, VOICE_CLONE_CONFIG_KEYS
+from podtran.fingerprints import (
+    FingerprintService,
+    TTS_CONFIG_KEYS,
+    VOICE_CLONE_CONFIG_KEYS,
+)
 
 
 def test_load_config_accepts_provider_scoped_fields(tmp_path: Path) -> None:
@@ -93,7 +97,10 @@ max_ref_seconds = 18
 
     assert config.providers.dashscope.api_key == "dash-key"
     assert config.providers.dashscope.tts_clone_model == "dash-clone"
-    assert config.providers.openai_compatible.translation_base_url == "http://localhost:9000/v1"
+    assert (
+        config.providers.openai_compatible.translation_base_url
+        == "http://localhost:9000/v1"
+    )
     assert config.providers.vllm_omni.instructions == "Warm broadcast tone."
     assert config.providers.qwen_local.clone_model_size == "1.7B"
     assert config.providers.qwen_local.torch_dtype == "float16"
@@ -165,7 +172,10 @@ def test_provider_helpers_resolve_defaults_and_overrides() -> None:
     assert config.translation.provider == "google-free"
     assert config.resolved_translation_base_url() == ""
     assert config.translation_model() == DEFAULT_TRANSLATION_MODEL
-    assert config.providers.openai_compatible.translation_base_url == DEFAULT_TRANSLATION_BASE_URL
+    assert (
+        config.providers.openai_compatible.translation_base_url
+        == DEFAULT_TRANSLATION_BASE_URL
+    )
     assert config.resolved_tts_base_url() == DEFAULT_TTS_BASE_URL
     assert config.tts_preset_model() == DEFAULT_TTS_PRESET_MODEL
     assert config.tts_clone_model() == DEFAULT_TTS_CLONE_MODEL
@@ -173,13 +183,19 @@ def test_provider_helpers_resolve_defaults_and_overrides() -> None:
     assert config.providers.vllm_omni.language == DEFAULT_VLLM_OMNI_LANGUAGE
     assert config.providers.qwen_local.clone_model_size == DEFAULT_QWEN_LOCAL_MODEL_SIZE
     assert config.providers.qwen_local.torch_dtype == DEFAULT_QWEN_LOCAL_TORCH_DTYPE
-    assert config.providers.qwen_local.attn_implementation == DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION
+    assert (
+        config.providers.qwen_local.attn_implementation
+        == DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION
+    )
 
     custom = AppConfig(
         translation={"provider": "openai-compatible"},
         tts={"provider": "vllm-omni"},
         providers={
-            "openai_compatible": {"translation_base_url": "https://example.com/v1/", "translation_model": "m"},
+            "openai_compatible": {
+                "translation_base_url": "https://example.com/v1/",
+                "translation_model": "m",
+            },
             "vllm_omni": {"base_url": "https://tts.example.com/root/", "model": "tts"},
         },
     )
@@ -219,11 +235,15 @@ def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None
     assert f'tts_clone_model = "{DEFAULT_TTS_CLONE_MODEL}"' in rendered
     assert f'clone_model_size = "{DEFAULT_QWEN_LOCAL_MODEL_SIZE}"' in rendered
     assert f'torch_dtype = "{DEFAULT_QWEN_LOCAL_TORCH_DTYPE}"' in rendered
-    assert f'attn_implementation = "{DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION}"' in rendered
+    assert (
+        f'attn_implementation = "{DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION}"' in rendered
+    )
     assert "\n[tts.preset]\n" in rendered
     assert "\n[tts.clone]\n" in rendered
     assert "\n[tts.vllm_omni]\n" not in rendered
-    assert "\nbase_url =" not in rendered.split("[translation]", 1)[1].split("[tts]", 1)[0]
+    assert (
+        "\nbase_url =" not in rendered.split("[translation]", 1)[1].split("[tts]", 1)[0]
+    )
 
 
 def test_render_config_toml_uses_provider_scoped_tts_sections() -> None:
@@ -238,54 +258,109 @@ def test_render_config_toml_uses_provider_scoped_tts_sections() -> None:
     assert "customization_url" not in rendered
 
 
-def test_provider_api_keys_do_not_affect_tts_or_voice_clone_fingerprints(tmp_path: Path) -> None:
+def test_provider_api_keys_do_not_affect_tts_or_voice_clone_fingerprints(
+    tmp_path: Path,
+) -> None:
     fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
-    first = AppConfig(tts={"provider": "vllm-omni"}, providers={"vllm_omni": {"api_key": "key-1"}})
-    second = AppConfig(tts={"provider": "vllm-omni"}, providers={"vllm_omni": {"api_key": "key-2"}})
+    first = AppConfig(
+        tts={"provider": "vllm-omni"}, providers={"vllm_omni": {"api_key": "key-1"}}
+    )
+    second = AppConfig(
+        tts={"provider": "vllm-omni"}, providers={"vllm_omni": {"api_key": "key-2"}}
+    )
 
-    assert fingerprints.hash_config_subset(first, TTS_CONFIG_KEYS) == fingerprints.hash_config_subset(second, TTS_CONFIG_KEYS)
-    assert fingerprints.hash_config_subset(first, VOICE_CLONE_CONFIG_KEYS) == fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
+    assert fingerprints.hash_config_subset(
+        first, TTS_CONFIG_KEYS
+    ) == fingerprints.hash_config_subset(second, TTS_CONFIG_KEYS)
+    assert fingerprints.hash_config_subset(
+        first, VOICE_CLONE_CONFIG_KEYS
+    ) == fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
 
 
-def test_provider_runtime_fields_affect_tts_and_voice_clone_fingerprints(tmp_path: Path) -> None:
+def test_provider_runtime_fields_affect_tts_and_voice_clone_fingerprints(
+    tmp_path: Path,
+) -> None:
     fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
     first = AppConfig(
         tts={"provider": "vllm-omni"},
-        providers={"vllm_omni": {"language": "Auto", "instructions": "", "x_vector_only_mode": False}},
+        providers={
+            "vllm_omni": {
+                "language": "Auto",
+                "instructions": "",
+                "x_vector_only_mode": False,
+            }
+        },
     )
     second = AppConfig(
         tts={"provider": "vllm-omni"},
-        providers={"vllm_omni": {"language": "zh", "instructions": "Warm", "x_vector_only_mode": True}},
+        providers={
+            "vllm_omni": {
+                "language": "zh",
+                "instructions": "Warm",
+                "x_vector_only_mode": True,
+            }
+        },
     )
 
-    assert fingerprints.hash_config_subset(first, TTS_CONFIG_KEYS) != fingerprints.hash_config_subset(second, TTS_CONFIG_KEYS)
-    assert fingerprints.hash_config_subset(first, VOICE_CLONE_CONFIG_KEYS) != fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
+    assert fingerprints.hash_config_subset(
+        first, TTS_CONFIG_KEYS
+    ) != fingerprints.hash_config_subset(second, TTS_CONFIG_KEYS)
+    assert fingerprints.hash_config_subset(
+        first, VOICE_CLONE_CONFIG_KEYS
+    ) != fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
 
 
-def test_qwen_local_runtime_fields_affect_tts_and_voice_clone_fingerprints(tmp_path: Path) -> None:
+def test_qwen_local_runtime_fields_affect_tts_and_voice_clone_fingerprints(
+    tmp_path: Path,
+) -> None:
     fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
     first = AppConfig(
         tts={"provider": "qwen-local"},
-        providers={"qwen_local": {"torch_dtype": "auto", "attn_implementation": "auto"}},
+        providers={
+            "qwen_local": {"torch_dtype": "auto", "attn_implementation": "auto"}
+        },
     )
     second = AppConfig(
         tts={"provider": "qwen-local"},
-        providers={"qwen_local": {"torch_dtype": "float16", "attn_implementation": "flash_attention_2"}},
+        providers={
+            "qwen_local": {
+                "torch_dtype": "float16",
+                "attn_implementation": "flash_attention_2",
+            }
+        },
     )
 
-    assert fingerprints.hash_config_subset(first, TTS_CONFIG_KEYS) != fingerprints.hash_config_subset(second, TTS_CONFIG_KEYS)
-    assert fingerprints.hash_config_subset(first, VOICE_CLONE_CONFIG_KEYS) != fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
+    assert fingerprints.hash_config_subset(
+        first, TTS_CONFIG_KEYS
+    ) != fingerprints.hash_config_subset(second, TTS_CONFIG_KEYS)
+    assert fingerprints.hash_config_subset(
+        first, VOICE_CLONE_CONFIG_KEYS
+    ) != fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
 
 
 def test_detect_legacy_translation_keys_detects_dashscope_provider() -> None:
-    assert detect_legacy_translation_keys({"translation": {"provider": "dashscope"}}) == ["provider=dashscope"]
+    assert detect_legacy_translation_keys(
+        {"translation": {"provider": "dashscope"}}
+    ) == ["provider=dashscope"]
 
 
 def test_resolve_workdir_uses_default_and_override() -> None:
     default_config = resolve_config_path()
     assert resolve_workdir() == Path("~/.podtran").expanduser().resolve()
     assert default_config == Path("~/.podtran/podtran.toml").expanduser().resolve()
-    assert resolve_workdir(Path("~/.podtran-tests")) == Path("~/.podtran-tests").expanduser().resolve()
-    assert resolve_workdir(config_path=Path("~/profiles/podtran.toml")) == Path("~/profiles").expanduser().resolve()
-    assert resolve_config_path(workdir_override=Path("~/.podtran-tests")) == Path("~/.podtran-tests/podtran.toml").expanduser().resolve()
-    assert resolve_config_path(Path("~/custom.toml")) == Path("~/custom.toml").expanduser().resolve()
+    assert (
+        resolve_workdir(Path("~/.podtran-tests"))
+        == Path("~/.podtran-tests").expanduser().resolve()
+    )
+    assert (
+        resolve_workdir(config_path=Path("~/profiles/podtran.toml"))
+        == Path("~/profiles").expanduser().resolve()
+    )
+    assert (
+        resolve_config_path(workdir_override=Path("~/.podtran-tests"))
+        == Path("~/.podtran-tests/podtran.toml").expanduser().resolve()
+    )
+    assert (
+        resolve_config_path(Path("~/custom.toml"))
+        == Path("~/custom.toml").expanduser().resolve()
+    )

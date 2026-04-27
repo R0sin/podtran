@@ -36,7 +36,10 @@ class _FakeBackend:
     batch_size_limit: int | None = None
 
     def translate_batch(self, batch: list[SegmentRecord]) -> list[dict[str, str]]:
-        return [{"segment_id": item.segment_id, "text_zh": f"zh-{item.segment_id}"} for item in batch]
+        return [
+            {"segment_id": item.segment_id, "text_zh": f"zh-{item.segment_id}"}
+            for item in batch
+        ]
 
 
 def test_resolve_translation_key_prefers_provider_credentials(monkeypatch) -> None:
@@ -50,12 +53,18 @@ def test_resolve_translation_key_prefers_provider_credentials(monkeypatch) -> No
 
 
 def test_build_translation_backend_supports_known_providers() -> None:
-    assert isinstance(build_translation_backend(AppConfig()), GoogleFreeTranslationBackend)
+    assert isinstance(
+        build_translation_backend(AppConfig()), GoogleFreeTranslationBackend
+    )
     assert isinstance(
         build_translation_backend(
             AppConfig(
                 translation={"provider": "openai-compatible"},
-                providers={"openai_compatible": {"translation_base_url": "http://localhost:9000/v1"}},
+                providers={
+                    "openai_compatible": {
+                        "translation_base_url": "http://localhost:9000/v1"
+                    }
+                },
             )
         ),
         OpenAICompatibleTranslationBackend,
@@ -105,7 +114,9 @@ def test_parse_google_free_translation_response_rejects_empty_payload() -> None:
         _parse_google_free_translation_response("", [_segment("seg_1")])
 
 
-def test_parse_google_free_translation_response_rejects_missing_sentences_list() -> None:
+def test_parse_google_free_translation_response_rejects_missing_sentences_list() -> (
+    None
+):
     with pytest.raises(RuntimeError, match="missing 'sentences' list"):
         _parse_google_free_translation_response('{"text":"你好"}', [_segment("seg_1")])
 
@@ -130,12 +141,20 @@ def test_google_free_backend_translates_batch_using_project_batch_size() -> None
             return None
 
     class _Client:
-        def post(self, url: str, params: dict[str, str], content: str, headers: dict[str, str]) -> _Response:
+        def post(
+            self,
+            url: str,
+            params: dict[str, str],
+            content: str,
+            headers: dict[str, str],
+        ) -> _Response:
             captured["url"] = url
             captured["params"] = params
             captured["content"] = content
             captured["headers"] = headers
-            return _Response('{"sentences":[{"trans":"你好"},{"trans":"世界"}],"src":"en"}')
+            return _Response(
+                '{"sentences":[{"trans":"你好"},{"trans":"世界"}],"src":"en"}'
+            )
 
     backend.client = _Client()  # type: ignore[assignment]
 
@@ -164,10 +183,20 @@ def test_google_free_backend_retries_http_failures_and_surfaces_error() -> None:
     backend = GoogleFreeTranslationBackend(AppConfig())
 
     class _Client:
-        def post(self, url: str, params: dict[str, str], content: str, headers: dict[str, str]) -> object:
-            request = httpx.Request("POST", url, params=params, content=content, headers=headers)
+        def post(
+            self,
+            url: str,
+            params: dict[str, str],
+            content: str,
+            headers: dict[str, str],
+        ) -> object:
+            request = httpx.Request(
+                "POST", url, params=params, content=content, headers=headers
+            )
             response = httpx.Response(status_code=429, request=request)
-            raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+            raise httpx.HTTPStatusError(
+                "rate limited", request=request, response=response
+            )
 
     backend.client = _Client()  # type: ignore[assignment]
 
@@ -199,7 +228,9 @@ def test_translate_segments_reports_segment_progress(tmp_path: Path) -> None:
     translated = translator.translate_segments(
         input_path,
         output_path,
-        progress_callback=lambda completed, total, message: events.append((completed, total, message)),
+        progress_callback=lambda completed, total, message: events.append(
+            (completed, total, message)
+        ),
     )
 
     assert [event[0] for event in events] == [0, 2, 3, 3]
@@ -209,10 +240,17 @@ def test_translate_segments_reports_segment_progress(tmp_path: Path) -> None:
     assert all(item.text_zh for item in translated)
 
 
-def test_translate_segments_reports_resume_progress_as_completed_over_total(tmp_path: Path) -> None:
+def test_translate_segments_reports_resume_progress_as_completed_over_total(
+    tmp_path: Path,
+) -> None:
     input_path = tmp_path / "segments.json"
     output_path = tmp_path / "translated.json"
-    segments = [_segment("seg_1"), _segment("seg_2"), _segment("seg_3"), _segment("seg_4")]
+    segments = [
+        _segment("seg_1"),
+        _segment("seg_2"),
+        _segment("seg_3"),
+        _segment("seg_4"),
+    ]
     input_path.write_text(
         "[" + ",".join(segment.model_dump_json() for segment in segments) + "]",
         encoding="utf-8",
@@ -236,7 +274,9 @@ def test_translate_segments_reports_resume_progress_as_completed_over_total(tmp_
     translated = translator.translate_segments(
         input_path,
         output_path,
-        progress_callback=lambda completed, total, message: events.append((completed, total, message)),
+        progress_callback=lambda completed, total, message: events.append(
+            (completed, total, message)
+        ),
     )
 
     assert [event[0] for event in events] == [2, 3, 4, 4]
@@ -246,7 +286,9 @@ def test_translate_segments_reports_resume_progress_as_completed_over_total(tmp_
     assert all(item.text_zh for item in translated)
 
 
-def test_translate_segments_runs_batches_concurrently_and_preserves_segment_order(tmp_path: Path) -> None:
+def test_translate_segments_runs_batches_concurrently_and_preserves_segment_order(
+    tmp_path: Path,
+) -> None:
     input_path = tmp_path / "segments.json"
     output_path = tmp_path / "translated.json"
     segments = [_segment(f"seg_{index}") for index in range(1, 5)]
@@ -269,10 +311,30 @@ def test_translate_segments_runs_batches_concurrently_and_preserves_segment_orde
     translated = translator.translate_segments(input_path, output_path)
     persisted = read_model_list(output_path, SegmentRecord)
 
-    assert [item.segment_id for item in translated] == ["seg_1", "seg_2", "seg_3", "seg_4"]
-    assert [item.text_zh for item in translated] == ["zh-seg_1", "zh-seg_2", "zh-seg_3", "zh-seg_4"]
-    assert [item.segment_id for item in persisted] == ["seg_1", "seg_2", "seg_3", "seg_4"]
-    assert [item.text_zh for item in persisted] == ["zh-seg_1", "zh-seg_2", "zh-seg_3", "zh-seg_4"]
+    assert [item.segment_id for item in translated] == [
+        "seg_1",
+        "seg_2",
+        "seg_3",
+        "seg_4",
+    ]
+    assert [item.text_zh for item in translated] == [
+        "zh-seg_1",
+        "zh-seg_2",
+        "zh-seg_3",
+        "zh-seg_4",
+    ]
+    assert [item.segment_id for item in persisted] == [
+        "seg_1",
+        "seg_2",
+        "seg_3",
+        "seg_4",
+    ]
+    assert [item.text_zh for item in persisted] == [
+        "zh-seg_1",
+        "zh-seg_2",
+        "zh-seg_3",
+        "zh-seg_4",
+    ]
 
 
 def test_translate_segments_marks_only_failed_batch_errors(tmp_path: Path) -> None:
@@ -334,7 +396,9 @@ def test_translate_segments_honors_backend_batch_limit(tmp_path: Path) -> None:
     assert calls == [["seg_1"], ["seg_2"], ["seg_3"]]
 
 
-def test_translate_segments_writes_merged_state_from_main_thread(tmp_path: Path, monkeypatch) -> None:
+def test_translate_segments_writes_merged_state_from_main_thread(
+    tmp_path: Path, monkeypatch
+) -> None:
     input_path = tmp_path / "segments.json"
     output_path = tmp_path / "translated.json"
     segments = [_segment(f"seg_{index}") for index in range(1, 5)]

@@ -9,7 +9,14 @@ class _ChunkRecorder:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def extract_audio_chunk(self, ffmpeg_path: str, source: Path, output: Path, start: float | None, end: float | None) -> Path:
+    def extract_audio_chunk(
+        self,
+        ffmpeg_path: str,
+        source: Path,
+        output: Path,
+        start: float | None,
+        end: float | None,
+    ) -> Path:
         self.calls.append(f"extract:{output.name}")
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"wav")
@@ -28,7 +35,6 @@ class _ChunkRecorder:
         return output
 
 
-
 def _segment(tts_audio_path: str) -> SegmentRecord:
     return SegmentRecord(
         segment_id="seg_1",
@@ -44,7 +50,6 @@ def _segment(tts_audio_path: str) -> SegmentRecord:
     )
 
 
-
 def test_compose_output_reports_progress(tmp_path: Path, monkeypatch) -> None:
     source_audio = tmp_path / "source.wav"
     source_audio.write_bytes(b"source")
@@ -55,14 +60,25 @@ def test_compose_output_reports_progress(tmp_path: Path, monkeypatch) -> None:
     recorder = _ChunkRecorder()
     events: list[tuple[int, int, str]] = []
 
-    monkeypatch.setattr("podtran.compose.reset_temp_dir", lambda path, root: path.mkdir(parents=True, exist_ok=True))
-    monkeypatch.setattr("podtran.compose.probe_duration", lambda ffprobe_path, path: 2.0)
-    monkeypatch.setattr("podtran.compose.extract_audio_chunk", recorder.extract_audio_chunk)
+    monkeypatch.setattr(
+        "podtran.compose.reset_temp_dir",
+        lambda path, root: path.mkdir(parents=True, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        "podtran.compose.probe_duration", lambda ffprobe_path, path: 2.0
+    )
+    monkeypatch.setattr(
+        "podtran.compose.extract_audio_chunk", recorder.extract_audio_chunk
+    )
     monkeypatch.setattr("podtran.compose.create_silence", recorder.create_silence)
     monkeypatch.setattr("podtran.compose.normalize_audio", recorder.normalize_audio)
     monkeypatch.setattr(
         "podtran.compose.concat_audio",
-        lambda ffmpeg_path, chunks, output, bitrate: (output.parent.mkdir(parents=True, exist_ok=True), output.write_bytes(b"mp3"), output)[2],
+        lambda ffmpeg_path, chunks, output, bitrate: (
+            output.parent.mkdir(parents=True, exist_ok=True),
+            output.write_bytes(b"mp3"),
+            output,
+        )[2],
     )
 
     compose_output(
@@ -71,7 +87,9 @@ def test_compose_output_reports_progress(tmp_path: Path, monkeypatch) -> None:
         AppConfig(),
         temp_dir,
         output_path,
-        progress_callback=lambda completed, total, message: events.append((completed, total, message)),
+        progress_callback=lambda completed, total, message: events.append(
+            (completed, total, message)
+        ),
     )
 
     assert events[0] == (0, 6, "Scanning segments")

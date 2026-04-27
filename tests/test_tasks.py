@@ -5,7 +5,6 @@ from podtran.fingerprints import FingerprintService
 from podtran.tasks import TaskStore
 
 
-
 def test_task_store_creates_unique_task_ids_and_loads_latest(tmp_path: Path) -> None:
     audio = tmp_path / "podcast.wav"
     audio.write_bytes(b"audio")
@@ -17,7 +16,6 @@ def test_task_store_creates_unique_task_ids_and_loads_latest(tmp_path: Path) -> 
 
     assert first.task_id != second.task_id
     assert store.load_latest_task().task_id == second.task_id
-
 
 
 def test_task_store_resolves_unique_prefix(tmp_path: Path) -> None:
@@ -32,8 +30,9 @@ def test_task_store_resolves_unique_prefix(tmp_path: Path) -> None:
     assert loaded.task_id == created.task_id
 
 
-
-def test_task_store_creates_preview_task_with_processing_audio_metadata(tmp_path: Path) -> None:
+def test_task_store_creates_preview_task_with_processing_audio_metadata(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "podcast.wav"
     preview = tmp_path / "preview.wav"
     source.write_bytes(b"source")

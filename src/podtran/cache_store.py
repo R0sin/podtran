@@ -6,7 +6,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from podtran.artifacts import copy_path, output_refs_exist, read_model, remove_path, write_json
+from podtran.artifacts import (
+    copy_path,
+    output_refs_exist,
+    read_model,
+    remove_path,
+    write_json,
+)
 from podtran.models import StageManifest
 
 
@@ -41,9 +47,17 @@ class CacheStore:
             return None
         if not output_refs_exist(entry_dir, manifest.output_refs):
             return None
-        return CacheEntry(stage=stage, cache_key=cache_key, entry_dir=entry_dir, manifest=manifest)
+        return CacheEntry(
+            stage=stage, cache_key=cache_key, entry_dir=entry_dir, manifest=manifest
+        )
 
-    def publish(self, stage: str, cache_key: str, outputs: dict[str, Path], manifest: StageManifest) -> CacheEntry:
+    def publish(
+        self,
+        stage: str,
+        cache_key: str,
+        outputs: dict[str, Path],
+        manifest: StageManifest,
+    ) -> CacheEntry:
         entry_dir = self._entry_dir(stage, cache_key)
         existing = self.lookup(stage, cache_key)
         if existing is not None:
@@ -82,7 +96,12 @@ class CacheStore:
                         return existing
                     raise
 
-            return CacheEntry(stage=stage, cache_key=cache_key, entry_dir=entry_dir, manifest=cache_manifest)
+            return CacheEntry(
+                stage=stage,
+                cache_key=cache_key,
+                entry_dir=entry_dir,
+                manifest=cache_manifest,
+            )
         finally:
             if temp_dir.exists():
                 remove_path(temp_dir)
@@ -93,7 +112,15 @@ class CacheStore:
             copy_path(source, destination)
 
     def list_entries(self, stage: str | None = None) -> list[CacheEntry]:
-        stages = [stage] if stage else [child.name for child in self.cache_dir.iterdir() if child.is_dir() and not child.name.startswith("_")]
+        stages = (
+            [stage]
+            if stage
+            else [
+                child.name
+                for child in self.cache_dir.iterdir()
+                if child.is_dir() and not child.name.startswith("_")
+            ]
+        )
         entries: list[CacheEntry] = []
         for stage_name in stages:
             stage_dir = self.cache_dir / stage_name
@@ -125,7 +152,9 @@ class CacheStore:
                 if not finished_at:
                     continue
                 try:
-                    finished_dt = _normalize_datetime(datetime.fromisoformat(finished_at))
+                    finished_dt = _normalize_datetime(
+                        datetime.fromisoformat(finished_at)
+                    )
                 except ValueError:
                     continue
                 if finished_dt >= normalized_before:

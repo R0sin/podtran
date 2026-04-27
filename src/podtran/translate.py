@@ -9,7 +9,12 @@ from urllib.parse import urlencode
 
 import httpx
 from openai import APIError, APITimeoutError, OpenAI, RateLimitError
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from podtran.artifacts import read_model_list, write_json
 from podtran.config import AppConfig
@@ -22,8 +27,7 @@ GOOGLE_FREE_TRANSLATE_URL = "https://translate.google.com/translate_a/t"
 class TranslationBackend(Protocol):
     batch_size_limit: int | None
 
-    def translate_batch(self, batch: list[SegmentRecord]) -> list[dict[str, str]]:
-        ...
+    def translate_batch(self, batch: list[SegmentRecord]) -> list[dict[str, str]]: ...
 
 
 class OpenAICompatibleTranslationBackend:
@@ -106,7 +110,9 @@ class GoogleFreeTranslationBackend:
 
 
 class Translator:
-    def __init__(self, config: AppConfig, backend: TranslationBackend | None = None) -> None:
+    def __init__(
+        self, config: AppConfig, backend: TranslationBackend | None = None
+    ) -> None:
         self.config = config
         self.backend = backend or build_translation_backend(config)
 
@@ -121,20 +127,36 @@ class Translator:
         total_segments = len(segments)
         completed_segments = total_segments - len(pending)
         if progress_callback is not None:
-            progress_callback(completed_segments, max(total_segments, 1), "Preparing translation batches")
+            progress_callback(
+                completed_segments,
+                max(total_segments, 1),
+                "Preparing translation batches",
+            )
         if not pending:
             if progress_callback is not None:
-                progress_callback(total_segments, max(total_segments, 1), "Translation complete")
+                progress_callback(
+                    total_segments, max(total_segments, 1), "Translation complete"
+                )
             return segments
 
         configured_batch_size = max(1, self.config.translation.batch_size)
         batch_limit = self.backend.batch_size_limit
-        batch_size = min(configured_batch_size, batch_limit) if batch_limit else configured_batch_size
+        batch_size = (
+            min(configured_batch_size, batch_limit)
+            if batch_limit
+            else configured_batch_size
+        )
         max_concurrency = max(1, self.config.translation.max_concurrency)
-        batches = [pending[start : start + batch_size] for start in range(0, len(pending), batch_size)]
+        batches = [
+            pending[start : start + batch_size]
+            for start in range(0, len(pending), batch_size)
+        ]
         processed = 0
         with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
-            future_to_batch = {executor.submit(self._translate_batch, batch): batch for batch in batches}
+            future_to_batch = {
+                executor.submit(self._translate_batch, batch): batch
+                for batch in batches
+            }
             for future in as_completed(future_to_batch):
                 batch = future_to_batch[future]
                 try:
@@ -164,7 +186,9 @@ def build_translation_backend(config: AppConfig) -> TranslationBackend:
         return GoogleFreeTranslationBackend(config)
     if provider == "openai-compatible":
         return OpenAICompatibleTranslationBackend(config)
-    raise RuntimeError(f"Unsupported translation provider: {config.translation.provider}")
+    raise RuntimeError(
+        f"Unsupported translation provider: {config.translation.provider}"
+    )
 
 
 def _load_resume_segments(input_path: Path, output_path: Path) -> list[SegmentRecord]:
@@ -172,7 +196,9 @@ def _load_resume_segments(input_path: Path, output_path: Path) -> list[SegmentRe
     return read_model_list(source, SegmentRecord)
 
 
-def _apply_translations(segments: list[SegmentRecord], translations: list[dict[str, str]]) -> None:
+def _apply_translations(
+    segments: list[SegmentRecord], translations: list[dict[str, str]]
+) -> None:
     mapping = {item["segment_id"]: item["text_zh"] for item in translations}
     for segment in segments:
         if segment.segment_id in mapping:
@@ -186,7 +212,9 @@ def _apply_batch_error(batch: list[SegmentRecord], exc: Exception) -> None:
         segment.error = error_message
 
 
-def _parse_translation_response(content: str, batch: list[SegmentRecord]) -> list[dict[str, str]]:
+def _parse_translation_response(
+    content: str, batch: list[SegmentRecord]
+) -> list[dict[str, str]]:
     cleaned = _strip_fences(content)
     if not cleaned:
         raise ValueError("Translation response was empty.")
@@ -215,7 +243,9 @@ def _parse_translation_response(content: str, batch: list[SegmentRecord]) -> lis
     normalized: list[dict[str, str]] = []
     for item in translations:
         if not isinstance(item, dict):
-            raise ValueError(f"Translation item was not an object: {_excerpt(json.dumps(item, ensure_ascii=False))}")
+            raise ValueError(
+                f"Translation item was not an object: {_excerpt(json.dumps(item, ensure_ascii=False))}"
+            )
         segment_id = str(item.get("segment_id", "")).strip()
         text_zh = str(item.get("text_zh", "")).strip()
         if not segment_id or segment_id not in expected_ids:
@@ -224,15 +254,21 @@ def _parse_translation_response(content: str, batch: list[SegmentRecord]) -> lis
                 f"Expected one of {sorted(expected_ids)}."
             )
         if segment_id in seen_ids:
-            raise ValueError(f"Translation response returned duplicate segment_id '{segment_id}'.")
+            raise ValueError(
+                f"Translation response returned duplicate segment_id '{segment_id}'."
+            )
         if not text_zh:
-            raise ValueError(f"Translation response returned empty text_zh for '{segment_id}'.")
+            raise ValueError(
+                f"Translation response returned empty text_zh for '{segment_id}'."
+            )
         seen_ids.add(segment_id)
         normalized.append({"segment_id": segment_id, "text_zh": text_zh})
 
     missing_ids = expected_ids - seen_ids
     if missing_ids:
-        raise ValueError(f"Translation response omitted segment_ids: {sorted(missing_ids)}")
+        raise ValueError(
+            f"Translation response omitted segment_ids: {sorted(missing_ids)}"
+        )
 
     return normalized
 
@@ -290,7 +326,9 @@ def _parse_google_free_dict_response(
                 f"Google-free translation response returned empty text for '{segment.segment_id}'. "
                 f"Response: {_excerpt(raw)}"
             )
-        normalized.append({"segment_id": segment.segment_id, "text_zh": translated_text})
+        normalized.append(
+            {"segment_id": segment.segment_id, "text_zh": translated_text}
+        )
     return normalized
 
 
@@ -314,7 +352,9 @@ def _parse_google_free_list_response(
                 f"Google-free translation response returned empty text for '{segment.segment_id}'. "
                 f"Response: {_excerpt(raw)}"
             )
-        normalized.append({"segment_id": segment.segment_id, "text_zh": translated_text})
+        normalized.append(
+            {"segment_id": segment.segment_id, "text_zh": translated_text}
+        )
     return normalized
 
 
@@ -346,7 +386,9 @@ def _excerpt(text: str, limit: int = 240) -> str:
 
 
 def _resolve_translation_key(config: AppConfig) -> str:
-    resolved = config.resolve_provider_api_key(config.translation.provider, purpose="translation")
+    resolved = config.resolve_provider_api_key(
+        config.translation.provider, purpose="translation"
+    )
     if resolved:
         return resolved
     return os.getenv("OPENAI_API_KEY", "")

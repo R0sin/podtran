@@ -1,7 +1,12 @@
 import sys
 from pathlib import Path
 
-from podtran.asr import _build_asr_options, _get_diarization_pipeline_class, transcribe_audio, transcription_stage_count
+from podtran.asr import (
+    _build_asr_options,
+    _get_diarization_pipeline_class,
+    transcribe_audio,
+    transcription_stage_count,
+)
 from podtran.config import ASRConfig
 
 
@@ -71,7 +76,9 @@ class _FakeWhisperXModule:
         return _FakeModel()
 
     @staticmethod
-    def load_align_model(language_code: str, device: str, model_name: str | None = None) -> tuple[object, dict[str, str]]:
+    def load_align_model(
+        language_code: str, device: str, model_name: str | None = None
+    ) -> tuple[object, dict[str, str]]:
         return object(), {"language": language_code}
 
     @staticmethod
@@ -117,7 +124,10 @@ def test_build_asr_options_skips_unknown_parameter_sets() -> None:
 
 
 def test_get_diarization_pipeline_class_prefers_top_level_export() -> None:
-    assert _get_diarization_pipeline_class(_TopLevelWhisperX) is _TopLevelWhisperX.DiarizationPipeline
+    assert (
+        _get_diarization_pipeline_class(_TopLevelWhisperX)
+        is _TopLevelWhisperX.DiarizationPipeline
+    )
 
 
 def test_get_diarization_pipeline_class_falls_back_to_nested_module() -> None:
@@ -137,13 +147,17 @@ def test_transcribe_audio_reports_stage_progress(monkeypatch) -> None:
         "hf-token",
         min_speakers=2,
         max_speakers=5,
-        progress_callback=lambda completed, total, message: events.append((completed, total, message)),
+        progress_callback=lambda completed, total, message: events.append(
+            (completed, total, message)
+        ),
     )
 
     assert len(result) == 1
     assert result[0].speaker == "SPEAKER_00"
     assert _FakeDiarizationPipeline.calls[-1] == {"min_speakers": 2, "max_speakers": 5}
-    assert [event[0] for event in events] == list(range(transcription_stage_count() + 1))
+    assert [event[0] for event in events] == list(
+        range(transcription_stage_count() + 1)
+    )
     assert all(event[1] == transcription_stage_count() for event in events)
     assert events[0][2] == "Loading audio"
     assert events[-1][2] == "Transcription complete"

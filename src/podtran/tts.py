@@ -14,9 +14,21 @@ from typing import Callable, Protocol
 
 import httpx
 from openai import OpenAI
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
-from podtran.artifacts import ArtifactPaths, atomic_write_bytes, copy_path, read_model_list, write_json
+from podtran.artifacts import (
+    ArtifactPaths,
+    atomic_write_bytes,
+    copy_path,
+    read_model_list,
+    remove_path,
+    write_json,
+)
 from podtran.audio import FFPROBE_COMMAND, probe_duration
 from podtran.cache_store import CacheStore
 from podtran.config import AppConfig
@@ -57,8 +69,9 @@ QWEN_LOCAL_ATTN_IMPLEMENTATIONS = frozenset({"flash_attention_2", "sdpa", "eager
 class TTSBackend(Protocol):
     supported_voice_kinds: frozenset[str]
 
-    def synthesize(self, text: str, spec: VoiceSpec, model: str, output_path: Path) -> None:
-        ...
+    def synthesize(
+        self, text: str, spec: VoiceSpec, model: str, output_path: Path
+    ) -> None: ...
 
 
 class DashScopeTTSBackend:
@@ -75,7 +88,9 @@ class DashScopeTTSBackend:
         wait=wait_exponential(multiplier=1, min=1, max=8),
         retry=retry_if_exception_type((RuntimeError, httpx.HTTPError)),
     )
-    def synthesize(self, text: str, spec: VoiceSpec, model: str, output_path: Path) -> None:
+    def synthesize(
+        self, text: str, spec: VoiceSpec, model: str, output_path: Path
+    ) -> None:
         response = self.client.post(
             f"{self.config.resolved_tts_base_url()}/services/aigc/multimodal-generation/generation",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -91,7 +106,9 @@ class DashScopeTTSBackend:
         payload = response.json()
         audio_url = payload.get("output", {}).get("audio", {}).get("url", "")
         if not audio_url:
-            raise RuntimeError(f"DashScope TTS returned no audio URL: {json.dumps(payload, ensure_ascii=False)}")
+            raise RuntimeError(
+                f"DashScope TTS returned no audio URL: {json.dumps(payload, ensure_ascii=False)}"
+            )
         audio_response = self.client.get(audio_url)
         audio_response.raise_for_status()
         atomic_write_bytes(output_path, audio_response.content)
@@ -102,7 +119,9 @@ class DashScopeTTSBackend:
         if isinstance(spec, ProviderCloneSpec):
             return spec.payload.voice_token
         if isinstance(spec, ReferenceCloneSpec):
-            raise RuntimeError("DashScope TTS backend does not support reference_clone specs.")
+            raise RuntimeError(
+                "DashScope TTS backend does not support reference_clone specs."
+            )
         raise RuntimeError(f"Unsupported voice spec for DashScope TTS: {spec.kind}")
 
 
@@ -123,9 +142,13 @@ class OpenAICompatibleTTSBackend:
         wait=wait_exponential(multiplier=1, min=1, max=8),
         retry=retry_if_exception_type(RuntimeError),
     )
-    def synthesize(self, text: str, spec: VoiceSpec, model: str, output_path: Path) -> None:
+    def synthesize(
+        self, text: str, spec: VoiceSpec, model: str, output_path: Path
+    ) -> None:
         if not isinstance(spec, PresetVoiceSpec):
-            raise RuntimeError(f"OpenAI-compatible TTS does not support voice kind: {spec.kind}")
+            raise RuntimeError(
+                f"OpenAI-compatible TTS does not support voice kind: {spec.kind}"
+            )
         response = self.client.audio.speech.create(
             model=model,
             voice=spec.voice_name,
@@ -150,7 +173,9 @@ class VllmOmniTTSBackend:
         wait=wait_exponential(multiplier=1, min=1, max=8),
         retry=retry_if_exception_type((RuntimeError, httpx.HTTPError)),
     )
-    def synthesize(self, text: str, spec: VoiceSpec, model: str, output_path: Path) -> None:
+    def synthesize(
+        self, text: str, spec: VoiceSpec, model: str, output_path: Path
+    ) -> None:
         payload = {
             "model": model,
             "input": text,
@@ -169,13 +194,17 @@ class VllmOmniTTSBackend:
             payload.update(
                 {
                     "task_type": "Base",
-                    "ref_audio": _audio_data_uri(Path(spec.payload.reference_audio_path)),
+                    "ref_audio": _audio_data_uri(
+                        Path(spec.payload.reference_audio_path)
+                    ),
                     "ref_text": _resolve_reference_text(spec),
                     "x_vector_only_mode": self.config.providers.vllm_omni.x_vector_only_mode,
                 }
             )
         else:
-            raise RuntimeError(f"vLLM-Omni TTS does not support voice kind: {spec.kind}")
+            raise RuntimeError(
+                f"vLLM-Omni TTS does not support voice kind: {spec.kind}"
+            )
 
         response = self.client.post(
             _vllm_omni_speech_url(self.config),
@@ -197,7 +226,9 @@ class QwenLocalTTSBackend:
         self.device = self._resolve_device()
         self._prompt_cache: dict[str, object] = {}
 
-    def synthesize(self, text: str, spec: VoiceSpec, model: str, output_path: Path) -> None:
+    def synthesize(
+        self, text: str, spec: VoiceSpec, model: str, output_path: Path
+    ) -> None:
         if isinstance(spec, PresetVoiceSpec):
             self._synthesize_preset(text, spec, output_path)
             return
@@ -206,8 +237,12 @@ class QwenLocalTTSBackend:
             return
         raise RuntimeError(f"Qwen local TTS does not support voice kind: {spec.kind}")
 
-    def _synthesize_preset(self, text: str, spec: PresetVoiceSpec, output_path: Path) -> None:
-        model = self._load_model("customvoice", self.config.providers.qwen_local.preset_model_size)
+    def _synthesize_preset(
+        self, text: str, spec: PresetVoiceSpec, output_path: Path
+    ) -> None:
+        model = self._load_model(
+            "customvoice", self.config.providers.qwen_local.preset_model_size
+        )
         wavs, sample_rate = model.generate_custom_voice(
             text=text,
             language=self.config.providers.qwen_local.language,
@@ -216,8 +251,12 @@ class QwenLocalTTSBackend:
         )
         _write_wav(output_path, wavs[0], sample_rate)
 
-    def _synthesize_clone(self, text: str, spec: ReferenceCloneSpec, output_path: Path) -> None:
-        model = self._load_model("base", self.config.providers.qwen_local.clone_model_size)
+    def _synthesize_clone(
+        self, text: str, spec: ReferenceCloneSpec, output_path: Path
+    ) -> None:
+        model = self._load_model(
+            "base", self.config.providers.qwen_local.clone_model_size
+        )
         prompt = self._voice_prompt(model, spec)
         wavs, sample_rate = model.generate_voice_clone(
             text=text,
@@ -243,7 +282,11 @@ class QwenLocalTTSBackend:
 
     def _load_model(self, kind: str, size: str) -> object:
         normalized_size = _normalize_qwen_model_size(size)
-        if self.model is not None and self.model_kind == kind and self.model_size == normalized_size:
+        if (
+            self.model is not None
+            and self.model_kind == kind
+            and self.model_size == normalized_size
+        ):
             return self.model
         self._unload_model()
         repo = _qwen_local_model_repo(kind, normalized_size)
@@ -258,14 +301,18 @@ class QwenLocalTTSBackend:
             import torch
             from qwen_tts import Qwen3TTSModel
         except ImportError as exc:
-            raise RuntimeError(f"qwen-local dependencies are not installed. {QWEN_LOCAL_INSTALL_HINT}") from exc
+            raise RuntimeError(
+                f"qwen-local dependencies are not installed. {QWEN_LOCAL_INSTALL_HINT}"
+            ) from exc
 
         if self.device == "cpu":
             kwargs = {"dtype": torch.float32, "low_cpu_mem_usage": False}
         else:
             kwargs = {
                 "device_map": self.device,
-                "dtype": _resolve_qwen_local_torch_dtype(torch, self.config.providers.qwen_local.torch_dtype, self.device),
+                "dtype": _resolve_qwen_local_torch_dtype(
+                    torch, self.config.providers.qwen_local.torch_dtype, self.device
+                ),
             }
             attn_implementation = _resolve_qwen_local_attn_implementation(
                 self.config.providers.qwen_local.attn_implementation
@@ -363,36 +410,51 @@ def synthesize_segments(
         cache_store,
         fingerprints,
         progress_callback=(
-            lambda completed, total, message: progress_callback(completed, max(total, 1), message)
-            if progress_callback is not None
-            else None
+            lambda completed, total, message: (
+                progress_callback(completed, max(total, 1), message)
+                if progress_callback is not None
+                else None
+            )
         ),
     )
     if progress_callback is not None and config.tts.normalized_mode() != "clone":
         progress_callback(0, stage_total, "Using preset voices")
 
-    tts_config_fingerprint = fingerprints.hash_config_subset(config, TTS_CONFIG_KEYS) if fingerprints else ""
+    tts_config_fingerprint = (
+        fingerprints.hash_config_subset(config, TTS_CONFIG_KEYS) if fingerprints else ""
+    )
     processed_segments = 0
     work_items: dict[str, _SynthesisWorkItem] = {}
 
     for index, segment in enumerate(segments):
         audio_path = _segment_audio_path(paths, segment)
-        if segment.tts_audio_path and Path(segment.tts_audio_path).exists() and segment.status == "completed":
-            processed_segments += 1
-            _emit_segment_progress(progress_callback, processed_segments, stage_total, "Reusing audio")
-            continue
-        if audio_path.exists() and audio_path.stat().st_size > 0:
-            _mark_segment_completed(segment, audio_path, int(probe_duration(FFPROBE_COMMAND, audio_path) * 1000))
+        existing_audio_paths = _existing_tts_audio_paths(segment, audio_path)
+        reused_audio = False
+        for existing_audio_path in existing_audio_paths:
+            duration_ms = _valid_tts_duration_or_none(existing_audio_path)
+            if duration_ms is None:
+                _discard_invalid_tts_audio(existing_audio_path)
+                _reset_segment_tts_state(segment)
+                write_json(output_path, segments)
+                continue
+            _mark_segment_completed(segment, existing_audio_path, duration_ms)
             write_json(output_path, segments)
             processed_segments += 1
-            _emit_segment_progress(progress_callback, processed_segments, stage_total, "Reusing audio")
+            _emit_segment_progress(
+                progress_callback, processed_segments, stage_total, "Reusing audio"
+            )
+            reused_audio = True
+            break
+        if reused_audio:
             continue
         if not segment.text_zh.strip():
             segment.status = "failed"
             segment.error = "Missing translated text."
             write_json(output_path, segments)
             processed_segments += 1
-            _emit_segment_progress(progress_callback, processed_segments, stage_total, "Skipping segment")
+            _emit_segment_progress(
+                progress_callback, processed_segments, stage_total, "Skipping segment"
+            )
             continue
 
         target = voice_targets.get(segment.speaker)
@@ -410,10 +472,15 @@ def synthesize_segments(
                         "Skipping UNKNOWN speaker",
                     )
                     continue
-                raise RuntimeError(f"Missing resolved clone voice target for {segment.speaker}.")
+                raise RuntimeError(
+                    f"Missing resolved clone voice target for {segment.speaker}."
+                )
             target = ResolvedVoiceTarget(
                 speaker=segment.speaker,
-                spec=PresetVoiceSpec(identity=f"preset:{segment.voice.strip()}", voice_name=segment.voice.strip()),
+                spec=PresetVoiceSpec(
+                    identity=f"preset:{segment.voice.strip()}",
+                    voice_name=segment.voice.strip(),
+                ),
             )
 
         model = _resolve_tts_model(config, target.spec)
@@ -422,11 +489,20 @@ def synthesize_segments(
             entry = cache_store.lookup("tts", cache_key)
             if entry is not None:
                 cache_store.restore(entry, {"audio": audio_path})
-                _mark_segment_completed(segment, audio_path, int(probe_duration(FFPROBE_COMMAND, audio_path) * 1000))
-                write_json(output_path, segments)
-                processed_segments += 1
-                _emit_segment_progress(progress_callback, processed_segments, stage_total, "Restored cached audio")
-                continue
+                duration_ms = _valid_tts_duration_or_none(audio_path)
+                if duration_ms is not None:
+                    _mark_segment_completed(segment, audio_path, duration_ms)
+                    write_json(output_path, segments)
+                    processed_segments += 1
+                    _emit_segment_progress(
+                        progress_callback,
+                        processed_segments,
+                        stage_total,
+                        "Restored cached audio",
+                    )
+                    continue
+                _discard_invalid_tts_audio(audio_path)
+                remove_path(entry.entry_dir)
 
         work_key = _tts_work_key(segment, target.spec, model)
         work_item = work_items.get(work_key)
@@ -439,7 +515,9 @@ def synthesize_segments(
                 cache_key=cache_key,
             )
             work_items[work_key] = work_item
-        work_item.segments.append(_PendingSegment(segment_index=index, audio_path=audio_path))
+        work_item.segments.append(
+            _PendingSegment(segment_index=index, audio_path=audio_path)
+        )
 
     if work_items:
         max_workers = _synthesis_worker_count(config, len(work_items))
@@ -468,8 +546,7 @@ def synthesize_segments(
             if isinstance(payload, BaseException):
                 for pending in item.segments:
                     segment = segments[pending.segment_index]
-                    segment.status = "failed"
-                    segment.error = str(payload)
+                    _mark_segment_failed(segment, str(payload))
                     processed_segments += 1
             else:
                 if item.cache_key and cache_store and fingerprints:
@@ -477,13 +554,24 @@ def synthesize_segments(
                         "tts",
                         item.cache_key,
                         {"audio": payload.output_path},
-                        _build_tts_manifest(item.text_zh, item.target.spec, item.model, item.cache_key, tts_config_fingerprint, fingerprints),
+                        _build_tts_manifest(
+                            item.text_zh,
+                            item.target.spec,
+                            item.model,
+                            item.cache_key,
+                            tts_config_fingerprint,
+                            fingerprints,
+                        ),
                     )
                 for pending in item.segments:
                     destination = pending.audio_path
                     if destination.resolve() != payload.output_path.resolve():
                         copy_path(payload.output_path, destination)
-                    _mark_segment_completed(segments[pending.segment_index], destination, payload.duration_ms)
+                    _mark_segment_completed(
+                        segments[pending.segment_index],
+                        destination,
+                        payload.duration_ms,
+                    )
                     processed_segments += 1
             write_json(output_path, segments)
             _emit_segment_progress(
@@ -505,7 +593,9 @@ def synthesize_segments(
                 handle_outcome(outcome)
         except KeyboardInterrupt:
             stop_event.set()
-            completed_items += _drain_ready_synthesis_outcomes(result_queue, handle_outcome)
+            completed_items += _drain_ready_synthesis_outcomes(
+                result_queue, handle_outcome
+            )
             raise
         finally:
             stop_event.set()
@@ -528,8 +618,12 @@ def build_tts_backend(config: AppConfig) -> TTSBackend:
     else:
         raise RuntimeError(f"Unsupported TTS provider: {config.tts.provider}")
 
-    if config.tts.normalized_mode() == "clone" and not (backend.supported_voice_kinds & CLONE_VOICE_KINDS):
-        raise RuntimeError(f"Clone mode is not supported for TTS provider: {config.tts.provider}")
+    if config.tts.normalized_mode() == "clone" and not (
+        backend.supported_voice_kinds & CLONE_VOICE_KINDS
+    ):
+        raise RuntimeError(
+            f"Clone mode is not supported for TTS provider: {config.tts.provider}"
+        )
     return backend
 
 
@@ -554,8 +648,12 @@ def _resolve_voice_targets(
         raise RuntimeError("Clone mode requires source audio.")
     resolved_source_audio = source_audio.resolve()
     if not resolved_source_audio.exists():
-        raise RuntimeError(f"Source audio not found for clone mode: {resolved_source_audio}")
-    return VoiceResolver(config, paths, cache_store=cache_store, fingerprints=fingerprints).resolve_voice_targets(
+        raise RuntimeError(
+            f"Source audio not found for clone mode: {resolved_source_audio}"
+        )
+    return VoiceResolver(
+        config, paths, cache_store=cache_store, fingerprints=fingerprints
+    ).resolve_voice_targets(
         segments,
         resolved_source_audio,
         source_audio_fingerprint=source_audio_fingerprint,
@@ -574,15 +672,76 @@ def _emit_segment_progress(
     progress_callback(completed, stage_total, action)
 
 
-def _mark_segment_completed(segment: SegmentRecord, audio_path: Path, duration_ms: int) -> None:
+def _mark_segment_completed(
+    segment: SegmentRecord, audio_path: Path, duration_ms: int
+) -> None:
     segment.tts_audio_path = str(audio_path.resolve())
     segment.tts_duration_ms = duration_ms
     segment.status = "completed"
     segment.error = None
 
 
+def _mark_segment_failed(segment: SegmentRecord, error: str) -> None:
+    _reset_segment_tts_state(segment)
+    segment.status = "failed"
+    segment.error = error
+
+
+def _reset_segment_tts_state(segment: SegmentRecord) -> None:
+    segment.tts_audio_path = ""
+    segment.tts_duration_ms = 0
+    segment.status = "pending"
+    segment.error = None
+
+
 def _segment_audio_path(paths: ArtifactPaths, segment: SegmentRecord) -> Path:
     return paths.tts_dir / f"{segment.segment_id}_{segment.speaker}.wav"
+
+
+def _existing_tts_audio_paths(
+    segment: SegmentRecord, default_audio_path: Path
+) -> list[Path]:
+    candidates: list[Path] = []
+    if segment.tts_audio_path and segment.status == "completed":
+        candidates.append(Path(segment.tts_audio_path))
+    candidates.append(default_audio_path)
+
+    existing_paths: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if candidate.exists():
+            existing_paths.append(candidate)
+    return existing_paths
+
+
+def _valid_tts_duration_or_none(audio_path: Path) -> int | None:
+    try:
+        return _validated_tts_duration_ms(audio_path)
+    except RuntimeError:
+        return None
+
+
+def _validated_tts_duration_ms(audio_path: Path) -> int:
+    try:
+        if not audio_path.exists():
+            raise RuntimeError("file does not exist")
+        if audio_path.stat().st_size <= 0:
+            raise RuntimeError("file is empty")
+        return int(probe_duration(FFPROBE_COMMAND, audio_path) * 1000)
+    except Exception as exc:
+        raise RuntimeError(f"{audio_path}: invalid TTS audio ({exc})") from exc
+
+
+def _discard_invalid_tts_audio(audio_path: Path) -> None:
+    if audio_path.exists() and audio_path.is_file():
+        audio_path.unlink()
 
 
 def _tts_work_key(segment: SegmentRecord, spec: VoiceSpec, model: str) -> str:
@@ -597,10 +756,16 @@ def _tts_work_key(segment: SegmentRecord, spec: VoiceSpec, model: str) -> str:
     )
 
 
-def _synthesize_work_item(backend: TTSBackend, item: _SynthesisWorkItem) -> _SynthesisResult:
+def _synthesize_work_item(
+    backend: TTSBackend, item: _SynthesisWorkItem
+) -> _SynthesisResult:
     _ensure_backend_supports_spec(backend, item.target.spec)
     backend.synthesize(item.text_zh, item.target.spec, item.model, item.output_path)
-    duration_ms = int(probe_duration(FFPROBE_COMMAND, item.output_path) * 1000)
+    try:
+        duration_ms = _validated_tts_duration_ms(item.output_path)
+    except RuntimeError:
+        _discard_invalid_tts_audio(item.output_path)
+        raise
     return _SynthesisResult(output_path=item.output_path, duration_ms=duration_ms)
 
 
@@ -624,8 +789,12 @@ def _synthesis_worker(
         try:
             if backend is None:
                 backend = build_tts_backend(config)
-            payload: _SynthesisResult | BaseException = _synthesize_work_item(backend, item)
-        except BaseException as exc:  # pragma: no cover - exercised through main-thread handling
+            payload: _SynthesisResult | BaseException = _synthesize_work_item(
+                backend, item
+            )
+        except (
+            BaseException
+        ) as exc:  # pragma: no cover - exercised through main-thread handling
             payload = exc
         result_queue.put(_SynthesisWorkerOutcome(item=item, payload=payload))
         work_queue.task_done()
@@ -748,7 +917,9 @@ def _resolve_reference_text(spec: ReferenceCloneSpec) -> str:
     if spec.payload.reference_text.strip():
         return spec.payload.reference_text
     if spec.payload.reference_text_path.strip():
-        return Path(spec.payload.reference_text_path).read_text(encoding="utf-8").strip()
+        return (
+            Path(spec.payload.reference_text_path).read_text(encoding="utf-8").strip()
+        )
     raise RuntimeError("reference_clone specs require reference text.")
 
 
@@ -774,7 +945,9 @@ def _synthesis_worker_count(config: AppConfig, work_item_count: int) -> int:
 def _normalize_qwen_model_size(size: str) -> str:
     normalized = size.strip() or "0.6B"
     if normalized not in QWEN_LOCAL_BASE_MODELS:
-        raise RuntimeError(f"Unsupported qwen-local model size: {size}. Expected one of: 0.6B, 1.7B")
+        raise RuntimeError(
+            f"Unsupported qwen-local model size: {size}. Expected one of: 0.6B, 1.7B"
+        )
     return normalized
 
 
@@ -792,7 +965,10 @@ def _resolve_qwen_local_torch_dtype(torch: object, value: str, device: str) -> o
         return torch.bfloat16
     if normalized in {"float32", "fp32", "full"}:
         return torch.float32
-    raise RuntimeError("Unsupported qwen-local torch_dtype: " f"{value}. Expected one of: auto, float16, bfloat16, float32")
+    raise RuntimeError(
+        "Unsupported qwen-local torch_dtype: "
+        f"{value}. Expected one of: auto, float16, bfloat16, float32"
+    )
 
 
 def _qwen_local_bf16_supported(torch: object) -> bool:
@@ -817,7 +993,9 @@ def _resolve_qwen_local_attn_implementation(value: str) -> str:
     return normalized
 
 
-def _qwen_local_from_pretrained(model_cls: object, repo: str, kwargs: dict[str, object]) -> object:
+def _qwen_local_from_pretrained(
+    model_cls: object, repo: str, kwargs: dict[str, object]
+) -> object:
     candidates = [dict(kwargs)]
     if "attn_implementation" in kwargs:
         without_attn = dict(kwargs)
@@ -836,7 +1014,9 @@ def _qwen_local_from_pretrained(model_cls: object, repo: str, kwargs: dict[str, 
     return model_cls.from_pretrained(repo, **kwargs)
 
 
-def _qwen_local_dtype_key_candidates(kwargs: dict[str, object]) -> list[dict[str, object]]:
+def _qwen_local_dtype_key_candidates(
+    kwargs: dict[str, object],
+) -> list[dict[str, object]]:
     candidates = [dict(kwargs)]
     if "dtype" in kwargs:
         compatible = dict(kwargs)
@@ -857,7 +1037,9 @@ def _write_wav(output_path: Path, audio: object, sample_rate: int) -> None:
     try:
         import soundfile as sf
     except ImportError as exc:
-        raise RuntimeError(f"qwen-local dependencies are not installed. {QWEN_LOCAL_INSTALL_HINT}") from exc
+        raise RuntimeError(
+            f"qwen-local dependencies are not installed. {QWEN_LOCAL_INSTALL_HINT}"
+        ) from exc
     buffer = io.BytesIO()
     sf.write(buffer, audio, sample_rate, format="WAV")
     atomic_write_bytes(output_path, buffer.getvalue())

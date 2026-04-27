@@ -9,7 +9,12 @@ import pytest
 
 from podtran.artifacts import ArtifactPaths, read_model_list, write_json
 from podtran.cache_store import CacheStore
-from podtran.config import AppConfig, DEFAULT_TTS_CLONE_MODEL, DEFAULT_TTS_PRESET_MODEL, TTSConfig
+from podtran.config import (
+    AppConfig,
+    DEFAULT_TTS_CLONE_MODEL,
+    DEFAULT_TTS_PRESET_MODEL,
+    TTSConfig,
+)
 from podtran.fingerprints import FingerprintService
 from podtran.models import (
     PresetVoiceSpec,
@@ -49,7 +54,9 @@ class _DummyBackend:
 class _TrackingBackend:
     supported_voice_kinds = frozenset({"preset", "provider_clone", "reference_clone"})
 
-    def __init__(self, *, fail_texts: set[str] | None = None, sleep_seconds: float = 0.05) -> None:
+    def __init__(
+        self, *, fail_texts: set[str] | None = None, sleep_seconds: float = 0.05
+    ) -> None:
         self.calls = 0
         self.active_calls = 0
         self.max_active_calls = 0
@@ -105,8 +112,17 @@ def _segment() -> SegmentRecord:
     )
 
 
-def _segment_with_text(segment_id: str, text_zh: str, voice: str = "Cherry") -> SegmentRecord:
-    return _segment().model_copy(update={"segment_id": segment_id, "block_id": f"block_{segment_id}", "text_zh": text_zh, "voice": voice})
+def _segment_with_text(
+    segment_id: str, text_zh: str, voice: str = "Cherry"
+) -> SegmentRecord:
+    return _segment().model_copy(
+        update={
+            "segment_id": segment_id,
+            "block_id": f"block_{segment_id}",
+            "text_zh": text_zh,
+            "voice": voice,
+        }
+    )
 
 
 def test_resolve_tts_model_switches_between_clone_and_preset_specs() -> None:
@@ -147,7 +163,9 @@ def test_resolve_tts_model_uses_qwen_local_model_identity() -> None:
     assert _resolve_tts_model(config, preset_spec) == "qwen-local:customvoice:0.6B"
 
 
-def test_build_tts_backend_rejects_clone_mode_for_backend_without_clone_capability() -> None:
+def test_build_tts_backend_rejects_clone_mode_for_backend_without_clone_capability() -> (
+    None
+):
     config = AppConfig(tts=TTSConfig(provider="openai-compatible", mode="clone"))
 
     with pytest.raises(RuntimeError, match="Clone mode is not supported"):
@@ -184,13 +202,17 @@ def test_build_tts_backend_rejects_legacy_openai_compatible_provider_name() -> N
         build_tts_backend(config)
 
 
-def test_resolve_openai_compatible_api_key_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_openai_compatible_api_key_reads_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("PODTRAN_TTS_API_KEY", "env-key")
 
     assert _resolve_openai_compatible_api_key() == "env-key"
 
 
-def test_resolve_vllm_omni_api_key_prefers_config_then_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_vllm_omni_api_key_prefers_config_then_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = AppConfig(providers={"vllm_omni": {"api_key": "config-key"}})
     monkeypatch.setenv("PODTRAN_VLLM_OMNI_API_KEY", "env-key")
 
@@ -223,7 +245,9 @@ def test_vllm_omni_backend_sends_custom_voice_request_body(tmp_path: Path) -> No
             return None
 
     class _Client:
-        def post(self, url: str, headers: dict[str, str], json: dict[str, object]) -> _Response:
+        def post(
+            self, url: str, headers: dict[str, str], json: dict[str, object]
+        ) -> _Response:
             captured["url"] = url
             captured["headers"] = headers
             captured["json"] = json
@@ -231,7 +255,12 @@ def test_vllm_omni_backend_sends_custom_voice_request_body(tmp_path: Path) -> No
 
     backend.client = _Client()  # type: ignore[assignment]
 
-    backend.synthesize("你好", PresetVoiceSpec(identity="preset:vivian", voice_name="vivian"), "Qwen/Qwen3-TTS", output_path)
+    backend.synthesize(
+        "你好",
+        PresetVoiceSpec(identity="preset:vivian", voice_name="vivian"),
+        "Qwen/Qwen3-TTS",
+        output_path,
+    )
 
     assert output_path.read_bytes() == b"wav"
     assert captured["url"] == "http://localhost:8091/v1/audio/speech"
@@ -247,7 +276,9 @@ def test_vllm_omni_backend_sends_custom_voice_request_body(tmp_path: Path) -> No
     }
 
 
-def test_vllm_omni_backend_sends_base_clone_request_body_without_auth_when_key_missing(tmp_path: Path) -> None:
+def test_vllm_omni_backend_sends_base_clone_request_body_without_auth_when_key_missing(
+    tmp_path: Path,
+) -> None:
     reference_audio = tmp_path / "reference.wav"
     reference_audio.write_bytes(b"wav")
     config = AppConfig(
@@ -275,7 +306,9 @@ def test_vllm_omni_backend_sends_base_clone_request_body_without_auth_when_key_m
             return None
 
     class _Client:
-        def post(self, url: str, headers: dict[str, str], json: dict[str, object]) -> _Response:
+        def post(
+            self, url: str, headers: dict[str, str], json: dict[str, object]
+        ) -> _Response:
             captured["url"] = url
             captured["headers"] = headers
             captured["json"] = json
@@ -304,7 +337,9 @@ def test_vllm_omni_backend_sends_base_clone_request_body_without_auth_when_key_m
     assert str(payload["ref_audio"]).startswith("data:audio/")
 
 
-def test_synthesize_segments_requires_source_audio_in_clone_mode(tmp_path: Path) -> None:
+def test_synthesize_segments_requires_source_audio_in_clone_mode(
+    tmp_path: Path,
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     write_json(paths.translated_json, [_segment()])
@@ -314,7 +349,9 @@ def test_synthesize_segments_requires_source_audio_in_clone_mode(tmp_path: Path)
         synthesize_segments(paths.translated_json, paths.translated_json, config, paths)
 
 
-def test_synthesize_segments_raises_when_clone_voice_target_is_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_raises_when_clone_voice_target_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     write_json(paths.translated_json, [_segment()])
@@ -327,10 +364,18 @@ def test_synthesize_segments_raises_when_clone_voice_target_is_missing(tmp_path:
     )
 
     with pytest.raises(RuntimeError, match="Missing resolved clone voice target"):
-        synthesize_segments(paths.translated_json, paths.translated_json, config, paths, source_audio=tmp_path / "source.wav")
+        synthesize_segments(
+            paths.translated_json,
+            paths.translated_json,
+            config,
+            paths,
+            source_audio=tmp_path / "source.wav",
+        )
 
 
-def test_synthesize_segments_skips_unknown_speaker_in_clone_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_skips_unknown_speaker_in_clone_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     source_audio = tmp_path / "source.wav"
@@ -350,7 +395,10 @@ def test_synthesize_segments_skips_unknown_speaker_in_clone_mode(tmp_path: Path,
     )
     config = AppConfig(tts=TTSConfig(mode="clone"))
 
-    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: pytest.fail("TTS backend should not be used for UNKNOWN speaker"))
+    monkeypatch.setattr(
+        "podtran.tts.build_tts_backend",
+        lambda cfg: pytest.fail("TTS backend should not be used for UNKNOWN speaker"),
+    )
 
     synthesized = synthesize_segments(
         paths.translated_json,
@@ -365,7 +413,9 @@ def test_synthesize_segments_skips_unknown_speaker_in_clone_mode(tmp_path: Path,
     assert synthesized[0].error == UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE
 
 
-def test_synthesize_segments_reuses_shared_tts_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_reuses_shared_tts_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     first_paths = _paths(tmp_path, "task-1")
     second_paths = _paths(tmp_path, "task-2")
     first_paths.ensure()
@@ -404,13 +454,96 @@ def test_synthesize_segments_reuses_shared_tts_cache(tmp_path: Path, monkeypatch
     assert Path(second_segments[0].tts_audio_path).exists()
 
 
-def test_synthesize_segments_does_not_reuse_shared_tts_cache_when_preset_voice_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_discards_invalid_existing_audio_and_regenerates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segment = _segment().model_copy(
+        update={
+            "status": "completed",
+            "tts_audio_path": str(paths.tts_dir / "seg_1_SPEAKER_00.wav"),
+            "tts_duration_ms": 1000,
+        }
+    )
+    write_json(paths.translated_json, [segment])
+    bad_audio = paths.tts_dir / "seg_1_SPEAKER_00.wav"
+    bad_audio.write_bytes(b"null")
+    backend = _DummyBackend()
+
+    def probe_valid_audio(ffprobe_path: str, path: Path) -> float:
+        _ = ffprobe_path
+        if path.read_bytes() == b"null":
+            raise RuntimeError("Invalid data found when processing input")
+        return 1.0
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", probe_valid_audio)
+
+    synthesized = synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(tts=TTSConfig(mode="preset")),
+        paths,
+    )
+
+    assert backend.calls == 1
+    assert bad_audio.read_bytes() == b"wav"
+    assert synthesized[0].status == "completed"
+    assert synthesized[0].tts_audio_path == str(bad_audio.resolve())
+
+
+def test_synthesize_segments_removes_invalid_new_audio_and_marks_segment_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    write_json(paths.translated_json, [_segment()])
+
+    class _InvalidAudioBackend:
+        supported_voice_kinds = frozenset({"preset"})
+
+        def synthesize(self, text: str, spec, model: str, output_path: Path) -> None:
+            _ = (text, spec, model)
+            output_path.write_bytes(b"null")
+
+    monkeypatch.setattr(
+        "podtran.tts.build_tts_backend", lambda cfg: _InvalidAudioBackend()
+    )
+    monkeypatch.setattr(
+        "podtran.tts.probe_duration",
+        lambda ffprobe_path, path: (_ for _ in ()).throw(
+            RuntimeError("Invalid data found when processing input")
+        ),
+    )
+
+    synthesized = synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(tts=TTSConfig(mode="preset")),
+        paths,
+    )
+
+    assert not (paths.tts_dir / "seg_1_SPEAKER_00.wav").exists()
+    assert synthesized[0].status == "failed"
+    assert synthesized[0].tts_audio_path == ""
+    assert "invalid TTS audio" in str(synthesized[0].error)
+
+
+def test_synthesize_segments_does_not_reuse_shared_tts_cache_when_preset_voice_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     first_paths = _paths(tmp_path, "task-1")
     second_paths = _paths(tmp_path, "task-2")
     first_paths.ensure()
     second_paths.ensure()
     write_json(first_paths.translated_json, [_segment()])
-    write_json(second_paths.translated_json, [_segment().model_copy(update={"voice": "Serena"})])
+    write_json(
+        second_paths.translated_json,
+        [_segment().model_copy(update={"voice": "Serena"})],
+    )
 
     config = AppConfig(tts=TTSConfig(mode="preset"))
     cache_store = CacheStore(first_paths.cache_dir)
@@ -440,7 +573,9 @@ def test_synthesize_segments_does_not_reuse_shared_tts_cache_when_preset_voice_c
     assert backend.calls == 2
 
 
-def test_synthesize_segments_reports_progress_for_preset_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_reports_progress_for_preset_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     segments = [_segment(), _segment().model_copy(update={"segment_id": "seg_2"})]
@@ -455,7 +590,9 @@ def test_synthesize_segments_reports_progress_for_preset_mode(tmp_path: Path, mo
         paths.translated_json,
         AppConfig(tts=TTSConfig(mode="preset")),
         paths,
-        progress_callback=lambda completed, total, message: events.append((completed, total, message)),
+        progress_callback=lambda completed, total, message: events.append(
+            (completed, total, message)
+        ),
     )
 
     assert events[0][2] == "Resolving voices"
@@ -488,7 +625,15 @@ def test_synthesize_segments_reports_clone_voice_progress_without_advancing_segm
         fingerprints,
         progress_callback=None,
     ):
-        _ = (config, paths, segments, source_audio, source_audio_fingerprint, cache_store, fingerprints)
+        _ = (
+            config,
+            paths,
+            segments,
+            source_audio,
+            source_audio_fingerprint,
+            cache_store,
+            fingerprints,
+        )
         if progress_callback is not None:
             progress_callback(1, 3, "Enrolled voice for SPEAKER_00")
         return {
@@ -508,17 +653,26 @@ def test_synthesize_segments_reports_clone_voice_progress_without_advancing_segm
         AppConfig(tts=TTSConfig(mode="clone")),
         paths,
         source_audio=source_audio,
-        progress_callback=lambda completed, total, message: events.append((completed, total, message)),
+        progress_callback=lambda completed, total, message: events.append(
+            (completed, total, message)
+        ),
     )
 
-    voice_event = next(event for event in events if event[2] == "Enrolled voice for SPEAKER_00")
+    voice_event = next(
+        event for event in events if event[2] == "Enrolled voice for SPEAKER_00"
+    )
     assert voice_event == (1, 3, "Enrolled voice for SPEAKER_00")
     assert events[-1] == (len(segments), len(segments), "Synthesis complete")
     assert any(event == (1, 3, "Enrolled voice for SPEAKER_00") for event in events)
-    assert any(event == (len(segments), len(segments), "Synthesizing audio") for event in events)
+    assert any(
+        event == (len(segments), len(segments), "Synthesizing audio")
+        for event in events
+    )
 
 
-def test_synthesize_segments_runs_distinct_work_items_concurrently(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_runs_distinct_work_items_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     segments = [
@@ -544,7 +698,9 @@ def test_synthesize_segments_runs_distinct_work_items_concurrently(tmp_path: Pat
     assert all(item.status == "completed" for item in synthesized)
 
 
-def test_synthesize_segments_deduplicates_identical_work_items(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_deduplicates_identical_work_items(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     segments = [
@@ -573,7 +729,9 @@ def test_synthesize_segments_deduplicates_identical_work_items(tmp_path: Path, m
     assert Path(synthesized[1].tts_audio_path).exists()
 
 
-def test_synthesize_segments_isolates_worker_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_isolates_worker_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     segments = [
@@ -599,7 +757,9 @@ def test_synthesize_segments_isolates_worker_failures(tmp_path: Path, monkeypatc
     assert synthesized[1].error == "boom: bad"
 
 
-def test_synthesize_segments_respects_max_concurrency_of_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_respects_max_concurrency_of_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     segments = [
@@ -623,7 +783,9 @@ def test_synthesize_segments_respects_max_concurrency_of_one(tmp_path: Path, mon
     assert backend.max_active_calls == 1
 
 
-def test_synthesize_segments_forces_qwen_local_concurrency_to_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_forces_qwen_local_concurrency_to_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     segments = [
@@ -639,7 +801,9 @@ def test_synthesize_segments_forces_qwen_local_concurrency_to_one(tmp_path: Path
     synthesize_segments(
         paths.translated_json,
         paths.translated_json,
-        AppConfig(tts=TTSConfig(provider="qwen-local", mode="preset", max_concurrency=4)),
+        AppConfig(
+            tts=TTSConfig(provider="qwen-local", mode="preset", max_concurrency=4)
+        ),
         paths,
     )
 
@@ -647,7 +811,9 @@ def test_synthesize_segments_forces_qwen_local_concurrency_to_one(tmp_path: Path
     assert backend.max_active_calls == 1
 
 
-def test_qwen_local_backend_generates_preset_audio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qwen_local_backend_generates_preset_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     calls: list[dict[str, object]] = []
 
     class _Model:
@@ -660,12 +826,24 @@ def test_qwen_local_backend_generates_preset_audio(tmp_path: Path, monkeypatch: 
             calls.append(kwargs)
             return [[0.0, 0.0]], 24000
 
-    monkeypatch.setitem(sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=_Model))
-    monkeypatch.setattr("podtran.tts._write_wav", lambda output_path, audio, sample_rate: output_path.write_bytes(b"wav"))
+    monkeypatch.setitem(
+        sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=_Model)
+    )
+    monkeypatch.setattr(
+        "podtran.tts._write_wav",
+        lambda output_path, audio, sample_rate: output_path.write_bytes(b"wav"),
+    )
 
-    backend = QwenLocalTTSBackend(AppConfig(tts={"provider": "qwen-local", "mode": "preset"}))
+    backend = QwenLocalTTSBackend(
+        AppConfig(tts={"provider": "qwen-local", "mode": "preset"})
+    )
     output_path = tmp_path / "speech.wav"
-    backend.synthesize("你好", PresetVoiceSpec(identity="preset:Vivian", voice_name="Vivian"), "qwen-local:customvoice:0.6B", output_path)
+    backend.synthesize(
+        "你好",
+        PresetVoiceSpec(identity="preset:Vivian", voice_name="Vivian"),
+        "qwen-local:customvoice:0.6B",
+        output_path,
+    )
 
     assert output_path.read_bytes() == b"wav"
     assert calls[0]["repo"] == "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
@@ -673,7 +851,9 @@ def test_qwen_local_backend_generates_preset_audio(tmp_path: Path, monkeypatch: 
     assert calls[1]["language"] == "Chinese"
 
 
-def test_qwen_local_backend_passes_dtype_and_attention_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qwen_local_backend_passes_dtype_and_attention_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import torch
 
     calls: list[dict[str, object]] = []
@@ -688,8 +868,13 @@ def test_qwen_local_backend_passes_dtype_and_attention_config(tmp_path: Path, mo
             calls.append(kwargs)
             return [[0.0, 0.0]], 24000
 
-    monkeypatch.setitem(sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=_Model))
-    monkeypatch.setattr("podtran.tts._write_wav", lambda output_path, audio, sample_rate: output_path.write_bytes(b"wav"))
+    monkeypatch.setitem(
+        sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=_Model)
+    )
+    monkeypatch.setattr(
+        "podtran.tts._write_wav",
+        lambda output_path, audio, sample_rate: output_path.write_bytes(b"wav"),
+    )
 
     backend = QwenLocalTTSBackend(
         AppConfig(
@@ -704,7 +889,12 @@ def test_qwen_local_backend_passes_dtype_and_attention_config(tmp_path: Path, mo
         )
     )
     output_path = tmp_path / "speech.wav"
-    backend.synthesize("你好", PresetVoiceSpec(identity="preset:Vivian", voice_name="Vivian"), "qwen-local:customvoice:0.6B", output_path)
+    backend.synthesize(
+        "你好",
+        PresetVoiceSpec(identity="preset:Vivian", voice_name="Vivian"),
+        "qwen-local:customvoice:0.6B",
+        output_path,
+    )
 
     assert output_path.read_bytes() == b"wav"
     assert calls[0]["repo"] == "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
@@ -751,7 +941,9 @@ def test_qwen_local_auto_dtype_falls_back_to_float16_without_bfloat16() -> None:
     assert _resolve_qwen_local_torch_dtype(fake_torch, "auto", "cuda") == torch.float16
 
 
-def test_qwen_local_backend_generates_clone_audio_and_caches_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qwen_local_backend_generates_clone_audio_and_caches_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     reference_audio = tmp_path / "reference.wav"
     reference_audio.write_bytes(b"ref")
     prompt_calls = 0
@@ -777,10 +969,17 @@ def test_qwen_local_backend_generates_clone_audio_and_caches_prompt(tmp_path: Pa
             assert kwargs["voice_clone_prompt"] == {"prompt": "cached"}
             return [[0.0, 0.0]], 24000
 
-    monkeypatch.setitem(sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=_Model))
-    monkeypatch.setattr("podtran.tts._write_wav", lambda output_path, audio, sample_rate: output_path.write_bytes(b"wav"))
+    monkeypatch.setitem(
+        sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=_Model)
+    )
+    monkeypatch.setattr(
+        "podtran.tts._write_wav",
+        lambda output_path, audio, sample_rate: output_path.write_bytes(b"wav"),
+    )
 
-    backend = QwenLocalTTSBackend(AppConfig(tts={"provider": "qwen-local", "mode": "clone"}))
+    backend = QwenLocalTTSBackend(
+        AppConfig(tts={"provider": "qwen-local", "mode": "clone"})
+    )
     spec = ReferenceCloneSpec(
         identity="qwen-local:reference_clone:ref-1",
         provider="qwen-local",
@@ -804,13 +1003,19 @@ def test_reference_clone_missing_text_error_is_provider_agnostic() -> None:
         payload=ReferenceClonePayload(reference_fingerprint="ref-1"),
     )
 
-    with pytest.raises(RuntimeError, match="reference_clone specs require reference text"):
+    with pytest.raises(
+        RuntimeError, match="reference_clone specs require reference text"
+    ):
         _resolve_reference_text(spec)
 
 
-def test_qwen_local_backend_collects_garbage_when_unloading_model(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qwen_local_backend_collects_garbage_when_unloading_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     collect_calls = 0
-    backend = QwenLocalTTSBackend(AppConfig(tts={"provider": "qwen-local", "mode": "preset"}))
+    backend = QwenLocalTTSBackend(
+        AppConfig(tts={"provider": "qwen-local", "mode": "preset"})
+    )
     backend.model = object()
     backend.model_kind = "base"
     backend.model_size = "0.6B"
@@ -828,9 +1033,13 @@ def test_qwen_local_backend_collects_garbage_when_unloading_model(monkeypatch: p
     assert backend._prompt_cache == {}
 
 
-def test_qwen_local_backend_reports_missing_dependencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qwen_local_backend_reports_missing_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setitem(sys.modules, "qwen_tts", None)
-    backend = QwenLocalTTSBackend(AppConfig(tts={"provider": "qwen-local", "mode": "preset"}))
+    backend = QwenLocalTTSBackend(
+        AppConfig(tts={"provider": "qwen-local", "mode": "preset"})
+    )
 
     with pytest.raises(RuntimeError, match="uv sync --extra qwen-local"):
         backend.synthesize(
@@ -841,7 +1050,9 @@ def test_qwen_local_backend_reports_missing_dependencies(tmp_path: Path, monkeyp
         )
 
 
-def test_synthesize_segments_builds_backend_once_per_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_builds_backend_once_per_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     segments = [
@@ -871,7 +1082,9 @@ def test_synthesize_segments_builds_backend_once_per_worker(tmp_path: Path, monk
     assert backend.calls == 2
 
 
-def test_synthesize_segments_preserves_completed_results_when_worker_interrupts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_preserves_completed_results_when_worker_interrupts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     segments = [
@@ -900,7 +1113,9 @@ def test_synthesize_segments_preserves_completed_results_when_worker_interrupts(
     assert synthesized[1].tts_audio_path == ""
 
 
-def test_synthesize_segments_stops_queued_work_quickly_on_sigint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_synthesize_segments_stops_queued_work_quickly_on_sigint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
     segments = [

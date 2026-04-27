@@ -520,6 +520,12 @@ def synthesize_segments(
         )
 
     if work_items:
+        _emit_segment_progress(
+            progress_callback,
+            processed_segments,
+            stage_total,
+            "Synthesizing audio",
+        )
         max_workers = _synthesis_worker_count(config, len(work_items))
         work_queue: queue.Queue[_SynthesisWorkItem] = queue.Queue()
         result_queue: queue.Queue[_SynthesisWorkerOutcome] = queue.Queue()

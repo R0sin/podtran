@@ -661,7 +661,9 @@ def test_synthesize_segments_reports_clone_voice_progress_without_advancing_segm
     voice_event = next(
         event for event in events if event[2] == "Enrolled voice for SPEAKER_00"
     )
+    voice_index = events.index(voice_event)
     assert voice_event == (1, 3, "Enrolled voice for SPEAKER_00")
+    assert events[voice_index + 1] == (0, len(segments), "Synthesizing audio")
     assert events[-1] == (len(segments), len(segments), "Synthesis complete")
     assert any(event == (1, 3, "Enrolled voice for SPEAKER_00") for event in events)
     assert any(

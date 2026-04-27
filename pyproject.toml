@@ -9,6 +9,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
 ]
 dependencies = [
+    "hf_xet>=1.1",
     "httpx>=0.27",
     "openai>=1.0",
     "pydantic>=2.8",

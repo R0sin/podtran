@@ -2198,6 +2198,7 @@ wheels = [
 name = "podtran"
 source = { editable = "." }
 dependencies = [
+    { name = "hf-xet" },
     { name = "httpx" },
     { name = "openai" },
     { name = "pydantic" },
@@ -2221,6 +2222,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "hf-xet", specifier = ">=1.1" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "openai", specifier = ">=1.0" },
     { name = "pydantic", specifier = ">=2.8" },

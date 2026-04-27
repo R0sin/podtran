@@ -1167,7 +1167,11 @@ def _ensure_synthesize(
         ensure_command(FFMPEG_COMMAND)
         ensure_command(FFPROBE_COMMAND)
         if reporter is not None:
-            reporter.start_stage("synthesize", 1, "Resolving voices")
+            reporter.start_stage(
+                "synthesize",
+                max(len(synthesis_input), 1),
+                "Resolving voices",
+            )
         if not resumable:
             remove_path(paths.tts_dir)
             remove_path(paths.refs_dir)

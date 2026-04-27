@@ -348,10 +348,8 @@ def synthesize_segments(
     segments = _load_resume_segments(input_path, output_path)
     paths.tts_dir.mkdir(parents=True, exist_ok=True)
 
-    speaker_units = _speaker_progress_units(config, segments)
     segment_units = len(segments)
-    stage_total = max(speaker_units + segment_units, 1)
-    segment_offset = speaker_units
+    stage_total = max(segment_units, 1)
 
     if progress_callback is not None:
         progress_callback(0, stage_total, "Resolving voices")
@@ -365,13 +363,13 @@ def synthesize_segments(
         cache_store,
         fingerprints,
         progress_callback=(
-            lambda completed, total, message: progress_callback(min(completed, speaker_units), stage_total, message)
+            lambda completed, total, message: progress_callback(completed, max(total, 1), message)
             if progress_callback is not None
             else None
         ),
     )
-    if progress_callback is not None and speaker_units == 1 and config.tts.normalized_mode() != "clone":
-        progress_callback(1, stage_total, "Using preset voices")
+    if progress_callback is not None and config.tts.normalized_mode() != "clone":
+        progress_callback(0, stage_total, "Using preset voices")
 
     tts_config_fingerprint = fingerprints.hash_config_subset(config, TTS_CONFIG_KEYS) if fingerprints else ""
     processed_segments = 0
@@ -381,20 +379,20 @@ def synthesize_segments(
         audio_path = _segment_audio_path(paths, segment)
         if segment.tts_audio_path and Path(segment.tts_audio_path).exists() and segment.status == "completed":
             processed_segments += 1
-            _emit_segment_progress(progress_callback, segment_offset + processed_segments, stage_total, processed_segments, segment_units, "Reusing audio")
+            _emit_segment_progress(progress_callback, processed_segments, stage_total, "Reusing audio")
             continue
         if audio_path.exists() and audio_path.stat().st_size > 0:
             _mark_segment_completed(segment, audio_path, int(probe_duration(FFPROBE_COMMAND, audio_path) * 1000))
             write_json(output_path, segments)
             processed_segments += 1
-            _emit_segment_progress(progress_callback, segment_offset + processed_segments, stage_total, processed_segments, segment_units, "Reusing audio")
+            _emit_segment_progress(progress_callback, processed_segments, stage_total, "Reusing audio")
             continue
         if not segment.text_zh.strip():
             segment.status = "failed"
             segment.error = "Missing translated text."
             write_json(output_path, segments)
             processed_segments += 1
-            _emit_segment_progress(progress_callback, segment_offset + processed_segments, stage_total, processed_segments, segment_units, "Skipping segment")
+            _emit_segment_progress(progress_callback, processed_segments, stage_total, "Skipping segment")
             continue
 
         target = voice_targets.get(segment.speaker)
@@ -407,10 +405,8 @@ def synthesize_segments(
                     processed_segments += 1
                     _emit_segment_progress(
                         progress_callback,
-                        segment_offset + processed_segments,
-                        stage_total,
                         processed_segments,
-                        segment_units,
+                        stage_total,
                         "Skipping UNKNOWN speaker",
                     )
                     continue
@@ -429,7 +425,7 @@ def synthesize_segments(
                 _mark_segment_completed(segment, audio_path, int(probe_duration(FFPROBE_COMMAND, audio_path) * 1000))
                 write_json(output_path, segments)
                 processed_segments += 1
-                _emit_segment_progress(progress_callback, segment_offset + processed_segments, stage_total, processed_segments, segment_units, "Restored cached audio")
+                _emit_segment_progress(progress_callback, processed_segments, stage_total, "Restored cached audio")
                 continue
 
         work_key = _tts_work_key(segment, target.spec, model)
@@ -492,10 +488,8 @@ def synthesize_segments(
             write_json(output_path, segments)
             _emit_segment_progress(
                 progress_callback,
-                segment_offset + processed_segments,
-                stage_total,
                 processed_segments,
-                segment_units,
+                stage_total,
                 "Synthesizing audio",
             )
 
@@ -569,27 +563,15 @@ def _resolve_voice_targets(
     )
 
 
-def _speaker_progress_units(config: AppConfig, segments: list[SegmentRecord]) -> int:
-    speakers = {segment.speaker for segment in segments}
-    if not speakers:
-        return 0
-    if config.tts.normalized_mode() == "clone":
-        return len(speakers)
-    return 1
-
-
 def _emit_segment_progress(
     progress_callback: StageProgressCallback | None,
     completed: int,
     stage_total: int,
-    processed_segments: int,
-    segment_units: int,
     action: str,
 ) -> None:
     if progress_callback is None:
         return
-    total_segments = max(segment_units, 1)
-    progress_callback(completed, stage_total, f"{action} {processed_segments}/{total_segments}")
+    progress_callback(completed, stage_total, action)
 
 
 def _mark_segment_completed(segment: SegmentRecord, audio_path: Path, duration_ms: int) -> None:

@@ -17,6 +17,7 @@ from podtran.models import (
     ProviderCloneSpec,
     ReferenceClonePayload,
     ReferenceCloneSpec,
+    ResolvedVoiceTarget,
     SegmentRecord,
 )
 from podtran.voices import UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE
@@ -461,6 +462,60 @@ def test_synthesize_segments_reports_progress_for_preset_mode(tmp_path: Path, mo
     assert events[1][2] == "Using preset voices"
     assert events[-1][2] == "Synthesis complete"
     assert events[-1][0] == events[-1][1]
+    assert {event[1] for event in events} == {len(segments)}
+    assert all("/" not in message for _, _, message in events)
+
+
+def test_synthesize_segments_reports_clone_voice_progress_without_advancing_segments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    source_audio = tmp_path / "source.wav"
+    source_audio.write_bytes(b"wav")
+    segments = [_segment(), _segment().model_copy(update={"segment_id": "seg_2"})]
+    write_json(paths.translated_json, segments)
+    events: list[tuple[int, int, str]] = []
+
+    def resolve_voice_targets(
+        config,
+        paths,
+        segments,
+        source_audio,
+        source_audio_fingerprint,
+        cache_store,
+        fingerprints,
+        progress_callback=None,
+    ):
+        _ = (config, paths, segments, source_audio, source_audio_fingerprint, cache_store, fingerprints)
+        if progress_callback is not None:
+            progress_callback(1, 3, "Enrolled voice for SPEAKER_00")
+        return {
+            "SPEAKER_00": ResolvedVoiceTarget(
+                speaker="SPEAKER_00",
+                spec=PresetVoiceSpec(identity="preset:Cherry", voice_name="Cherry"),
+            )
+        }
+
+    monkeypatch.setattr("podtran.tts._resolve_voice_targets", resolve_voice_targets)
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: _DummyBackend())
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(tts=TTSConfig(mode="clone")),
+        paths,
+        source_audio=source_audio,
+        progress_callback=lambda completed, total, message: events.append((completed, total, message)),
+    )
+
+    voice_event = next(event for event in events if event[2] == "Enrolled voice for SPEAKER_00")
+    assert voice_event == (1, 3, "Enrolled voice for SPEAKER_00")
+    assert events[-1] == (len(segments), len(segments), "Synthesis complete")
+    assert any(event == (1, 3, "Enrolled voice for SPEAKER_00") for event in events)
+    assert any(event == (len(segments), len(segments), "Synthesizing audio") for event in events)
 
 
 def test_synthesize_segments_runs_distinct_work_items_concurrently(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

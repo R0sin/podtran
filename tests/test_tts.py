@@ -337,6 +337,54 @@ def test_vllm_omni_backend_sends_base_clone_request_body_without_auth_when_key_m
     assert str(payload["ref_audio"]).startswith("data:audio/")
 
 
+def test_vllm_omni_backend_prefers_reference_clone_x_vector_flag(
+    tmp_path: Path,
+) -> None:
+    reference_audio = tmp_path / "reference.wav"
+    reference_audio.write_bytes(b"wav")
+    config = AppConfig(
+        tts={"provider": "vllm-omni", "mode": "clone"},
+        providers={
+            "vllm_omni": {
+                "base_url": "http://localhost:8091/v1",
+                "x_vector_only_mode": True,
+            }
+        },
+    )
+    backend = VllmOmniTTSBackend(config)
+    captured: dict[str, object] = {}
+
+    class _Response:
+        content = b"wav"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class _Client:
+        def post(
+            self, url: str, headers: dict[str, str], json: dict[str, object]
+        ) -> _Response:
+            _ = (url, headers)
+            captured["json"] = json
+            return _Response()
+
+    backend.client = _Client()  # type: ignore[assignment]
+    spec = ReferenceCloneSpec(
+        identity="vllm-omni:reference_clone:ref-1:anchor",
+        provider="vllm-omni",
+        payload=ReferenceClonePayload(
+            reference_fingerprint="ref-1",
+            reference_audio_path=str(reference_audio),
+            reference_text="reference text",
+            x_vector_only_mode=False,
+        ),
+    )
+
+    backend.synthesize("你好", spec, "Qwen/Qwen3-TTS-Base", tmp_path / "speech.wav")
+
+    assert captured["json"]["x_vector_only_mode"] is False
+
+
 def test_synthesize_segments_requires_source_audio_in_clone_mode(
     tmp_path: Path,
 ) -> None:
@@ -943,7 +991,7 @@ def test_qwen_local_auto_dtype_falls_back_to_float16_without_bfloat16() -> None:
     assert _resolve_qwen_local_torch_dtype(fake_torch, "auto", "cuda") == torch.float16
 
 
-def test_qwen_local_backend_generates_clone_audio_and_caches_prompt(
+def test_qwen_local_backend_prefers_spec_x_vector_flag_and_caches_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     reference_audio = tmp_path / "reference.wav"
@@ -963,6 +1011,7 @@ def test_qwen_local_backend_generates_clone_audio_and_caches_prompt(
             prompt_calls += 1
             assert kwargs["ref_audio"] == str(reference_audio)
             assert kwargs["ref_text"] == "reference text"
+            assert kwargs["x_vector_only_mode"] is False
             return {"prompt": "cached"}
 
         def generate_voice_clone(self, **kwargs):
@@ -980,7 +1029,10 @@ def test_qwen_local_backend_generates_clone_audio_and_caches_prompt(
     )
 
     backend = QwenLocalTTSBackend(
-        AppConfig(tts={"provider": "qwen-local", "mode": "clone"})
+        AppConfig(
+            tts={"provider": "qwen-local", "mode": "clone"},
+            providers={"qwen_local": {"x_vector_only_mode": True}},
+        )
     )
     spec = ReferenceCloneSpec(
         identity="qwen-local:reference_clone:ref-1",
@@ -989,6 +1041,7 @@ def test_qwen_local_backend_generates_clone_audio_and_caches_prompt(
             reference_fingerprint="ref-1",
             reference_audio_path=str(reference_audio),
             reference_text="reference text",
+            x_vector_only_mode=False,
         ),
     )
     backend.synthesize("你好一", spec, "qwen-local:base:0.6B", tmp_path / "one.wav")

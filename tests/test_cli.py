@@ -191,6 +191,7 @@ def test_init_prompts_for_provider_managed_config_and_writes_defaults(
     assert config.translation.provider == "google-free"
     assert config.providers.openai_compatible.translation_model == "qwen-flash"
     assert config.tts.provider == "dashscope"
+    assert config.tts.mode == "auto"
     assert config.providers.dashscope.tts_clone_model == "qwen3-tts-vc-2026-01-22"
     assert (tmp_path / "artifacts").exists()
     assert "speaker-diarization-community-1" in result.output
@@ -209,7 +210,8 @@ def test_init_can_write_openai_compatible_tts_provider(tmp_path: Path) -> None:
     assert result.exit_code == 0
     config = load_config(config_path)
     assert config.tts.provider == "openai-compatible"
-    assert config.tts.mode == "preset"
+    assert config.tts.mode == "auto"
+    assert config.tts.effective_mode(config.tts.provider) == "preset"
     assert config.providers.openai_compatible.tts_base_url == "http://localhost:9000/v1"
     assert config.providers.openai_compatible.tts_model == "tts-1"
     assert "DashScope API key" not in result.output

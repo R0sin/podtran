@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, model_validator
 
 StageStatus = Literal["pending", "running", "completed", "failed"]
 TaskStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
-VoiceMode = Literal["preset", "clone"]
+VoiceMode = Literal["auto", "preset", "clone"]
 VoiceSpecKind = Literal["preset", "provider_clone", "reference_clone"]
 StageProgressCallback = Callable[[int, int, str], None]
 
@@ -69,6 +69,7 @@ class ReferenceClonePayload(BaseModel):
     reference_audio_path: str = ""
     reference_text_path: str = ""
     reference_text: str = ""
+    x_vector_only_mode: bool | None = None
 
 
 class ReferenceCloneSpec(BaseModel):

@@ -198,7 +198,9 @@ class VllmOmniTTSBackend:
                         Path(spec.payload.reference_audio_path)
                     ),
                     "ref_text": _resolve_reference_text(spec),
-                    "x_vector_only_mode": self.config.providers.vllm_omni.x_vector_only_mode,
+                    "x_vector_only_mode": _reference_x_vector_only_mode(
+                        spec, self.config.providers.vllm_omni.x_vector_only_mode
+                    ),
                 }
             )
         else:
@@ -275,7 +277,9 @@ class QwenLocalTTSBackend:
         prompt = model.create_voice_clone_prompt(
             ref_audio=spec.payload.reference_audio_path,
             ref_text=reference_text,
-            x_vector_only_mode=self.config.providers.qwen_local.x_vector_only_mode,
+            x_vector_only_mode=_reference_x_vector_only_mode(
+                spec, self.config.providers.qwen_local.x_vector_only_mode
+            ),
         )
         self._prompt_cache[key] = prompt
         return prompt
@@ -417,7 +421,10 @@ def synthesize_segments(
             )
         ),
     )
-    if progress_callback is not None and config.tts.normalized_mode() != "clone":
+    if (
+        progress_callback is not None
+        and config.tts.effective_mode(config.tts.provider) != "clone"
+    ):
         progress_callback(0, stage_total, "Using preset voices")
 
     tts_config_fingerprint = (
@@ -459,7 +466,7 @@ def synthesize_segments(
 
         target = voice_targets.get(segment.speaker)
         if target is None:
-            if config.tts.normalized_mode() == "clone":
+            if config.tts.effective_mode(config.tts.provider) == "clone":
                 if is_unknown_speaker(segment.speaker):
                     segment.status = "failed"
                     segment.error = UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE
@@ -624,7 +631,7 @@ def build_tts_backend(config: AppConfig) -> TTSBackend:
     else:
         raise RuntimeError(f"Unsupported TTS provider: {config.tts.provider}")
 
-    if config.tts.normalized_mode() == "clone" and not (
+    if config.tts.effective_mode(config.tts.provider) == "clone" and not (
         backend.supported_voice_kinds & CLONE_VOICE_KINDS
     ):
         raise RuntimeError(
@@ -648,7 +655,7 @@ def _resolve_voice_targets(
     fingerprints: FingerprintService | None,
     progress_callback: StageProgressCallback | None = None,
 ) -> dict[str, ResolvedVoiceTarget]:
-    if config.tts.normalized_mode() != "clone":
+    if config.tts.effective_mode(config.tts.provider) != "clone":
         return build_preset_targets(segments)
     if source_audio is None:
         raise RuntimeError("Clone mode requires source audio.")
@@ -927,6 +934,14 @@ def _resolve_reference_text(spec: ReferenceCloneSpec) -> str:
             Path(spec.payload.reference_text_path).read_text(encoding="utf-8").strip()
         )
     raise RuntimeError("reference_clone specs require reference text.")
+
+
+def _reference_x_vector_only_mode(
+    spec: ReferenceCloneSpec, default_value: bool
+) -> bool:
+    if spec.payload.x_vector_only_mode is not None:
+        return spec.payload.x_vector_only_mode
+    return default_value
 
 
 def _vllm_omni_speech_url(config: AppConfig) -> str:

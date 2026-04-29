@@ -16,7 +16,13 @@ from tenacity import (
     wait_exponential,
 )
 
-from podtran.artifacts import ArtifactPaths, read_model, read_model_list, write_json
+from podtran.artifacts import (
+    ArtifactPaths,
+    copy_path,
+    read_model,
+    read_model_list,
+    write_json,
+)
 from podtran.audio import (
     FFMPEG_COMMAND,
     concat_wav_chunks,
@@ -50,6 +56,10 @@ UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE = (
     "Skipped TTS for UNKNOWN speaker: speaker diarization did not identify this segment, "
     "so clone voice cannot be resolved."
 )
+ANCHOR_REFERENCE_TEXT = (
+    "这是一段用于生成中文参考音色的标准语音，语速自然，情绪平稳，发音清晰。"
+)
+# TODO: Parametrize anchor text if podtran supports non-Chinese targets.
 
 
 class VoiceCloneProvider(Protocol):
@@ -83,6 +93,8 @@ class DashScopeCloneProvider:
         preferred_name: str,
         reference_fingerprint: str,
     ) -> ProviderCloneSpec:
+        # DashScope manages clone assets server-side, so auto mode does not need
+        # the local two-stage anchor strategy used by reference-clone backends.
         _ = reference_text
         audio_bytes = reference_audio.read_bytes()
         mime_type = mimetypes.guess_type(reference_audio.name)[0] or "audio/wav"
@@ -131,7 +143,26 @@ class VllmOmniCloneProvider:
         preferred_name: str,
         reference_fingerprint: str,
     ) -> ReferenceCloneSpec:
-        _ = (target_model, preferred_name)
+        _ = preferred_name
+        if self.config.tts.normalized_mode() == "auto":
+            anchor_audio = _anchor_audio_path(reference_audio)
+            self._synthesize_anchor(
+                reference_audio,
+                reference_text,
+                target_model,
+                reference_fingerprint,
+                anchor_audio,
+            )
+            return ReferenceCloneSpec(
+                identity=f"vllm-omni:reference_clone:{reference_fingerprint}:anchor",
+                provider="vllm-omni",
+                payload=ReferenceClonePayload(
+                    reference_fingerprint=reference_fingerprint,
+                    reference_audio_path=str(anchor_audio.resolve()),
+                    reference_text=ANCHOR_REFERENCE_TEXT,
+                    x_vector_only_mode=False,
+                ),
+            )
         return ReferenceCloneSpec(
             identity=f"vllm-omni:reference_clone:{reference_fingerprint}",
             provider="vllm-omni",
@@ -141,6 +172,34 @@ class VllmOmniCloneProvider:
                 reference_text=reference_text.strip(),
             ),
         )
+
+    def _synthesize_anchor(
+        self,
+        reference_audio: Path,
+        reference_text: str,
+        target_model: str,
+        reference_fingerprint: str,
+        anchor_audio: Path,
+    ) -> None:
+        if anchor_audio.exists() and anchor_audio.stat().st_size > 0:
+            return
+        from podtran.tts import VllmOmniTTSBackend
+
+        spec = ReferenceCloneSpec(
+            identity=f"vllm-omni:reference_clone:{reference_fingerprint}:xvec-anchor-source",
+            provider="vllm-omni",
+            payload=ReferenceClonePayload(
+                reference_fingerprint=reference_fingerprint,
+                reference_audio_path=str(reference_audio.resolve()),
+                reference_text=reference_text.strip(),
+                x_vector_only_mode=True,
+            ),
+        )
+        backend = VllmOmniTTSBackend(self.config)
+        try:
+            backend.synthesize(ANCHOR_REFERENCE_TEXT, spec, target_model, anchor_audio)
+        finally:
+            backend.client.close()
 
 
 class QwenLocalCloneProvider:
@@ -155,7 +214,26 @@ class QwenLocalCloneProvider:
         preferred_name: str,
         reference_fingerprint: str,
     ) -> ReferenceCloneSpec:
-        _ = (target_model, preferred_name)
+        _ = preferred_name
+        if self.config.tts.normalized_mode() == "auto":
+            anchor_audio = _anchor_audio_path(reference_audio)
+            self._synthesize_anchor(
+                reference_audio,
+                reference_text,
+                target_model,
+                reference_fingerprint,
+                anchor_audio,
+            )
+            return ReferenceCloneSpec(
+                identity=f"qwen-local:reference_clone:{reference_fingerprint}:anchor",
+                provider="qwen-local",
+                payload=ReferenceClonePayload(
+                    reference_fingerprint=reference_fingerprint,
+                    reference_audio_path=str(anchor_audio.resolve()),
+                    reference_text=ANCHOR_REFERENCE_TEXT,
+                    x_vector_only_mode=False,
+                ),
+            )
         return ReferenceCloneSpec(
             identity=f"qwen-local:reference_clone:{reference_fingerprint}",
             provider="qwen-local",
@@ -165,6 +243,34 @@ class QwenLocalCloneProvider:
                 reference_text=reference_text.strip(),
             ),
         )
+
+    def _synthesize_anchor(
+        self,
+        reference_audio: Path,
+        reference_text: str,
+        target_model: str,
+        reference_fingerprint: str,
+        anchor_audio: Path,
+    ) -> None:
+        if anchor_audio.exists() and anchor_audio.stat().st_size > 0:
+            return
+        from podtran.tts import QwenLocalTTSBackend
+
+        spec = ReferenceCloneSpec(
+            identity=f"qwen-local:reference_clone:{reference_fingerprint}:xvec-anchor-source",
+            provider="qwen-local",
+            payload=ReferenceClonePayload(
+                reference_fingerprint=reference_fingerprint,
+                reference_audio_path=str(reference_audio.resolve()),
+                reference_text=reference_text.strip(),
+                x_vector_only_mode=True,
+            ),
+        )
+        backend = QwenLocalTTSBackend(self.config)
+        try:
+            backend.synthesize(ANCHOR_REFERENCE_TEXT, spec, target_model, anchor_audio)
+        finally:
+            backend._unload_model()
 
 
 @dataclass(slots=True)
@@ -355,7 +461,9 @@ class VoiceResolver:
                     target_model=target_model,
                     voice_spec=voice_spec,
                     reference_fingerprint=reference_fingerprint,
-                    reference_audio_path=str(ref_audio_path.resolve()),
+                    reference_audio_path=_profile_reference_audio_path(
+                        voice_spec, ref_audio_path
+                    ),
                     reference_text_path=str(ref_text_path.resolve()),
                     source_audio_fingerprint=source_audio_fingerprint or "",
                     source_audio_path=str(source_path),
@@ -510,6 +618,12 @@ class VoiceResolver:
             and not Path(profile.reference_audio_path).exists()
         ):
             return False
+        if isinstance(profile.voice_spec, ReferenceCloneSpec) and _is_anchor_voice_spec(
+            profile.voice_spec
+        ):
+            anchor_audio_path = profile.voice_spec.payload.reference_audio_path
+            if not anchor_audio_path or not Path(anchor_audio_path).exists():
+                return False
         return True
 
     def _refresh_profile_paths(
@@ -522,15 +636,29 @@ class VoiceResolver:
         reference_text_path: Path,
     ) -> VoiceProfile:
         updated_spec = profile.voice_spec
+        resolved_reference_audio_path = reference_audio_path
         if isinstance(updated_spec, ReferenceCloneSpec):
             reference_text = updated_spec.payload.reference_text
             if not reference_text and reference_text_path.exists():
                 reference_text = reference_text_path.read_text(encoding="utf-8").strip()
+            if _is_anchor_voice_spec(updated_spec):
+                anchor_path = _anchor_audio_path(reference_audio_path)
+                existing_anchor = Path(updated_spec.payload.reference_audio_path)
+                if not existing_anchor.exists():
+                    raise RuntimeError(
+                        f"Cached anchor audio is missing for {profile.speaker}: "
+                        f"{existing_anchor}"
+                    )
+                if existing_anchor.resolve() != anchor_path.resolve():
+                    copy_path(existing_anchor, anchor_path)
+                resolved_reference_audio_path = anchor_path
             updated_spec = updated_spec.model_copy(
                 update={
                     "payload": updated_spec.payload.model_copy(
                         update={
-                            "reference_audio_path": str(reference_audio_path.resolve()),
+                            "reference_audio_path": str(
+                                resolved_reference_audio_path.resolve()
+                            ),
                             "reference_text_path": str(reference_text_path.resolve()),
                             "reference_fingerprint": reference_fingerprint,
                             "reference_text": reference_text,
@@ -542,7 +670,7 @@ class VoiceResolver:
             update={
                 "voice_spec": updated_spec,
                 "reference_fingerprint": reference_fingerprint,
-                "reference_audio_path": str(reference_audio_path.resolve()),
+                "reference_audio_path": str(resolved_reference_audio_path.resolve()),
                 "reference_text_path": str(reference_text_path.resolve()),
                 "source_audio_fingerprint": source_audio_fingerprint
                 or profile.source_audio_fingerprint,
@@ -594,15 +722,21 @@ class VoiceResolver:
         config_fingerprint = self.fingerprints.hash_config_subset(
             self.config, VOICE_CLONE_CONFIG_KEYS
         )
+        input_fingerprints = {
+            "source_audio": source_audio_fingerprint,
+            "reference": reference_fingerprint,
+            "speaker": speaker,
+            "target_model": target_model,
+            "effective_mode": self.config.tts.effective_mode(self.config.tts.provider),
+        }
+        if _uses_auto_anchor_clone(self.config):
+            input_fingerprints["anchor_text"] = self.fingerprints.hash_value(
+                ANCHOR_REFERENCE_TEXT
+            )
         return self.fingerprints.build_stage_cache_key(
             "voice_clone",
             VOICE_CLONE_STAGE_VERSION,
-            {
-                "source_audio": source_audio_fingerprint,
-                "reference": reference_fingerprint,
-                "speaker": speaker,
-                "target_model": target_model,
-            },
+            input_fingerprints,
             config_fingerprint,
         )
 
@@ -612,7 +746,30 @@ class VoiceResolver:
         entry = self.cache_store.lookup("voice_clone", cache_key)
         if entry is None:
             return None
-        return read_model(entry.output_path("voice_profile"), VoiceProfile)
+        profile = read_model(entry.output_path("voice_profile"), VoiceProfile)
+        if "anchor_audio" in entry.manifest.output_refs:
+            restored_anchor = (
+                self.paths.refs_dir / entry.output_path("anchor_audio").name
+            )
+            copy_path(entry.output_path("anchor_audio"), restored_anchor)
+            if isinstance(profile.voice_spec, ReferenceCloneSpec):
+                profile = profile.model_copy(
+                    update={
+                        "voice_spec": profile.voice_spec.model_copy(
+                            update={
+                                "payload": profile.voice_spec.payload.model_copy(
+                                    update={
+                                        "reference_audio_path": str(
+                                            restored_anchor.resolve()
+                                        )
+                                    }
+                                )
+                            }
+                        ),
+                        "reference_audio_path": str(restored_anchor.resolve()),
+                    }
+                )
+        return profile
 
     def _publish_cached_profile(
         self,
@@ -633,17 +790,23 @@ class VoiceResolver:
         reference_fingerprint = self._reference_fingerprint(
             profile.speaker, candidate, source_audio_fingerprint
         )
+        input_fingerprints = {
+            "source_audio": source_audio_fingerprint,
+            "reference": reference_fingerprint,
+            "speaker": profile.speaker,
+            "target_model": profile.target_model,
+            "effective_mode": self.config.tts.effective_mode(self.config.tts.provider),
+        }
+        if _uses_auto_anchor_clone(self.config):
+            input_fingerprints["anchor_text"] = self.fingerprints.hash_value(
+                ANCHOR_REFERENCE_TEXT
+            )
         manifest = StageManifest(
             stage="voice_clone",
             status="completed",
             stage_version=VOICE_CLONE_STAGE_VERSION,
             cache_key=cache_key,
-            input_fingerprints={
-                "source_audio": source_audio_fingerprint,
-                "reference": reference_fingerprint,
-                "speaker": profile.speaker,
-                "target_model": profile.target_model,
-            },
+            input_fingerprints=input_fingerprints,
             config_fingerprint=self.fingerprints.hash_config_subset(
                 self.config, VOICE_CLONE_CONFIG_KEYS
             ),
@@ -652,9 +815,16 @@ class VoiceResolver:
             finished_at=_utc_now(),
             pid=os.getpid(),
         )
-        self.cache_store.publish(
-            "voice_clone", cache_key, {"voice_profile": profile_json}, manifest
-        )
+        outputs = {"voice_profile": profile_json}
+        if (
+            isinstance(profile.voice_spec, ReferenceCloneSpec)
+            and _is_anchor_voice_spec(profile.voice_spec)
+            and profile.voice_spec.payload.reference_audio_path
+        ):
+            anchor_audio = Path(profile.voice_spec.payload.reference_audio_path)
+            if anchor_audio.exists():
+                outputs["anchor_audio"] = anchor_audio
+        self.cache_store.publish("voice_clone", cache_key, outputs, manifest)
 
     def _clone_spec_from_profile(self, profile: VoiceProfile) -> CloneVoiceSpec:
         if profile.voice_spec is None:
@@ -685,6 +855,28 @@ def build_preset_targets(
 
 def is_unknown_speaker(speaker: str) -> bool:
     return speaker.strip().upper() == UNKNOWN_SPEAKER
+
+
+def _anchor_audio_path(reference_audio: Path) -> Path:
+    return reference_audio.with_name(f"{reference_audio.stem}.anchor.wav")
+
+
+def _profile_reference_audio_path(spec: CloneVoiceSpec, fallback: Path) -> str:
+    if isinstance(spec, ReferenceCloneSpec) and spec.payload.reference_audio_path:
+        return str(Path(spec.payload.reference_audio_path).resolve())
+    return str(fallback.resolve())
+
+
+def _is_anchor_voice_spec(spec: ReferenceCloneSpec) -> bool:
+    return spec.identity.endswith(":anchor")
+
+
+def _uses_auto_anchor_clone(config: AppConfig) -> bool:
+    provider = config.tts.provider.strip().lower()
+    return config.tts.normalized_mode() == "auto" and provider in {
+        "vllm-omni",
+        "qwen-local",
+    }
 
 
 def resolve_dashscope_api_key(config: AppConfig) -> str:

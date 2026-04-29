@@ -170,6 +170,11 @@ def test_provider_helpers_resolve_defaults_and_overrides() -> None:
     config = AppConfig()
 
     assert config.translation.provider == "google-free"
+    assert config.tts.mode == "auto"
+    assert config.tts.effective_mode("dashscope") == "clone"
+    assert config.tts.effective_mode("vllm-omni") == "clone"
+    assert config.tts.effective_mode("qwen-local") == "clone"
+    assert config.tts.effective_mode("openai-compatible") == "preset"
     assert config.resolved_translation_base_url() == ""
     assert config.translation_model() == DEFAULT_TRANSLATION_MODEL
     assert (
@@ -250,6 +255,7 @@ def test_render_config_toml_uses_provider_scoped_tts_sections() -> None:
     rendered = render_config_toml(AppConfig())
 
     assert "[tts]" in rendered
+    assert 'mode = "auto"' in rendered
     assert "[tts.preset]" in rendered
     assert "[tts.preset.voice_map]" in rendered
     assert "[tts.clone]" in rendered

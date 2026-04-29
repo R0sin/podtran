@@ -14,8 +14,11 @@ from podtran.models import (
     VoiceProfile,
 )
 from podtran.voices import (
+    ANCHOR_REFERENCE_TEXT,
     UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE,
     DashScopeCloneProvider,
+    QwenLocalCloneProvider,
+    VllmOmniCloneProvider,
     VoiceResolver,
     resolve_dashscope_api_key,
     select_reference_candidate,
@@ -63,6 +66,34 @@ class _FixedProvider:
                 reference_fingerprint=reference_fingerprint,
                 reference_audio_path=str(reference_audio),
                 reference_text=reference_text,
+            ),
+        )
+
+
+class _AnchorProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def create_voice_spec(
+        self,
+        reference_audio: Path,
+        reference_text: str,
+        target_model: str,
+        preferred_name: str,
+        reference_fingerprint: str,
+    ):
+        _ = (reference_text, target_model, preferred_name)
+        self.calls += 1
+        anchor_audio = reference_audio.with_name(f"{reference_audio.stem}.anchor.wav")
+        anchor_audio.write_bytes(b"anchor")
+        return ReferenceCloneSpec(
+            identity=f"fake:reference_clone:{reference_fingerprint}:anchor",
+            provider="fake",
+            payload=ReferenceClonePayload(
+                reference_fingerprint=reference_fingerprint,
+                reference_audio_path=str(anchor_audio.resolve()),
+                reference_text=ANCHOR_REFERENCE_TEXT,
+                x_vector_only_mode=False,
             ),
         )
 
@@ -309,6 +340,94 @@ def test_voice_resolver_uses_reference_clone_specs_for_qwen_local(
     assert Path(spec.payload.reference_audio_path).exists()
 
 
+def test_voice_resolver_uses_anchor_clone_for_vllm_omni_auto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    source_audio = tmp_path / "source.wav"
+    source_audio.write_bytes(b"wav")
+    calls: list[tuple[str, str, bool]] = []
+
+    def synthesize_anchor(
+        self,
+        reference_audio: Path,
+        reference_text: str,
+        target_model: str,
+        reference_fingerprint: str,
+        anchor_audio: Path,
+    ) -> None:
+        _ = (self, target_model, reference_fingerprint)
+        calls.append((reference_audio.name, reference_text, True))
+        anchor_audio.write_bytes(b"anchor")
+
+    monkeypatch.setattr(VllmOmniCloneProvider, "_synthesize_anchor", synthesize_anchor)
+    manager = VoiceResolver(
+        AppConfig(
+            tts=TTSConfig(provider="vllm-omni", mode="auto"),
+            providers={"vllm_omni": {"base_url": "http://localhost:8091/v1"}},
+        ),
+        paths,
+    )
+    manager._export_reference_audio = _stub_export(paths)  # type: ignore[method-assign]
+
+    resolved = manager.resolve_voice_targets(
+        [_segment("seg_1", 0.0, 12.0)], source_audio
+    )
+
+    spec = resolved["SPEAKER_00"].spec
+    assert calls == [
+        (
+            "SPEAKER_00.wav",
+            "this is a suitable reference sentence for cloning quality",
+            True,
+        )
+    ]
+    assert spec.kind == "reference_clone"
+    assert spec.provider == "vllm-omni"
+    assert spec.payload.reference_text == ANCHOR_REFERENCE_TEXT
+    assert spec.payload.x_vector_only_mode is False
+    assert Path(spec.payload.reference_audio_path).name == "SPEAKER_00.anchor.wav"
+    assert Path(spec.payload.reference_audio_path).read_bytes() == b"anchor"
+
+
+def test_voice_resolver_uses_anchor_clone_for_qwen_local_auto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    source_audio = tmp_path / "source.wav"
+    source_audio.write_bytes(b"wav")
+
+    def synthesize_anchor(
+        self,
+        reference_audio: Path,
+        reference_text: str,
+        target_model: str,
+        reference_fingerprint: str,
+        anchor_audio: Path,
+    ) -> None:
+        _ = (self, reference_audio, reference_text, target_model, reference_fingerprint)
+        anchor_audio.write_bytes(b"anchor")
+
+    monkeypatch.setattr(QwenLocalCloneProvider, "_synthesize_anchor", synthesize_anchor)
+    manager = VoiceResolver(
+        AppConfig(tts=TTSConfig(provider="qwen-local", mode="auto")), paths
+    )
+    manager._export_reference_audio = _stub_export(paths)  # type: ignore[method-assign]
+
+    resolved = manager.resolve_voice_targets(
+        [_segment("seg_1", 0.0, 12.0)], source_audio
+    )
+
+    spec = resolved["SPEAKER_00"].spec
+    assert spec.kind == "reference_clone"
+    assert spec.provider == "qwen-local"
+    assert spec.payload.reference_text == ANCHOR_REFERENCE_TEXT
+    assert spec.payload.x_vector_only_mode is False
+    assert Path(spec.payload.reference_audio_path).name == "SPEAKER_00.anchor.wav"
+
+
 def test_voice_resolver_reuses_shared_voice_cache(tmp_path: Path) -> None:
     source_audio = tmp_path / "source.wav"
     source_audio.write_bytes(b"wav")
@@ -351,6 +470,81 @@ def test_voice_resolver_reuses_shared_voice_cache(tmp_path: Path) -> None:
         first_resolved["SPEAKER_00"].spec.identity
         == second_resolved["SPEAKER_00"].spec.identity
     )
+
+
+def test_voice_resolver_restores_anchor_audio_from_shared_voice_cache(
+    tmp_path: Path,
+) -> None:
+    source_audio = tmp_path / "source.wav"
+    source_audio.write_bytes(b"wav")
+    first_paths = _paths(tmp_path, "task-1")
+    second_paths = _paths(tmp_path, "task-2")
+    first_paths.ensure()
+    second_paths.ensure()
+    cache_store = CacheStore(first_paths.cache_dir)
+    fingerprints = FingerprintService(first_paths.cache_indexes_dir)
+
+    first_manager = VoiceResolver(
+        AppConfig(tts=TTSConfig(provider="vllm-omni", mode="auto")),
+        first_paths,
+        cache_store=cache_store,
+        fingerprints=fingerprints,
+    )
+    first_manager._clone_provider = _AnchorProvider()
+    first_manager._export_reference_audio = _stub_export(first_paths)  # type: ignore[method-assign]
+
+    second_manager = VoiceResolver(
+        AppConfig(tts=TTSConfig(provider="vllm-omni", mode="auto")),
+        second_paths,
+        cache_store=cache_store,
+        fingerprints=fingerprints,
+    )
+    second_manager._clone_provider = _UnexpectedProvider()
+    second_manager._export_reference_audio = _stub_export(second_paths)  # type: ignore[method-assign]
+
+    segments = [_segment("seg_1", 0.0, 12.0)]
+    first_manager.resolve_voice_targets(
+        segments, source_audio, source_audio_fingerprint="audio-1"
+    )
+    first_anchor = first_paths.refs_dir / "SPEAKER_00.anchor.wav"
+    first_anchor.unlink()
+
+    second_resolved = second_manager.resolve_voice_targets(
+        segments, source_audio, source_audio_fingerprint="audio-1"
+    )
+
+    spec = second_resolved["SPEAKER_00"].spec
+    assert spec.kind == "reference_clone"
+    assert Path(spec.payload.reference_audio_path).parent == second_paths.refs_dir
+    assert Path(spec.payload.reference_audio_path).name == "SPEAKER_00.anchor.wav"
+    assert Path(spec.payload.reference_audio_path).read_bytes() == b"anchor"
+
+
+def test_voice_resolver_rebuilds_when_local_anchor_profile_audio_is_missing(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    source_audio = tmp_path / "source.wav"
+    source_audio.write_bytes(b"wav")
+    manager = VoiceResolver(
+        AppConfig(tts=TTSConfig(provider="vllm-omni", mode="auto")),
+        paths,
+    )
+    provider = _AnchorProvider()
+    manager._clone_provider = provider
+    manager._export_reference_audio = _stub_export(paths)  # type: ignore[method-assign]
+
+    segments = [_segment("seg_1", 0.0, 12.0)]
+    first_resolved = manager.resolve_voice_targets(segments, source_audio)
+    Path(first_resolved["SPEAKER_00"].spec.payload.reference_audio_path).unlink()
+
+    second_resolved = manager.resolve_voice_targets(segments, source_audio)
+
+    assert provider.calls == 2
+    assert Path(
+        second_resolved["SPEAKER_00"].spec.payload.reference_audio_path
+    ).exists()
 
 
 def test_voice_resolver_reports_progress(tmp_path: Path) -> None:

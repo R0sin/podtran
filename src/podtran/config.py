@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from podtran.models import VoiceMode
@@ -132,7 +132,7 @@ class TTSConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     provider: str = DEFAULT_TTS_PROVIDER
-    mode: VoiceMode = "clone"
+    mode: VoiceMode = "auto"
     timeout_seconds: int = DEFAULT_TTS_TIMEOUT_SECONDS
     max_concurrency: int = 4
     preset: TTSPresetConfig = Field(default_factory=TTSPresetConfig)
@@ -140,6 +140,16 @@ class TTSConfig(BaseModel):
 
     def normalized_mode(self) -> str:
         return self.mode.strip().lower()
+
+    def effective_mode(self, provider: str) -> Literal["preset", "clone"]:
+        mode = self.normalized_mode()
+        if mode in {"preset", "clone"}:
+            return mode  # type: ignore[return-value]
+
+        normalized_provider = provider.strip().lower()
+        if normalized_provider == "openai-compatible":
+            return "preset"
+        return "clone"
 
 
 class ASRConfig(BaseModel):
@@ -356,7 +366,7 @@ def render_config_toml(config: AppConfig) -> str:
         f"max_concurrency = {config.translation.max_concurrency}",
         "",
         "[tts]",
-        '# Set mode to "preset" to synthesize with preset voices only.',
+        '# Mode: "auto" chooses the recommended backend behavior; "preset" and "clone" force a mode.',
         f'provider = "{config.tts.provider}"',
         f'mode = "{config.tts.mode}"',
         f"timeout_seconds = {config.tts.timeout_seconds}",

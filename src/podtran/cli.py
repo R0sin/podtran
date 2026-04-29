@@ -123,7 +123,7 @@ DEFAULT_MIN_SPEAKERS = 2
 DEFAULT_MAX_SPEAKERS = 5
 TTS_PROVIDER_CHOICES = ("dashscope", "openai-compatible", "vllm-omni", "qwen-local")
 TRANSLATION_PROVIDER_CHOICES = ("google-free", "openai-compatible")
-TTS_MODE_CHOICES = ("preset", "clone")
+TTS_MODE_CHOICES = ("auto", "preset", "clone")
 DEFAULT_VLLM_OMNI_BASE_URL = "http://localhost:8091/v1"
 UNKNOWN_SPEAKER = "UNKNOWN"
 UNKNOWN_SPEAKER_TTS_SKIP_PREFIX = "Skipped TTS for UNKNOWN speaker"
@@ -402,7 +402,7 @@ def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
         )
 
     if provider == "openai-compatible":
-        config.tts.mode = "preset"
+        config.tts.mode = "auto"
         config.providers.openai_compatible.tts_base_url = _prompt_required(
             "OpenAI-compatible TTS base URL",
             current_value=config.providers.openai_compatible.tts_base_url,
@@ -428,7 +428,8 @@ def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
         )
 
     config.tts.mode = _prompt_choice("TTS mode", TTS_MODE_CHOICES, config.tts.mode)
-    if config.tts.mode == "preset":
+    effective_tts_mode = config.tts.effective_mode(provider)
+    if effective_tts_mode == "preset":
         if provider == "qwen-local":
             config.providers.qwen_local.preset_model_size = _prompt_with_default(
                 "Qwen local preset model size",
@@ -1626,7 +1627,7 @@ def _synthesize_output_refs(cfg: AppConfig) -> dict[str, str]:
         "tts_dir": "tts",
         "refs_dir": "refs",
     }
-    if cfg.tts.normalized_mode() == "clone":
+    if cfg.tts.effective_mode(cfg.tts.provider) == "clone":
         refs["voices_json"] = "voices.json"
     return refs
 

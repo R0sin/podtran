@@ -1,6 +1,6 @@
 # podtran
 
-`podtran` 是一个面向长播客的分阶段翻译 CLI，目标是让你在一台普通笔记本上，也能把英文播客转成可听的中文版本。
+`podtran` 是一个面向长播客的分阶段翻译 CLI，用于把英文播客转成可听的中文版本。它把转写、翻译、TTS 和合成拆成可恢复、可缓存的阶段，并支持按资源条件选择本地模型、自托管服务或云端兼容服务。
 
 它默认走这条流水线：
 
@@ -9,8 +9,8 @@
 特点：
 
 - 本地用 `WhisperX` 做转写、对齐和说话人区分
-- 翻译支持 `google-free`、`dashscope`、`openai-compatible`，默认谷歌翻译；TTS 默认走 `qwen-local`
-- 默认支持 `clone` 音色克隆，也支持 `preset` 预置音色
+- 翻译支持 `google-free` 和 `openai-compatible`，DashScope 通过兼容 OpenAI 的端点接入；TTS 默认走 `qwen-local`
+- TTS 默认 `mode = "auto"`：本地、DashScope 和 vLLM-Omni 默认走音色克隆，OpenAI-compatible 默认走预置音色
 - 每次运行都会创建独立 task，避免旧结果污染新结果
 - 共享缓存会自动复用已完成的转写、翻译、声纹和逐段 TTS 结果
 - 中断后可用 `podtran resume` 从断点继续，已完成的翻译不会丢失
@@ -91,22 +91,22 @@ podtran init
 - 先去接受 Hugging Face 的 `speaker-diarization-community-1` 协议
 - 填写 `hf_token`
 - 选择翻译 provider；如果选 `google-free`，则不需要翻译 API key
-- 选择 TTS provider，并按提示填写对应的 `base_url`、API key、mode 和 model
+- 选择 TTS provider；向导只会询问该 provider 实际需要的 `base_url`、API key、mode 或 model
 - 只有当 TTS 实际使用 `dashscope` 时，才会要求填写 DashScope API key
 
 默认配置会写到 `~/.podtran/config.toml`。如果传 `--workdir <path>`，则会写到 `<path>/config.toml`，同时任务和缓存也会放到这个目录下。
 
 TTS provider 说明：
 
-- `qwen-local`：默认选项，支持 `preset` 和 `clone`，需要安装 `qwen-local` extra，默认使用 0.6B 模型
-- `dashscope`：支持 `preset` 和 `clone`
-- `openai-compatible`：支持 `preset`
-- `vllm-omni`：支持 `preset` 和 `clone`，需要配置 `providers.vllm_omni.base_url`
+- `qwen-local`：默认选项，支持 `preset` 和 `clone`，`auto` 下使用优化过的 `clone`，需要安装 `qwen-local` extra，默认使用 0.6B 模型
+- `dashscope`：支持 `preset` 和 `clone`，`auto` 下使用 `clone`
+- `openai-compatible`：支持 `preset`，`auto` 下使用 `preset`
+- `vllm-omni`：支持 `preset` 和 `clone`，`auto` 下使用 `clone`，需要配置 `providers.vllm_omni.base_url`
 
 翻译 provider 说明：
 
 - `google-free`：默认选项，免费，无需 API key；走 Google 非公开网页接口，可能受地区、风控、请求频率影响
-- `openai-compatible`：适合自建或第三方兼容 OpenAI Chat Completions 的翻译端点；需要设置 `providers.openai_compatible.translation_base_url`
+- `openai-compatible`：适合自建、DashScope compatible-mode 或其他兼容 OpenAI Chat Completions 的翻译端点；需要设置 `providers.openai_compatible.translation_base_url`
 
 如果你手动编辑 `config.toml`，最常见的翻译配置是：
 
@@ -115,7 +115,7 @@ TTS provider 说明：
 provider = "google-free"  # 默认；忽略 base_url 和 model
 ```
 
-如果你想切到 DashScope，可改成：
+如果你想切到 DashScope compatible-mode，可改成：
 
 ```toml
 [translation]
@@ -123,6 +123,7 @@ provider = "openai-compatible"
 
 [providers.openai_compatible]
 translation_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+translation_api_key = "sk-..."
 translation_model = "qwen-flash"
 ```
 
@@ -147,7 +148,8 @@ uv sync --extra qwen-local
 ```toml
 [tts]
 provider = "qwen-local"
-mode = "clone"
+mode = "auto"
+batch_size = 4
 max_concurrency = 1
 
 [providers.qwen_local]
@@ -156,6 +158,8 @@ preset_model_size = "0.6B"
 device = "auto"
 language = "Chinese"
 ```
+
+`batch_size` 可以根据设备资源微调；显存或内存紧张时调小，资源更充足时可以适当调大。
 
 转录相关设置默认来自 `config.toml` 里的 `[asr]` 配置：
 
@@ -197,6 +201,8 @@ podtran path\to\podcast.mp3 --preview
 
 这一步就是首选验证方式。对长播客也一样，先用预览模式确认配置、说话人区分、翻译质量和 TTS 效果，再决定是否跑完整音频。
 
+如果你知道说话人大致数量，可以用 `--min_speakers` 和 `--max_speakers` 给 diarization 提示；默认是 `--min_speakers 2 --max_speakers 5`。
+
 3. 预览效果没问题后，跑完整音频
 
 ```powershell
@@ -232,6 +238,8 @@ podtran status
 - 预览任务通常生成 `<原文件名>.preview.interleave.mp3`
 
 `interleave` 是默认模式，表示保留英文原声并穿插中文配音。
+
+如果在 `[compose]` 里设置 `mode = "replace"`，则会生成 `<原文件名>.replace.mp3`，表示只保留中文配音。
 
 ## 常见问题
 

@@ -134,7 +134,7 @@ class TTSConfig(BaseModel):
     provider: str = DEFAULT_TTS_PROVIDER
     mode: VoiceMode = "auto"
     timeout_seconds: int = DEFAULT_TTS_TIMEOUT_SECONDS
-    batch_size: int = 1
+    batch_size: int = 4
     max_concurrency: int = 4
     preset: TTSPresetConfig = Field(default_factory=TTSPresetConfig)
     clone: TTSCloneConfig = Field(default_factory=TTSCloneConfig)

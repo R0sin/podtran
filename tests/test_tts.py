@@ -1456,7 +1456,7 @@ def test_synthesize_segments_preserves_completed_results_when_worker_interrupts(
         synthesize_segments(
             paths.translated_json,
             paths.translated_json,
-            AppConfig(tts=TTSConfig(mode="preset", max_concurrency=1)),
+            AppConfig(tts=TTSConfig(mode="preset", batch_size=1, max_concurrency=1)),
             paths,
         )
 
@@ -1491,7 +1491,9 @@ def test_synthesize_segments_stops_queued_work_quickly_on_sigint(
             synthesize_segments(
                 paths.translated_json,
                 paths.translated_json,
-                AppConfig(tts=TTSConfig(mode="preset", max_concurrency=1)),
+                AppConfig(
+                    tts=TTSConfig(mode="preset", batch_size=1, max_concurrency=1)
+                ),
                 paths,
             )
     finally:

@@ -24,6 +24,7 @@ from podtran.config import (
 )
 from podtran.fingerprints import (
     FingerprintService,
+    SYNTHESIZE_CONFIG_KEYS,
     TTS_CONFIG_KEYS,
     VOICE_CLONE_CONFIG_KEYS,
 )
@@ -188,7 +189,7 @@ def test_provider_helpers_resolve_defaults_and_overrides() -> None:
     assert config.tts_preset_model() == "qwen-local:customvoice:0.6B"
     assert config.tts_clone_model() == "qwen-local:base:0.6B"
     assert config.tts.timeout_seconds == DEFAULT_TTS_TIMEOUT_SECONDS
-    assert config.tts.batch_size == 1
+    assert config.tts.batch_size == 4
     assert config.tts.max_concurrency == 4
     assert config.providers.vllm_omni.language == DEFAULT_VLLM_OMNI_LANGUAGE
     assert config.providers.qwen_local.clone_model_size == DEFAULT_QWEN_LOCAL_MODEL_SIZE
@@ -287,7 +288,7 @@ def test_render_config_toml_uses_provider_scoped_tts_sections() -> None:
     )
     assert "[tts]" in rendered
     assert 'mode = "auto"' in rendered
-    assert "batch_size = 1" in rendered
+    assert "batch_size = 4" in rendered
     assert "[tts.preset]" in rendered
     assert "[tts.preset.voice_map]" in rendered
     assert "[tts.clone]" in rendered
@@ -391,6 +392,9 @@ def test_tts_runtime_scheduling_fields_do_not_affect_fingerprints(
     assert fingerprints.hash_config_subset(
         first, VOICE_CLONE_CONFIG_KEYS
     ) == fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
+    assert fingerprints.hash_config_subset(
+        first, SYNTHESIZE_CONFIG_KEYS
+    ) == fingerprints.hash_config_subset(second, SYNTHESIZE_CONFIG_KEYS)
 
 
 def test_detect_legacy_translation_keys_detects_dashscope_provider() -> None:

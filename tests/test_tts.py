@@ -179,7 +179,7 @@ def _segment_with_text(
 
 
 def test_resolve_tts_model_switches_between_clone_and_preset_specs() -> None:
-    config = AppConfig(tts=TTSConfig(mode="clone"))
+    config = AppConfig(tts=TTSConfig(provider="dashscope", mode="clone"))
 
     clone_spec = ProviderCloneSpec(
         identity="dashscope:provider_clone:voice-token",
@@ -193,7 +193,7 @@ def test_resolve_tts_model_switches_between_clone_and_preset_specs() -> None:
 
 
 def test_resolve_tts_model_supports_reference_clone_specs() -> None:
-    config = AppConfig(tts=TTSConfig(mode="clone"))
+    config = AppConfig(tts=TTSConfig(provider="dashscope", mode="clone"))
     reference_spec = ReferenceCloneSpec(
         identity="fake:reference_clone:ref-1",
         provider="fake",
@@ -791,7 +791,9 @@ def test_synthesize_segments_runs_distinct_work_items_concurrently(
     synthesize_segments(
         paths.translated_json,
         paths.translated_json,
-        AppConfig(tts=TTSConfig(mode="preset", max_concurrency=2)),
+        AppConfig(
+            tts=TTSConfig(provider="dashscope", mode="preset", max_concurrency=2)
+        ),
         paths,
     )
 
@@ -988,7 +990,11 @@ def test_synthesize_segments_does_not_batch_non_qwen_local_provider(
     synthesize_segments(
         paths.translated_json,
         paths.translated_json,
-        AppConfig(tts=TTSConfig(mode="preset", batch_size=3, max_concurrency=1)),
+        AppConfig(
+            tts=TTSConfig(
+                provider="dashscope", mode="preset", batch_size=3, max_concurrency=1
+            )
+        ),
         paths,
     )
 

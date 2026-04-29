@@ -17,11 +17,11 @@ ensuring reproducibility and efficient reuse across tasks.
 | Package manager | [uv](https://docs.astral.sh/uv/) |
 | Build backend | Hatchling |
 | CLI framework | Typer + Rich |
-| Config | TOML (`podtran.toml`), parsed via `tomllib` / `tomli` |
+| Config | TOML (`config.toml`), parsed via `tomllib` / `tomli` |
 | Data models | Pydantic v2 (`BaseModel`, `model_dump`, `model_copy`) |
 | ASR | WhisperX (word-level alignment + speaker diarization) |
 | Translation | OpenAI-compatible LLM API (default: Qwen3 via DashScope) |
-| TTS | DashScope Qwen3 TTS, OpenAI-compatible TTS |
+| TTS | qwen-local Qwen3 TTS, DashScope Qwen3 TTS, OpenAI-compatible TTS |
 | Audio toolchain | ffmpeg / ffprobe (external binaries) |
 | HTTP client | httpx (TTS), openai SDK (translation, OpenAI-compat TTS) |
 | Retry | tenacity |
@@ -162,7 +162,7 @@ It does not perform dry-run planning or predict reruns.
 
 ### Config Structure
 
-`AppConfig` (Pydantic) is loaded from `~/.podtran/podtran.toml`:
+`AppConfig` (Pydantic) is loaded from `~/.podtran/config.toml`:
 - `[providers.dashscope]` → `ProviderConfig` (API key)
 - `[translation]` → `TranslationConfig`
 - `[tts]` → `TTSConfig` (supports `preset` and `clone` voice modes)
@@ -176,13 +176,13 @@ It does not perform dry-run planning or predict reruns.
 | Mode | Model | Behavior |
 |---|---|---|
 | `preset` | `qwen3-tts-flash` or provider-specific preset model | Uses `voice_map` + `fallback_voices`; supported by DashScope and explicit `openai_compatible` TTS providers |
-| `clone` | `qwen3-tts-vc-*` | Currently DashScope-only. Extracts reference audio, enrolls a provider-managed clone asset, then caches the resolved voice profile |
+| `clone` | Provider-specific clone model | Extracts reference audio, resolves a provider-specific clone asset, then caches the resolved voice profile |
 
 ### TTS Provider Routing
 
 - **TTS provider routing is explicit** — `tts.provider = "dashscope"` selects DashScope; `tts.provider = "openai_compatible"` selects the OpenAI-compatible backend.
 - **Unknown TTS provider names are rejected** — non-DashScope names no longer implicitly fall back to the OpenAI-compatible backend.
-- **Clone support is backend-specific** — today only DashScope supports production `clone` mode.
+- **Clone support is backend-specific** — qwen-local and DashScope support production `clone` mode today.
 - **Internal clone asset kinds** use `VoiceSpec` variants:
   - `preset`
   - `provider_clone` — provider-managed reusable clone asset (used by DashScope enrollment today)
@@ -220,7 +220,7 @@ It does not perform dry-run planning or predict reruns.
 
 ## Important Gotchas
 
-- **`podtran.toml` lives at `~/.podtran/podtran.toml`** — outside the project repo. It contains API keys. Use `podtran init` to generate it.
+- **`config.toml` lives at `~/.podtran/config.toml`** — outside the project repo. It contains API keys. Use `podtran init` to generate it.
 - **`--workdir` overrides all paths** — config, artifacts, tasks, and cache all resolve relative to the workdir. Use for testing only.
 - **`merge` is not a cached stage** — it re-derives `segments.json` from `transcript.json`
   on every run before `translate`, so changes to merge config take effect immediately.

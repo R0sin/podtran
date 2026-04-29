@@ -121,7 +121,7 @@ KNOWN_COMMANDS = {
 }
 DEFAULT_MIN_SPEAKERS = 2
 DEFAULT_MAX_SPEAKERS = 5
-TTS_PROVIDER_CHOICES = ("dashscope", "openai-compatible", "vllm-omni", "qwen-local")
+TTS_PROVIDER_CHOICES = ("qwen-local", "dashscope", "openai-compatible", "vllm-omni")
 TRANSLATION_PROVIDER_CHOICES = ("google-free", "openai-compatible")
 TTS_MODE_CHOICES = ("auto", "preset", "clone")
 DEFAULT_VLLM_OMNI_BASE_URL = "http://localhost:8091/v1"
@@ -311,7 +311,7 @@ def run(
 
 @app.command(
     short_help="Create or update config interactively.",
-    help="Launch an interactive config wizard, write `podtran.toml`, and prepare the artifact workdir.",
+    help="Launch an interactive config wizard, write `config.toml`, and prepare the artifact workdir.",
 )
 def init(
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
@@ -359,7 +359,7 @@ def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
     )
     console.print("[bold]podtran init[/bold]")
     console.print(
-        "Translation defaults to google-free. Choose the translation and TTS providers you want to configure."
+        "Translation defaults to google-free. TTS defaults to qwen-local. Choose the providers you want to configure."
     )
     console.print(
         "Before entering your Hugging Face token, accept the model terms at "

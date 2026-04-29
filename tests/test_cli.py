@@ -47,7 +47,7 @@ def _segment(
 
 
 def _create_config(tmp_path: Path) -> tuple[Path, AppConfig]:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
     write_default_config(config_path)
     return config_path, load_config(config_path)
 
@@ -173,33 +173,34 @@ def test_stage_help_documents_task_requirements() -> None:
     assert "2026-04-01T12:30:00+08:00" in cache_clean_result.output
 
 
-def test_init_prompts_for_provider_managed_config_and_writes_defaults(
+def test_init_prompts_for_qwen_local_defaults(
     tmp_path: Path,
 ) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
 
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="hf-token\n\n\ndash-key\n\n\n",
+        input="hf-token\n\n\n\n\n",
     )
 
     assert result.exit_code == 0
     config = load_config(config_path)
     assert config.hf_token == "hf-token"
-    assert config.providers.dashscope.api_key == "dash-key"
+    assert config.providers.dashscope.api_key == ""
     assert config.translation.provider == "google-free"
     assert config.providers.openai_compatible.translation_model == "qwen-flash"
-    assert config.tts.provider == "dashscope"
+    assert config.tts.provider == "qwen-local"
     assert config.tts.mode == "auto"
-    assert config.providers.dashscope.tts_clone_model == "qwen3-tts-vc-2026-01-22"
+    assert config.providers.qwen_local.clone_model_size == "0.6B"
     assert (tmp_path / "artifacts").exists()
     assert "speaker-diarization-community-1" in result.output
     assert "hf.co/settings/tokens" in result.output
+    assert "DashScope API key" not in result.output
 
 
 def test_init_can_write_openai_compatible_tts_provider(tmp_path: Path) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
 
     result = runner.invoke(
         cli.app,
@@ -218,7 +219,7 @@ def test_init_can_write_openai_compatible_tts_provider(tmp_path: Path) -> None:
 
 
 def test_init_can_write_vllm_omni_tts_provider(tmp_path: Path) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
 
     result = runner.invoke(
         cli.app,
@@ -236,29 +237,30 @@ def test_init_can_write_vllm_omni_tts_provider(tmp_path: Path) -> None:
 
 
 def test_init_reprompts_required_values(tmp_path: Path) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
 
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="\nhf-token\n\n\n\ndash-key\n\ncustom-tts\n",
+        input="\nhf-token\n\n\ninvalid\n\n1.7B\n",
     )
 
     assert result.exit_code == 0
     config = load_config(config_path)
     assert config.hf_token == "hf-token"
-    assert config.providers.dashscope.api_key == "dash-key"
+    assert config.providers.dashscope.api_key == ""
     assert config.translation.provider == "google-free"
     assert config.providers.openai_compatible.translation_model == "qwen-flash"
-    assert config.providers.dashscope.tts_clone_model == "custom-tts"
+    assert config.tts.provider == "qwen-local"
+    assert config.providers.qwen_local.clone_model_size == "1.7B"
     assert result.output.count("Hugging Face token") >= 2
-    assert result.output.count("DashScope API key") >= 2
+    assert "TTS mode must be one of" in result.output
 
 
 def test_init_uses_existing_values_as_defaults_and_preserves_other_fields(
     tmp_path: Path,
 ) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
     config = AppConfig()
     config.hf_token = "hf-existing"
     config.providers.dashscope.api_key = "dash-existing"
@@ -294,7 +296,7 @@ def test_init_uses_existing_values_as_defaults_and_preserves_other_fields(
 def test_init_rebuilds_legacy_tts_config_with_backup_and_preserved_auth(
     tmp_path: Path,
 ) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
 hf_token = "hf-legacy"
@@ -323,7 +325,7 @@ fallback_voices = ["Cherry"]
 
     assert result.exit_code == 0
     rebuilt = load_config(config_path)
-    backup_path = tmp_path / "podtran.toml.bak"
+    backup_path = tmp_path / "config.toml.bak"
     assert backup_path.exists()
     assert 'voice_mode = "clone"' in backup_path.read_text(encoding="utf-8")
     assert rebuilt.hf_token == "hf-legacy"
@@ -378,7 +380,7 @@ def test_rebuild_legacy_config_preserves_legacy_vllm_omni_api_key() -> None:
 def test_init_skips_dashscope_key_when_neither_translation_nor_tts_use_dashscope(
     tmp_path: Path,
 ) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
 
     result = runner.invoke(
         cli.app,
@@ -402,7 +404,7 @@ def test_init_skips_dashscope_key_when_neither_translation_nor_tts_use_dashscope
 
 
 def test_init_writes_openai_compatible_translation_provider(tmp_path: Path) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
 
     result = runner.invoke(
         cli.app,
@@ -431,12 +433,12 @@ def test_init_writes_openai_compatible_translation_provider(tmp_path: Path) -> N
 def test_init_prompts_dashscope_key_immediately_for_dashscope_tts(
     tmp_path: Path,
 ) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
 
     result = runner.invoke(
         cli.app,
         ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
-        input="hf-token\n\n\ndash-key\nclone\ncustom-tts\n",
+        input="hf-token\n\ndashscope\ndash-key\nclone\ncustom-tts\n",
     )
 
     assert result.exit_code == 0
@@ -452,9 +454,9 @@ def test_init_prompts_dashscope_key_immediately_for_dashscope_tts(
 
 
 def test_backup_legacy_config_preserves_existing_backup(tmp_path: Path) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
     config_path.write_text('mode = "new"', encoding="utf-8")
-    backup_path = tmp_path / "podtran.toml.bak"
+    backup_path = tmp_path / "config.toml.bak"
     backup_path.write_text('mode = "old"', encoding="utf-8")
 
     preserved = cli._backup_legacy_config(config_path)

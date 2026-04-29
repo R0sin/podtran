@@ -15,7 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover
 DEFAULT_TRANSLATION_PROVIDER = "google-free"
 DEFAULT_TRANSLATION_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_TRANSLATION_MODEL = "qwen-flash"
-DEFAULT_TTS_PROVIDER = "dashscope"
+DEFAULT_TTS_PROVIDER = "qwen-local"
 DEFAULT_TTS_PRESET_MODEL = "qwen3-tts-flash"
 DEFAULT_TTS_CLONE_MODEL = "qwen3-tts-vc-2026-01-22"
 DEFAULT_TTS_ENROLLMENT_MODEL = "qwen-voice-enrollment"
@@ -27,7 +27,7 @@ DEFAULT_QWEN_LOCAL_LANGUAGE = "Chinese"
 DEFAULT_QWEN_LOCAL_TORCH_DTYPE = "auto"
 DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION = "auto"
 DEFAULT_WORKDIR = Path("~/.podtran")
-DEFAULT_CONFIG_FILENAME = "podtran.toml"
+DEFAULT_CONFIG_FILENAME = "config.toml"
 DEFAULT_FALLBACK_VOICES = ["Cherry", "Serena", "Ethan", "Chelsie"]
 LEGACY_TRANSLATION_KEYS = (
     "base_url",
@@ -265,7 +265,7 @@ def build_init_config(
     hf_token: str,
     dashscope_api_key: str,
     translation_model: str,
-    tts_model: str,
+    tts_model_size: str,
 ) -> AppConfig:
     config = AppConfig()
     config.hf_token = hf_token.strip()
@@ -275,8 +275,8 @@ def build_init_config(
         translation_model.strip() or DEFAULT_TRANSLATION_MODEL
     )
     config.tts.provider = DEFAULT_TTS_PROVIDER
-    config.providers.dashscope.tts_clone_model = (
-        tts_model.strip() or DEFAULT_TTS_CLONE_MODEL
+    config.providers.qwen_local.clone_model_size = (
+        tts_model_size.strip() or DEFAULT_QWEN_LOCAL_MODEL_SIZE
     )
     return config
 
@@ -322,7 +322,7 @@ def resolve_config_path(
 
 def render_config_toml(config: AppConfig) -> str:
     lines = [
-        "# This config lives under ~/.podtran/podtran.toml by default.",
+        "# This config lives under ~/.podtran/config.toml by default.",
         "# Use --workdir to move config, tasks, and cache into a different directory.",
         f'hf_token = "{config.hf_token}"',
         "",
@@ -359,6 +359,14 @@ def render_config_toml(config: AppConfig) -> str:
         f'instructions = "{config.providers.qwen_local.instructions}"',
         f"x_vector_only_mode = {str(config.providers.qwen_local.x_vector_only_mode).lower()}",
         "",
+        "[asr]",
+        f'model = "{config.asr.model}"',
+        f'compute_type = "{config.asr.compute_type}"',
+        f'device = "{config.asr.device}"',
+        f'language = "{config.asr.language}"',
+        f"batch_size = {config.asr.batch_size}",
+        f'align_model = "{config.asr.align_model}"',
+        "",
         "[translation]",
         "# google-free uses the unofficial Google Translate web endpoint and ignores base_url/model.",
         f'provider = "{config.translation.provider}"',
@@ -385,14 +393,6 @@ def render_config_toml(config: AppConfig) -> str:
         "[tts.clone]",
         f"min_ref_seconds = {config.tts.clone.min_ref_seconds}",
         f"max_ref_seconds = {config.tts.clone.max_ref_seconds}",
-        "",
-        "[asr]",
-        f'model = "{config.asr.model}"',
-        f'compute_type = "{config.asr.compute_type}"',
-        f'device = "{config.asr.device}"',
-        f'language = "{config.asr.language}"',
-        f"batch_size = {config.asr.batch_size}",
-        f'align_model = "{config.asr.align_model}"',
         "",
         "[compose]",
         "# interleave = English + Chinese, replace = Chinese only.",

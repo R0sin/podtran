@@ -188,7 +188,9 @@ def test_voice_resolver_preferred_name_uses_normalized_speaker_without_prefix(
     tmp_path: Path,
 ) -> None:
     paths = _paths(tmp_path)
-    manager = VoiceResolver(AppConfig(tts=TTSConfig(mode="clone")), paths)
+    manager = VoiceResolver(
+        AppConfig(tts=TTSConfig(provider="dashscope", mode="clone")), paths
+    )
 
     assert manager._preferred_name("SPEAKER_00") == "speaker_00"
     assert manager._preferred_name("Host A / Guest B") == "host_a_guest_b"
@@ -218,7 +220,9 @@ def test_voice_resolver_reuses_cached_voice_profile(tmp_path: Path) -> None:
             }
         ],
     )
-    manager = VoiceResolver(AppConfig(tts=TTSConfig(mode="clone")), paths)
+    manager = VoiceResolver(
+        AppConfig(tts=TTSConfig(provider="dashscope", mode="clone")), paths
+    )
     manager._clone_provider = _UnexpectedProvider()
     manager._export_reference_audio = _stub_export(paths)  # type: ignore[method-assign]
 
@@ -577,7 +581,8 @@ def test_dashscope_clone_provider_uses_fixed_enrollment_model_and_derived_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = AppConfig(
-        providers={"dashscope": {"tts_base_url": "https://tts.example.com/root/"}}
+        tts={"provider": "dashscope"},
+        providers={"dashscope": {"tts_base_url": "https://tts.example.com/root/"}},
     )
     provider = DashScopeCloneProvider(config)
     captured: dict[str, object] = {}

@@ -23,5 +23,5 @@ def ensure_audio_file(path: Path) -> None:
 def ensure_hf_token(token: str) -> None:
     if not token.strip():
         raise RuntimeError(
-            "Missing Hugging Face token. Set hf_token in podtran.toml and accept the speaker-diarization-community-1 model terms first."
+            "Missing Hugging Face token. Set hf_token in config.toml and accept the speaker-diarization-community-1 model terms first."
         )

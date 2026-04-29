@@ -9,7 +9,7 @@
 特点：
 
 - 本地用 `WhisperX` 做转写、对齐和说话人区分
-- 翻译支持 `google-free`、`dashscope`、`openai-compatible`，默认谷歌翻译；TTS 默认走 DashScope
+- 翻译支持 `google-free`、`dashscope`、`openai-compatible`，默认谷歌翻译；TTS 默认走 `qwen-local`
 - 默认支持 `clone` 音色克隆，也支持 `preset` 预置音色
 - 每次运行都会创建独立 task，避免旧结果污染新结果
 - 共享缓存会自动复用已完成的转写、翻译、声纹和逐段 TTS 结果
@@ -32,30 +32,30 @@
 
 ## 安装
 
-标准方式是直接从 Git 仓库安装 CLI，然后使用 `podtran` 命令：
-
-```powershell
-uv tool install --torch-backend auto git+https://github.com/R0sin/podtran
-```
-
-`--torch-backend auto` 会让 `uv` 为 PyTorch 生态依赖自动选择合适后端；有可用 NVIDIA CUDA 驱动时会优先安装 CUDA 版，否则使用 CPU 版。这会同时影响 WhisperX 转写和本地 TTS 依赖。
-
-如果你要在 CLI 安装版中使用 `qwen-local`，安装时需要启用可选依赖：
+标准方式是直接从 Git 仓库安装 CLI，并启用默认 TTS 后端需要的 `qwen-local` 可选依赖：
 
 ```powershell
 uv tool install --torch-backend auto "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
 ```
 
+`--torch-backend auto` 会让 `uv` 为 PyTorch 生态依赖自动选择合适后端；有可用 NVIDIA CUDA 驱动时会优先安装 CUDA 版，否则使用 CPU 版。这会同时影响 WhisperX 转写和本地 TTS 依赖。
+
+如果你不使用本地 TTS，也可以只安装基础依赖，然后在配置里把 TTS provider 改成 `dashscope`、`openai-compatible` 或 `vllm-omni`：
+
+```powershell
+uv tool install --torch-backend auto git+https://github.com/R0sin/podtran
+```
+
 如果已经安装过，可以用同一条命令加 `--force` 重新安装：
 
 ```powershell
-uv tool install --force --torch-backend auto git+https://github.com/R0sin/podtran
+uv tool install --force --torch-backend auto "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
 ```
 
-`qwen-local` 版本则使用：
+基础依赖版本则使用：
 
 ```powershell
-uv tool install --force --torch-backend auto "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
+uv tool install --force --torch-backend auto git+https://github.com/R0sin/podtran
 ```
 
 安装完成后可以先确认命令已可用：
@@ -94,21 +94,21 @@ podtran init
 - 选择 TTS provider，并按提示填写对应的 `base_url`、API key、mode 和 model
 - 只有当 TTS 实际使用 `dashscope` 时，才会要求填写 DashScope API key
 
-默认配置会写到 `~/.podtran/podtran.toml`。如果传 `--workdir <path>`，则会写到 `<path>/podtran.toml`，同时任务和缓存也会放到这个目录下。
+默认配置会写到 `~/.podtran/config.toml`。如果传 `--workdir <path>`，则会写到 `<path>/config.toml`，同时任务和缓存也会放到这个目录下。
 
 TTS provider 说明：
 
+- `qwen-local`：默认选项，支持 `preset` 和 `clone`，需要安装 `qwen-local` extra，默认使用 0.6B 模型
 - `dashscope`：支持 `preset` 和 `clone`
 - `openai-compatible`：支持 `preset`
 - `vllm-omni`：支持 `preset` 和 `clone`，需要配置 `providers.vllm_omni.base_url`
-- `qwen-local`：支持 `preset` 和 `clone`，需要安装 `qwen-local` extra，默认使用 0.6B 模型
 
 翻译 provider 说明：
 
 - `google-free`：默认选项，免费，无需 API key；走 Google 非公开网页接口，可能受地区、风控、请求频率影响
 - `openai-compatible`：适合自建或第三方兼容 OpenAI Chat Completions 的翻译端点；需要设置 `providers.openai_compatible.translation_base_url`
 
-如果你手动编辑 `podtran.toml`，最常见的翻译配置是：
+如果你手动编辑 `config.toml`，最常见的翻译配置是：
 
 ```toml
 [translation]
@@ -134,7 +134,7 @@ translation_model = "qwen-flash"
 
 对 `podtran` 来说，只需要一个可访问的 `vllm-omni` TTS 服务，并把 `providers.vllm_omni.base_url` 指向它；默认示例地址是 `http://localhost:8091/v1`。
 
-如果你想直接在 podtran 进程内运行 Qwen3-TTS，需要安装 `qwen-local` 可选依赖。使用 `uv tool install` 安装 CLI 时，请按前面的安装命令启用 `podtran[qwen-local]`。
+默认 TTS 后端会直接在 podtran 进程内运行 Qwen3-TTS，需要安装 `qwen-local` 可选依赖。使用 `uv tool install` 安装 CLI 时，请按前面的默认安装命令启用 `podtran[qwen-local]`。
 
 如果是在源码 checkout 中开发或运行，可同步 extra：
 
@@ -157,7 +157,7 @@ device = "auto"
 language = "Chinese"
 ```
 
-转录相关设置默认来自 `podtran.toml` 里的 `[asr]` 配置：
+转录相关设置默认来自 `config.toml` 里的 `[asr]` 配置：
 
 ```toml
 [asr]

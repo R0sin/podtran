@@ -30,7 +30,7 @@ from podtran.fingerprints import (
 
 
 def test_load_config_accepts_provider_scoped_fields(tmp_path: Path) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
 hf_token = ""
@@ -115,7 +115,7 @@ max_ref_seconds = 18
 
 
 def test_load_config_rejects_legacy_translation_fields(tmp_path: Path) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
 [translation]
@@ -131,7 +131,7 @@ model = "translate-model"
 
 
 def test_load_config_rejects_dashscope_translation_provider(tmp_path: Path) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
 [translation]
@@ -145,7 +145,7 @@ provider = "dashscope"
 
 
 def test_load_config_rejects_legacy_tts_fields(tmp_path: Path) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
 [tts]
@@ -172,6 +172,7 @@ def test_provider_helpers_resolve_defaults_and_overrides() -> None:
     config = AppConfig()
 
     assert config.translation.provider == "google-free"
+    assert config.tts.provider == "qwen-local"
     assert config.tts.mode == "auto"
     assert config.tts.effective_mode("dashscope") == "clone"
     assert config.tts.effective_mode("vllm-omni") == "clone"
@@ -183,9 +184,9 @@ def test_provider_helpers_resolve_defaults_and_overrides() -> None:
         config.providers.openai_compatible.translation_base_url
         == DEFAULT_TRANSLATION_BASE_URL
     )
-    assert config.resolved_tts_base_url() == DEFAULT_TTS_BASE_URL
-    assert config.tts_preset_model() == DEFAULT_TTS_PRESET_MODEL
-    assert config.tts_clone_model() == DEFAULT_TTS_CLONE_MODEL
+    assert config.resolved_tts_base_url() == ""
+    assert config.tts_preset_model() == "qwen-local:customvoice:0.6B"
+    assert config.tts_clone_model() == "qwen-local:base:0.6B"
     assert config.tts.timeout_seconds == DEFAULT_TTS_TIMEOUT_SECONDS
     assert config.tts.batch_size == 1
     assert config.tts.max_concurrency == 4
@@ -196,6 +197,11 @@ def test_provider_helpers_resolve_defaults_and_overrides() -> None:
         config.providers.qwen_local.attn_implementation
         == DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION
     )
+
+    dashscope = AppConfig(tts={"provider": "dashscope"})
+    assert dashscope.resolved_tts_base_url() == DEFAULT_TTS_BASE_URL
+    assert dashscope.tts_preset_model() == DEFAULT_TTS_PRESET_MODEL
+    assert dashscope.tts_clone_model() == DEFAULT_TTS_CLONE_MODEL
 
     custom = AppConfig(
         translation={"provider": "openai-compatible"},
@@ -219,19 +225,19 @@ def test_build_init_config_sets_provider_managed_auth_and_models() -> None:
         hf_token="hf-token",
         dashscope_api_key="dash-key",
         translation_model="custom-translate",
-        tts_model="custom-tts",
+        tts_model_size="1.7B",
     )
 
     assert config.hf_token == "hf-token"
     assert config.providers.dashscope.api_key == "dash-key"
     assert config.translation.provider == "google-free"
     assert config.providers.openai_compatible.translation_model == "custom-translate"
-    assert config.tts.provider == "dashscope"
-    assert config.providers.dashscope.tts_clone_model == "custom-tts"
+    assert config.tts.provider == "qwen-local"
+    assert config.providers.qwen_local.clone_model_size == "1.7B"
 
 
 def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None:
-    config_path = tmp_path / "podtran.toml"
+    config_path = tmp_path / "config.toml"
 
     write_default_config(config_path)
     rendered = config_path.read_text(encoding="utf-8")
@@ -241,10 +247,11 @@ def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None
     assert "[providers.vllm_omni]" in rendered
     assert "[providers.qwen_local]" in rendered
     assert 'provider = "google-free"' in rendered
+    assert 'provider = "qwen-local"' in rendered
     assert f'tts_clone_model = "{DEFAULT_TTS_CLONE_MODEL}"' in rendered
     assert f'clone_model_size = "{DEFAULT_QWEN_LOCAL_MODEL_SIZE}"' in rendered
     qwen_local_section = rendered.split("[providers.qwen_local]", 1)[1].split(
-        "[translation]", 1
+        "[asr]", 1
     )[0]
     assert "max_concurrency" not in qwen_local_section
     assert f'torch_dtype = "{DEFAULT_QWEN_LOCAL_TORCH_DTYPE}"' in rendered
@@ -262,6 +269,22 @@ def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None
 def test_render_config_toml_uses_provider_scoped_tts_sections() -> None:
     rendered = render_config_toml(AppConfig())
 
+    section_order = [
+        "[providers.dashscope]",
+        "[providers.openai_compatible]",
+        "[providers.vllm_omni]",
+        "[providers.qwen_local]",
+        "[asr]",
+        "[translation]",
+        "[tts]",
+        "[tts.preset]",
+        "[tts.preset.voice_map]",
+        "[tts.clone]",
+        "[compose]",
+    ]
+    assert [rendered.index(section) for section in section_order] == sorted(
+        rendered.index(section) for section in section_order
+    )
     assert "[tts]" in rendered
     assert 'mode = "auto"' in rendered
     assert "batch_size = 1" in rendered
@@ -379,18 +402,18 @@ def test_detect_legacy_translation_keys_detects_dashscope_provider() -> None:
 def test_resolve_workdir_uses_default_and_override() -> None:
     default_config = resolve_config_path()
     assert resolve_workdir() == Path("~/.podtran").expanduser().resolve()
-    assert default_config == Path("~/.podtran/podtran.toml").expanduser().resolve()
+    assert default_config == Path("~/.podtran/config.toml").expanduser().resolve()
     assert (
         resolve_workdir(Path("~/.podtran-tests"))
         == Path("~/.podtran-tests").expanduser().resolve()
     )
     assert (
-        resolve_workdir(config_path=Path("~/profiles/podtran.toml"))
+        resolve_workdir(config_path=Path("~/profiles/config.toml"))
         == Path("~/profiles").expanduser().resolve()
     )
     assert (
         resolve_config_path(workdir_override=Path("~/.podtran-tests"))
-        == Path("~/.podtran-tests/podtran.toml").expanduser().resolve()
+        == Path("~/.podtran-tests/config.toml").expanduser().resolve()
     )
     assert (
         resolve_config_path(Path("~/custom.toml"))

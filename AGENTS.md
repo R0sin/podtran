@@ -1,238 +1,329 @@
-# AGENT.md — podtran
+# AGENTS.md - podtran
 
 ## Project Overview
 
-**podtran** is a staged podcast translation CLI designed for low-memory laptops (16 GB RAM).
-It translates English podcasts into Chinese using a multi-stage pipeline:
-`transcribe → merge → translate → synthesize → compose`.
+`podtran` is a staged podcast translation CLI for low-memory laptops. It turns
+English podcast audio into Chinese audio with resumable stages and reusable
+content-addressed artifacts.
 
-The execution model uses **task-isolated directories** with a **content-addressable shared cache**,
-ensuring reproducibility and efficient reuse across tasks.
+Current pipeline:
+
+```text
+transcribe -> translate -> synthesize -> compose
+```
+
+`merge` is not a CLI stage. Transcript blocks are rebuilt from `transcript.json`
+inside translate preparation and written to `segments.json`.
+
+The execution model uses task-isolated directories under a workdir plus a shared
+cache under the same workdir. By default the workdir is `~/.podtran`; `--workdir`
+moves config, tasks, cache, and indexes together.
 
 ## Tech Stack
 
 | Layer | Technology |
 |---|---|
-| Language | Python 3.11 (supports `>=3.10,<3.13`) |
-| Package manager | [uv](https://docs.astral.sh/uv/) |
-| Build backend | Hatchling |
-| CLI framework | Typer + Rich |
-| Config | TOML (`config.toml`), parsed via `tomllib` / `tomli` |
-| Data models | Pydantic v2 (`BaseModel`, `model_dump`, `model_copy`) |
-| ASR | WhisperX (word-level alignment + speaker diarization) |
-| Translation | OpenAI-compatible LLM API (default: Qwen3 via DashScope) |
-| TTS | qwen-local Qwen3 TTS, DashScope Qwen3 TTS, OpenAI-compatible TTS |
-| Audio toolchain | ffmpeg / ffprobe (external binaries) |
-| HTTP client | httpx (TTS), openai SDK (translation, OpenAI-compat TTS) |
-| Retry | tenacity |
-| Linter | Ruff |
-| Tests | pytest |
+| Language | Python 3.11 recommended, package supports `>=3.10,<3.13` |
+| Package manager | `uv` |
+| Build backend | Hatchling, src-layout |
+| CLI | Typer + Rich |
+| Config | TOML via `tomllib` / `tomli`, Pydantic v2 models |
+| ASR | WhisperX with alignment and speaker diarization |
+| Translation | `google-free` by default; `openai-compatible` for LLM endpoints |
+| TTS | `qwen-local` by default; also `dashscope`, `openai-compatible`, `vllm-omni` |
+| Audio | external `ffmpeg` / `ffprobe` |
+| HTTP / SDK | `httpx`, `openai` SDK |
+| Retry | `tenacity` |
+| Tests / lint | `pytest`, `ruff` |
+
+`qwen-local` is optional in packaging (`podtran[qwen-local]`) but is the default
+runtime TTS provider. Development tests do not require real WhisperX, DashScope,
+Google, vLLM, ffmpeg, or qwen-local service calls.
 
 ## Repository Layout
 
 ```text
 podtran/
-├── src/podtran/          # Main package (hatchling src-layout)
-│   ├── cli.py            # Typer CLI: root AUDIO entry, resume, init, tasks, status, stages, cache clean
-│   ├── config.py         # Pydantic config models, TOML loader, render_config_toml
-│   ├── models.py         # Domain models: TaskManifest, StageManifest, SegmentRecord, VoiceProfile, etc.
-│   ├── asr.py            # WhisperX transcription with progress callbacks
-│   ├── merge.py          # Transcript → block-aggregated segments
-│   ├── translate.py      # Batch translation via OpenAI-compatible API
-│   ├── tts.py            # TTS backends (DashScope, OpenAI-compatible), backend dispatch, segment-level synthesis + cache
-│   ├── voices.py         # Voice clone: reference audio selection, DashScope enrollment, VoiceResolver, clone profile/cache handling
-│   ├── compose.py        # Final audio compositing (interleave / replace modes)
-│   ├── artifacts.py      # ArtifactPaths helper, JSON I/O, atomic writes, copy/remove utilities
-│   ├── tasks.py           # TaskStore: create/load/list/save task manifests under artifacts/tasks/<task_id>/
-│   ├── cache_store.py    # CacheStore: content-addressable shared cache under artifacts/cache/
-│   ├── fingerprints.py   # FingerprintService: SHA-256 hashing, config-subset hashing, cache key generation
-│   ├── stage_executor.py # StageExecutor: orchestrates stage lifecycle (start, complete, fail, is_current)
-│   ├── stage_versions.py # Stage version constants for cache invalidation
-│   ├── audio.py          # Audio utilities: ffprobe duration, ffmpeg extract/convert
-│   └── checks.py         # Pre-flight checks: audio file, ffmpeg, hf_token
-│   ├── __init__.py       # Package version
-│   └── __main__.py       # python -m podtran entry
-├── tests/                # pytest test suite
-├── docs/                 # Design docs (gitignored, local only)
-├── main.py               # Dev entry point (adds src/ to sys.path, calls cli:main)
-├── pyproject.toml        # Project metadata, dependencies, scripts, dev tools
-└── .python-version       # Pinned to 3.11
+├── src/podtran/
+│   ├── cli.py              # Typer commands, root AUDIO shortcut, pipeline orchestration
+│   ├── config.py           # Pydantic config models, TOML loading/rendering, legacy detection
+│   ├── models.py           # Task, stage, segment, voice, and voice-spec models
+│   ├── asr.py              # WhisperX transcription
+│   ├── merge.py            # Transcript -> block SegmentRecord aggregation
+│   ├── translate.py        # google-free and OpenAI-compatible translation backends
+│   ├── tts.py              # TTS backends, segment synthesis, per-segment TTS cache
+│   ├── voices.py           # Clone reference selection, voice resolver, voice profile cache
+│   ├── compose.py          # Final audio composition
+│   ├── artifacts.py        # Artifact paths, JSON I/O, atomic writes, copy/remove helpers
+│   ├── tasks.py            # TaskStore under artifacts/tasks/<task_id>/
+│   ├── cache_store.py      # Shared content-addressed cache
+│   ├── fingerprints.py     # Stage/config hashing and config key lists
+│   ├── stage_executor.py   # Stage lifecycle and manifest persistence
+│   ├── stage_versions.py   # Cache invalidation version constants
+│   ├── audio.py            # ffmpeg/ffprobe helpers
+│   ├── checks.py           # Preflight checks
+│   ├── __init__.py         # Package version
+│   └── __main__.py         # python -m podtran entry
+├── tests/                  # Unit tests with mocked external services
+├── scripts/                # Local helper scripts
+├── docs/                   # Local design docs, gitignored
+├── main.py                 # Dev entry point that adds src/ to sys.path
+├── pyproject.toml
+└── uv.lock
 ```
 
-## Development Environment
+## Development Commands
 
-### Setup
+Install normal dev dependencies:
 
 ```powershell
 uv sync
 ```
 
-For CPU-only PyTorch (recommended for 16 GB RAM):
+Install default local TTS dependencies for actual `qwen-local` runs:
 
 ```powershell
-uv pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
-uv sync
+uv sync --extra qwen-local
 ```
 
-### Run the CLI
+Run the CLI:
 
 ```powershell
 uv run podtran --help
-uv run podtran path\to\podcast.mp3
+uv run podtran run path\to\episode.mp3 --preview
+uv run podtran path\to\episode.mp3
 uv run podtran resume
 uv run podtran tasks
 uv run podtran status
+uv run podtran version
 ```
 
-### Run Tests
+Run tests and lint:
 
 ```powershell
-uv run pytest
+uv run pytest -q
+uv run ruff check src tests
+uv run ruff format --check src tests
 ```
 
-Tests in `tests/` are pure-Python unit tests. They mock external services
-(WhisperX, DashScope API, ffmpeg) and use `tmp_path` for filesystem isolation.
+CI uses Python 3.11, installs the package with minimal non-heavy dependencies,
+runs `uv run ruff check src tests`, then `uv run pytest -q`.
 
-### Lint
+## CLI Behavior
 
-```powershell
-uv run ruff check src/ tests/
-uv run ruff format --check src/ tests/
-```
+- `podtran run AUDIO` is the explicit entry point.
+- `podtran AUDIO` is a shortcut: `main()` rewrites root audio invocations to
+  `run` when the first non-option token is not a known command.
+- `--preview` extracts the first 300 seconds to `preview.wav` and creates a
+  preview task.
+- `--min_speakers` and `--max_speakers` default to 2 and 5 and are passed to
+  WhisperX diarization.
+- `resume [TASK]` loads a task id or unique prefix, defaulting to the latest
+  task.
+- Single-stage commands are `transcribe`, `translate`, `synthesize`, and
+  `compose`; each requires an existing task and does not auto-run prerequisites.
+- `cache clean [--before ...]` is the only public cache maintenance command.
+  Do not add cache list/inspect commands unless the CLI scope intentionally
+  changes.
 
-## Architecture & Key Patterns
+## Artifact Model
 
-### Execution Model
-
-- **`podtran <audio>`** → creates a new task under `~/.podtran/artifacts/tasks/<task_id>/`,
-  then runs the full pipeline `transcribe → merge → translate → synthesize → compose`.
-- **`podtran resume [task]`** → loads an existing task (defaults to latest) and re-runs the pipeline
-  from where it left off. Completed stages are skipped; interrupted translations resume from partial results.
-- **`podtran tasks`** → lists recent task instances.
-- **`podtran status [task]`** → shows the current facts for a task; defaults to the latest task.
-- **Single-stage commands** (`transcribe`, `translate`, `synthesize`, `compose`)
-  require `TASK` as a positional argument and execute only that stage.
-- **`podtran cache clean`** → removes shared cache entries; no other cache inspection commands are exposed.
-
-### Task Isolation
-
-Each task gets its own directory:
+Each task lives under:
 
 ```text
-~/.podtran/artifacts/tasks/<task_id>/
-  task.json          # TaskManifest (audio path, config snapshot, status)
-  transcript.json   # WhisperX output
-  segments.json     # Merged blocks
-  translated.json   # Translations + TTS status per segment
-  preview.wav       # Preview mode extracted audio clip
-  voices.json       # Resolved voice profiles (clone mode)
-  refs/             # Reference audio clips (clone mode)
-  tts/              # Per-segment synthesized WAV files
-  final/            # Final composed MP3
-  manifests/        # Per-stage StageManifest JSON files
-  tmp/              # Temporary build files (compose chunks, voice refs)
+<workdir>/artifacts/tasks/<task_id>/
+  task.json
+  transcript.json
+  segments.json
+  translated.json
+  preview.wav
+  voices.json
+  refs/
+  tts/
+  final/
+  manifests/
+  tmp/
 ```
 
-### Content-Addressable Cache
+Shared cache lives under:
 
-Shared cache lives in `~/.podtran/artifacts/cache/<stage>/<cache_key>/`.
-Cache keys are SHA-256 hashes of `{stage, stage_version, input_fingerprints, config_fingerprint}`.
+```text
+<workdir>/artifacts/cache/
+  _indexes/audio_hashes.json
+  transcribe/<cache_key>/
+  translate/<cache_key>/
+  voice_clone/<cache_key>/
+  tts/<cache_key>/
+```
 
-- **Fingerprinting**: `FingerprintService` hashes audio files, JSON structures, and config subsets.
-- **Stage versions**: `stage_versions.py` constants; bump to force cache invalidation when stage logic changes.
-- **Cache flow**: `lookup → restore` on hit; `publish` after successful execution.
-- Shared cache is user-visible only through `podtran cache clean`; list/inspect operations are intentionally not part of the simplified CLI.
+`TaskStore` resolves exact task ids and unique prefixes. Task ids are UTC
+timestamps plus the first 6 chars of the source audio hash.
 
-### Stage Lifecycle (`StageExecutor`)
+## Stage And Cache Rules
 
-Each stage follows: `is_current? → cache hit? → start → <execute> → complete/fail/interrupt`.
-`StageManifest` records `input_fingerprints`, `config_fingerprint`, and `output_refs`
-for deterministic staleness detection.
+`StageExecutor` owns stage manifests and task status. Stages follow this pattern:
 
-- **`KeyboardInterrupt` (Ctrl+C)** is caught per-stage and calls `executor.interrupt(manifest)`,
-  setting status to `"interrupted"` before exiting. The pipeline prints a resume hint.
-- **Partial result preservation**: `_can_resume_partial()` checks the old manifest's status,
-  `stage_version`, input fingerprints, and config fingerprint to decide whether to keep
-  existing partial output (e.g. `translated.json`) on resume.
+```text
+is_current? -> shared cache lookup where applicable -> start -> execute -> complete/fail/interrupt
+```
 
-### Status Reporting
+Important boundaries:
 
-`status` reports the current task state from on-disk manifests and output presence.
-It does not perform dry-run planning or predict reruns.
+- Transcribe and translate use shared stage-level cache entries.
+- Synthesize does not publish one stage-level cache entry; it reuses voice-clone
+  cache entries and per-segment TTS cache entries.
+- Compose records a stage manifest for current/stale checks, but it does not
+  publish a shared compose cache entry.
+- `segments.json` is intentionally regenerated before translate so merge config
+  changes take effect.
+- Translate and synthesize can preserve compatible partial results after
+  `failed` or `interrupted` manifests when stage version, input fingerprints,
+  and config fingerprints still match.
+- Unknown speaker segments in clone mode are skipped with a recorded segment
+  failure and warning; compose is allowed to continue when required TTS output is
+  otherwise complete.
 
-### Config Structure
+When changing output-affecting behavior:
 
-`AppConfig` (Pydantic) is loaded from `~/.podtran/config.toml`:
-- `[providers.dashscope]` → `ProviderConfig` (API key)
-- `[translation]` → `TranslationConfig`
-- `[tts]` → `TTSConfig` (supports `preset` and `clone` voice modes)
-- `[asr]` → `ASRConfig`
-- `[compose]` → `ComposeConfig`
-- All config sub-models use `extra="ignore"` for forward-compatible TOML parsing.
-- Use `podtran init` to generate a template config interactively.
+- Add or update the relevant dotted config keys in `fingerprints.py`.
+- Bump the affected constant in `stage_versions.py`.
+- If serialized `VoiceSpec` or clone profile semantics change, bump the clone
+  and TTS-related versions.
+- Do not include API keys or pure scheduling knobs in fingerprints unless they
+  actually change deterministic output. Current tests assert that provider API
+  keys and TTS concurrency/batch scheduling do not affect TTS fingerprints.
 
-### TTS Modes
+## Config Model
 
-| Mode | Model | Behavior |
-|---|---|---|
-| `preset` | `qwen3-tts-flash` or provider-specific preset model | Uses `voice_map` + `fallback_voices`; supported by DashScope and explicit `openai_compatible` TTS providers |
-| `clone` | Provider-specific clone model | Extracts reference audio, resolves a provider-specific clone asset, then caches the resolved voice profile |
+Default config path:
 
-### TTS Provider Routing
+```text
+~/.podtran/config.toml
+```
 
-- **TTS provider routing is explicit** — `tts.provider = "dashscope"` selects DashScope; `tts.provider = "openai_compatible"` selects the OpenAI-compatible backend.
-- **Unknown TTS provider names are rejected** — non-DashScope names no longer implicitly fall back to the OpenAI-compatible backend.
-- **Clone support is backend-specific** — qwen-local and DashScope support production `clone` mode today.
-- **Internal clone asset kinds** use `VoiceSpec` variants:
-  - `preset`
-  - `provider_clone` — provider-managed reusable clone asset (used by DashScope enrollment today)
-  - `reference_clone` — reserved for backends that can synthesize directly from reference audio/text
+`AppConfig` contains:
 
-### Clone Persistence Compatibility
+- top-level `hf_token`
+- `[providers.dashscope]`
+- `[providers.openai_compatible]`
+- `[providers.vllm_omni]`
+- `[providers.qwen_local]`
+- `[asr]`
+- `[translation]`
+- `[tts]`, `[tts.preset]`, `[tts.preset.voice_map]`, `[tts.clone]`
+- `[compose]`
 
-- Clone-related cache validity depends on the serialized `VoiceSpec` shape and stage versions.
-- When changing clone asset semantics or serialized `VoiceSpec` structure, bump the relevant stage versions in `stage_versions.py`.
+Defaults:
 
-### Memory Management
+- Translation provider: `google-free`
+- OpenAI-compatible translation default base URL: DashScope compatible-mode
+- OpenAI-compatible translation default model: `qwen-flash`
+- TTS provider: `qwen-local`
+- TTS mode: `auto`
+- `auto` mode resolves to `preset` only for `openai-compatible`; it resolves to
+  `clone` for `qwen-local`, `dashscope`, and `vllm-omni`.
+- ASR defaults: `model = "medium"`, `device = "cpu"`, `compute_type = "int8"`,
+  `batch_size = 4`.
 
-- WhisperX models are loaded sequentially and explicitly `del`-ed + `gc.collect()`-ed between stages
-  to stay within 16 GB RAM.
-- Default `asr.batch_size = 4` keeps memory usage low on CPU.
+Legacy config is intentionally rejected by `load_config()`. `podtran init` can
+rebuild legacy TTS config, write `config.toml.bak`, and preserve `hf_token` plus
+provider API keys. Old translation fields such as `translation.base_url`,
+`translation.model`, and `translation.provider = "dashscope"` are legacy; use
+`translation.provider = "openai-compatible"` plus
+`[providers.openai_compatible]` instead.
+
+Never commit real `config.toml` contents or API keys.
+
+## Provider Notes
+
+Translation providers:
+
+- `google-free`: default, no API key, uses an unofficial Google Translate web
+  endpoint and can be affected by network/rate limits.
+- `openai-compatible`: uses Chat Completions via the OpenAI SDK. DashScope
+  translation is configured through this provider and its compatible-mode URL.
+
+TTS providers:
+
+- `qwen-local`: default, supports `preset` and `clone`, uses local Qwen3-TTS
+  models through the optional `qwen-local` extra, single worker, batches matching
+  same-voice work items.
+- `dashscope`: supports `preset` and server-managed `provider_clone` voices.
+- `openai-compatible`: supports `preset` only.
+- `vllm-omni`: supports `preset` and `reference_clone` through
+  `/audio/speech`.
+
+Internal voice spec kinds:
+
+- `preset`
+- `provider_clone`
+- `reference_clone`
+
+`qwen-local` and `vllm-omni` use `reference_clone`; `dashscope` uses
+`provider_clone`.
 
 ## Coding Conventions
 
-1. **Type hints everywhere** — use `from __future__ import annotations` for deferred evaluation.
-2. **Pydantic v2 models** — all domain data is typed via `BaseModel`.
-   Use `model_dump()`, `model_copy(update={...})`, never raw dicts for domain objects.
-3. **Atomic writes** — all JSON output uses `atomic_write_text` / `atomic_write_bytes`
-   to prevent partial writes on crash.
-4. **Imports** — heavy dependencies (`whisperx`) are lazy-imported inside functions
-   to avoid loading CUDA/PyTorch at CLI parse time. `openai` and `httpx` are imported at module level.
-5. **Config keys** — when adding a config field that affects a stage's output,
-   add its dotted key to the corresponding `*_CONFIG_KEYS` list in `fingerprints.py`
-   and bump the stage version in `stage_versions.py`.
-6. **Error handling** — stages catch exceptions via `StageExecutor.fail()` which
-   records the error in the manifest and updates task status. `KeyboardInterrupt` is
-   caught separately via `StageExecutor.interrupt()` to set `"interrupted"` status.
-   Individual segment-level failures (translate, TTS) are recorded per-segment in `SegmentRecord.error`.
-7. **CLI pattern** — commands that need runtime state load it via `_load_runtime()` or `_load_task_context()`.
-8. **No globals / singletons** — all state flows through function args or dataclass instances.
+1. Use `from __future__ import annotations` in Python modules.
+2. Keep domain state in Pydantic v2 models. Prefer `model_dump()` and
+   `model_copy(update={...})` over raw dict mutation for domain data.
+3. Write JSON and binary artifacts atomically through helpers in `artifacts.py`.
+4. Lazy-import heavy optional/runtime dependencies inside functions or backend
+   methods. `whisperx`, `qwen_tts`, `torch`, and `soundfile` should not be loaded
+   by CLI help.
+5. Route runtime state through function args, `TaskStore`, `CacheStore`,
+   `FingerprintService`, and `ArtifactPaths`. Do not introduce global mutable
+   state or singletons.
+6. Let `StageExecutor.fail()` and `StageExecutor.interrupt()` record stage
+   errors. Segment-level translation/TTS failures belong on `SegmentRecord.error`.
+7. Preserve resumability: do not delete `translated.json`, `tts/`, `refs/`, or
+   `voices.json` unless the current implementation has determined the old partial
+   output is not resumable.
+8. Keep CLI commands using `_load_runtime()` or `_load_task_context()` for
+   consistent config/workdir/task/cache setup.
+9. Prefer structured parsing and Pydantic validation over ad hoc string handling.
+10. Keep tests pure Python and isolated with `tmp_path`; mock external services,
+    ffmpeg/ffprobe, model downloads, and network calls.
 
-## Important Gotchas
+## Testing Guidance
 
-- **`config.toml` lives at `~/.podtran/config.toml`** — outside the project repo. It contains API keys. Use `podtran init` to generate it.
-- **`--workdir` overrides all paths** — config, artifacts, tasks, and cache all resolve relative to the workdir. Use for testing only.
-- **`merge` is not a cached stage** — it re-derives `segments.json` from `transcript.json`
-  on every run before `translate`, so changes to merge config take effect immediately.
-- **`translate` only runs when `transcript.json` exists** — stage commands do not auto-run prerequisites.
-- **`synthesize` does not use shared cache at the stage level** — only per-segment TTS
-  results are cached in `artifacts/cache/tts/`.
-- **Clone cache compatibility is versioned by serialized `VoiceSpec` shape** — renaming clone kinds or changing clone payload structure invalidates prior TTS / voice-clone cache entries.
-- **`compose` only runs when there is at least one completed TTS output** — it does not auto-run synthesize.
-- **WhisperX requires HuggingFace token** — you must accept the `speaker-diarization-community-1`
-  model agreement on HuggingFace before diarization will work.
-- **ffmpeg and ffprobe must be on PATH** — the CLI checks this before any audio operations.
-- **Audio longer than 1 hour** — WhisperX loads the entire file into memory;
-  consider pre-splitting with ffmpeg.
+Add or update focused tests when changing:
 
+- CLI help, command routing, stage prerequisites, resume behavior, or status
+  output: `tests/test_cli.py`
+- Config shape, default values, legacy detection, config rendering, fingerprints:
+  `tests/test_config.py`
+- Translation backends and response parsing: `tests/test_translate.py`
+- TTS backends, cache behavior, concurrency, qwen-local batching, provider
+  routing: `tests/test_tts.py`
+- Voice clone resolution, reference selection, profile reuse: `tests/test_voices.py`
+- Audio helpers and compose behavior: `tests/test_audio.py`,
+  `tests/test_compose.py`
+- Task and cache store behavior: `tests/test_tasks.py`,
+  `tests/test_cache_store.py`
 
+Run the smallest relevant pytest file first, then `uv run pytest -q` before
+finishing broad changes.
+
+## Release Notes
+
+The user-facing changelog is `CHANGELOG.md` and is written in Chinese. For a
+release, update the changelog, bump `src/podtran/__init__.py`, run lint/tests,
+commit, and tag. There is a local `podtran-release` Codex skill for this
+workflow.
+
+## Gotchas
+
+- `config.toml` is outside the repo by default and can contain secrets.
+- `--workdir` changes where config, artifacts, tasks, cache, and cache indexes
+  live; use it heavily in tests.
+- WhisperX diarization needs a Hugging Face token and acceptance of the
+  `pyannote/speaker-diarization-community-1` model terms.
+- `ffmpeg` and `ffprobe` must be on `PATH` before preview, synthesize validation,
+  or compose operations.
+- `translate` requires `transcript.json`; `synthesize` requires complete
+  translations; `compose` requires complete required TTS output.
+- `qwen-local` model sizes are currently `0.6B` and `1.7B`.
+- For long audio, WhisperX can load the whole file into memory; pre-splitting is
+  still the practical fallback on constrained machines.
+- `docs/` and `.codex/` are gitignored local working areas.

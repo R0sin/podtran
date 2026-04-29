@@ -914,7 +914,7 @@ def test_synthesize_segments_ignores_global_tts_concurrency_for_qwen_local(
     assert backend.max_active_calls == 1
 
 
-def test_synthesize_segments_uses_qwen_local_provider_scoped_concurrency(
+def test_synthesize_segments_uses_single_worker_for_qwen_local(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = _paths(tmp_path)
@@ -933,14 +933,13 @@ def test_synthesize_segments_uses_qwen_local_provider_scoped_concurrency(
         paths.translated_json,
         paths.translated_json,
         AppConfig(
-            tts=TTSConfig(provider="qwen-local", mode="preset", max_concurrency=1),
-            providers={"qwen_local": {"max_concurrency": 2}},
+            tts=TTSConfig(provider="qwen-local", mode="preset", max_concurrency=8),
         ),
         paths,
     )
 
     assert backend.calls == 2
-    assert backend.max_active_calls >= 2
+    assert backend.max_active_calls == 1
 
 
 def test_synthesize_segments_batches_qwen_local_same_voice_work_items(
@@ -963,7 +962,6 @@ def test_synthesize_segments_batches_qwen_local_same_voice_work_items(
         paths.translated_json,
         AppConfig(
             tts=TTSConfig(provider="qwen-local", mode="preset", batch_size=3),
-            providers={"qwen_local": {"max_concurrency": 1}},
         ),
         paths,
     )

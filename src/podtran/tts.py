@@ -1178,9 +1178,8 @@ def _ensure_batch_compatible(
 
 def _synthesis_worker_count(config: AppConfig, work_item_count: int) -> int:
     if config.tts.provider.strip().lower() == "qwen-local":
-        concurrency = config.providers.qwen_local.max_concurrency
-    else:
-        concurrency = config.tts.max_concurrency
+        return 1
+    concurrency = config.tts.max_concurrency
     return min(max(1, concurrency), work_item_count)
 
 

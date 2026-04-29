@@ -6,7 +6,6 @@ from podtran.config import (
     AppConfig,
     DEFAULT_QWEN_LOCAL_MODEL_SIZE,
     DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION,
-    DEFAULT_QWEN_LOCAL_MAX_CONCURRENCY,
     DEFAULT_QWEN_LOCAL_TORCH_DTYPE,
     DEFAULT_TRANSLATION_BASE_URL,
     DEFAULT_TRANSLATION_MODEL,
@@ -62,7 +61,6 @@ x_vector_only_mode = true
 [providers.qwen_local]
 clone_model_size = "1.7B"
 preset_model_size = "0.6B"
-max_concurrency = 2
 device = "cuda"
 torch_dtype = "float16"
 attn_implementation = "flash_attention_2"
@@ -106,7 +104,6 @@ max_ref_seconds = 18
     )
     assert config.providers.vllm_omni.instructions == "Warm broadcast tone."
     assert config.providers.qwen_local.clone_model_size == "1.7B"
-    assert config.providers.qwen_local.max_concurrency == 2
     assert config.providers.qwen_local.torch_dtype == "float16"
     assert config.providers.qwen_local.attn_implementation == "flash_attention_2"
     assert config.translation.provider == "openai-compatible"
@@ -194,10 +191,6 @@ def test_provider_helpers_resolve_defaults_and_overrides() -> None:
     assert config.tts.max_concurrency == 4
     assert config.providers.vllm_omni.language == DEFAULT_VLLM_OMNI_LANGUAGE
     assert config.providers.qwen_local.clone_model_size == DEFAULT_QWEN_LOCAL_MODEL_SIZE
-    assert (
-        config.providers.qwen_local.max_concurrency
-        == DEFAULT_QWEN_LOCAL_MAX_CONCURRENCY
-    )
     assert config.providers.qwen_local.torch_dtype == DEFAULT_QWEN_LOCAL_TORCH_DTYPE
     assert (
         config.providers.qwen_local.attn_implementation
@@ -250,7 +243,10 @@ def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None
     assert 'provider = "google-free"' in rendered
     assert f'tts_clone_model = "{DEFAULT_TTS_CLONE_MODEL}"' in rendered
     assert f'clone_model_size = "{DEFAULT_QWEN_LOCAL_MODEL_SIZE}"' in rendered
-    assert f"max_concurrency = {DEFAULT_QWEN_LOCAL_MAX_CONCURRENCY}" in rendered
+    qwen_local_section = rendered.split("[providers.qwen_local]", 1)[1].split(
+        "[translation]", 1
+    )[0]
+    assert "max_concurrency" not in qwen_local_section
     assert f'torch_dtype = "{DEFAULT_QWEN_LOCAL_TORCH_DTYPE}"' in rendered
     assert (
         f'attn_implementation = "{DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION}"' in rendered
@@ -364,7 +360,6 @@ def test_tts_runtime_scheduling_fields_do_not_affect_fingerprints(
     first = AppConfig(tts={"provider": "qwen-local"})
     second = AppConfig(
         tts={"provider": "qwen-local", "batch_size": 4, "max_concurrency": 8},
-        providers={"qwen_local": {"max_concurrency": 2}},
     )
 
     assert fingerprints.hash_config_subset(

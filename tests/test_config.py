@@ -6,6 +6,7 @@ from podtran.config import (
     AppConfig,
     DEFAULT_QWEN_LOCAL_MODEL_SIZE,
     DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION,
+    DEFAULT_QWEN_LOCAL_MAX_CONCURRENCY,
     DEFAULT_QWEN_LOCAL_TORCH_DTYPE,
     DEFAULT_TRANSLATION_BASE_URL,
     DEFAULT_TRANSLATION_MODEL,
@@ -61,6 +62,7 @@ x_vector_only_mode = true
 [providers.qwen_local]
 clone_model_size = "1.7B"
 preset_model_size = "0.6B"
+max_concurrency = 2
 device = "cuda"
 torch_dtype = "float16"
 attn_implementation = "flash_attention_2"
@@ -78,6 +80,7 @@ max_concurrency = 3
 provider = "qwen-local"
 mode = "clone"
 timeout_seconds = 60
+batch_size = 4
 max_concurrency = 2
 
 [tts.preset]
@@ -103,11 +106,13 @@ max_ref_seconds = 18
     )
     assert config.providers.vllm_omni.instructions == "Warm broadcast tone."
     assert config.providers.qwen_local.clone_model_size == "1.7B"
+    assert config.providers.qwen_local.max_concurrency == 2
     assert config.providers.qwen_local.torch_dtype == "float16"
     assert config.providers.qwen_local.attn_implementation == "flash_attention_2"
     assert config.translation.provider == "openai-compatible"
     assert config.translation.timeout_seconds == 90
     assert config.tts.provider == "qwen-local"
+    assert config.tts.batch_size == 4
     assert config.tts.clone.min_ref_seconds == 8
     assert config.tts.preset.voice_map == {"SPEAKER_00": "Vivian"}
 
@@ -185,8 +190,14 @@ def test_provider_helpers_resolve_defaults_and_overrides() -> None:
     assert config.tts_preset_model() == DEFAULT_TTS_PRESET_MODEL
     assert config.tts_clone_model() == DEFAULT_TTS_CLONE_MODEL
     assert config.tts.timeout_seconds == DEFAULT_TTS_TIMEOUT_SECONDS
+    assert config.tts.batch_size == 1
+    assert config.tts.max_concurrency == 4
     assert config.providers.vllm_omni.language == DEFAULT_VLLM_OMNI_LANGUAGE
     assert config.providers.qwen_local.clone_model_size == DEFAULT_QWEN_LOCAL_MODEL_SIZE
+    assert (
+        config.providers.qwen_local.max_concurrency
+        == DEFAULT_QWEN_LOCAL_MAX_CONCURRENCY
+    )
     assert config.providers.qwen_local.torch_dtype == DEFAULT_QWEN_LOCAL_TORCH_DTYPE
     assert (
         config.providers.qwen_local.attn_implementation
@@ -239,6 +250,7 @@ def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None
     assert 'provider = "google-free"' in rendered
     assert f'tts_clone_model = "{DEFAULT_TTS_CLONE_MODEL}"' in rendered
     assert f'clone_model_size = "{DEFAULT_QWEN_LOCAL_MODEL_SIZE}"' in rendered
+    assert f"max_concurrency = {DEFAULT_QWEN_LOCAL_MAX_CONCURRENCY}" in rendered
     assert f'torch_dtype = "{DEFAULT_QWEN_LOCAL_TORCH_DTYPE}"' in rendered
     assert (
         f'attn_implementation = "{DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION}"' in rendered
@@ -256,6 +268,7 @@ def test_render_config_toml_uses_provider_scoped_tts_sections() -> None:
 
     assert "[tts]" in rendered
     assert 'mode = "auto"' in rendered
+    assert "batch_size = 1" in rendered
     assert "[tts.preset]" in rendered
     assert "[tts.preset.voice_map]" in rendered
     assert "[tts.clone]" in rendered
@@ -342,6 +355,24 @@ def test_qwen_local_runtime_fields_affect_tts_and_voice_clone_fingerprints(
     assert fingerprints.hash_config_subset(
         first, VOICE_CLONE_CONFIG_KEYS
     ) != fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
+
+
+def test_tts_runtime_scheduling_fields_do_not_affect_fingerprints(
+    tmp_path: Path,
+) -> None:
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    first = AppConfig(tts={"provider": "qwen-local"})
+    second = AppConfig(
+        tts={"provider": "qwen-local", "batch_size": 4, "max_concurrency": 8},
+        providers={"qwen_local": {"max_concurrency": 2}},
+    )
+
+    assert fingerprints.hash_config_subset(
+        first, TTS_CONFIG_KEYS
+    ) == fingerprints.hash_config_subset(second, TTS_CONFIG_KEYS)
+    assert fingerprints.hash_config_subset(
+        first, VOICE_CLONE_CONFIG_KEYS
+    ) == fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
 
 
 def test_detect_legacy_translation_keys_detects_dashscope_provider() -> None:

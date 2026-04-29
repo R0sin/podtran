@@ -66,11 +66,21 @@ QWEN_LOCAL_CUSTOM_VOICE_MODELS = {
 QWEN_LOCAL_ATTN_IMPLEMENTATIONS = frozenset({"flash_attention_2", "sdpa", "eager"})
 
 
+@dataclass(slots=True)
+class _TTSBatchRequest:
+    text: str
+    output_path: Path
+
+
 class TTSBackend(Protocol):
     supported_voice_kinds: frozenset[str]
 
     def synthesize(
         self, text: str, spec: VoiceSpec, model: str, output_path: Path
+    ) -> None: ...
+
+    def synthesize_batch(
+        self, requests: list[_TTSBatchRequest], spec: VoiceSpec, model: str
     ) -> None: ...
 
 
@@ -112,6 +122,12 @@ class DashScopeTTSBackend:
         audio_response = self.client.get(audio_url)
         audio_response.raise_for_status()
         atomic_write_bytes(output_path, audio_response.content)
+
+    def synthesize_batch(
+        self, requests: list[_TTSBatchRequest], spec: VoiceSpec, model: str
+    ) -> None:
+        for request in requests:
+            self.synthesize(request.text, spec, model, request.output_path)
 
     def _voice_value(self, spec: VoiceSpec) -> str:
         if isinstance(spec, PresetVoiceSpec):
@@ -157,6 +173,12 @@ class OpenAICompatibleTTSBackend:
         )
         payload = _read_binary_response(response)
         atomic_write_bytes(output_path, payload)
+
+    def synthesize_batch(
+        self, requests: list[_TTSBatchRequest], spec: VoiceSpec, model: str
+    ) -> None:
+        for request in requests:
+            self.synthesize(request.text, spec, model, request.output_path)
 
 
 class VllmOmniTTSBackend:
@@ -216,6 +238,12 @@ class VllmOmniTTSBackend:
         response.raise_for_status()
         atomic_write_bytes(output_path, response.content)
 
+    def synthesize_batch(
+        self, requests: list[_TTSBatchRequest], spec: VoiceSpec, model: str
+    ) -> None:
+        for request in requests:
+            self.synthesize(request.text, spec, model, request.output_path)
+
 
 class QwenLocalTTSBackend:
     supported_voice_kinds = frozenset({"preset", "reference_clone"})
@@ -239,6 +267,23 @@ class QwenLocalTTSBackend:
             return
         raise RuntimeError(f"Qwen local TTS does not support voice kind: {spec.kind}")
 
+    def synthesize_batch(
+        self, requests: list[_TTSBatchRequest], spec: VoiceSpec, model: str
+    ) -> None:
+        if not requests:
+            return
+        if len(requests) == 1:
+            request = requests[0]
+            self.synthesize(request.text, spec, model, request.output_path)
+            return
+        if isinstance(spec, PresetVoiceSpec):
+            self._synthesize_preset_batch(requests, spec)
+            return
+        if isinstance(spec, ReferenceCloneSpec):
+            self._synthesize_clone_batch(requests, spec)
+            return
+        raise RuntimeError(f"Qwen local TTS does not support voice kind: {spec.kind}")
+
     def _synthesize_preset(
         self, text: str, spec: PresetVoiceSpec, output_path: Path
     ) -> None:
@@ -252,6 +297,20 @@ class QwenLocalTTSBackend:
             instruct=self.config.providers.qwen_local.instructions or None,
         )
         _write_wav(output_path, wavs[0], sample_rate)
+
+    def _synthesize_preset_batch(
+        self, requests: list[_TTSBatchRequest], spec: PresetVoiceSpec
+    ) -> None:
+        model = self._load_model(
+            "customvoice", self.config.providers.qwen_local.preset_model_size
+        )
+        wavs, sample_rate = model.generate_custom_voice(
+            text=[request.text for request in requests],
+            language=[self.config.providers.qwen_local.language] * len(requests),
+            speaker=spec.voice_name,
+            instruct=self.config.providers.qwen_local.instructions or None,
+        )
+        _write_batch_wavs(requests, wavs, sample_rate)
 
     def _synthesize_clone(
         self, text: str, spec: ReferenceCloneSpec, output_path: Path
@@ -267,6 +326,21 @@ class QwenLocalTTSBackend:
             instruct=self.config.providers.qwen_local.instructions or None,
         )
         _write_wav(output_path, wavs[0], sample_rate)
+
+    def _synthesize_clone_batch(
+        self, requests: list[_TTSBatchRequest], spec: ReferenceCloneSpec
+    ) -> None:
+        model = self._load_model(
+            "base", self.config.providers.qwen_local.clone_model_size
+        )
+        prompt = self._voice_prompt(model, spec)
+        wavs, sample_rate = model.generate_voice_clone(
+            text=[request.text for request in requests],
+            language=[self.config.providers.qwen_local.language] * len(requests),
+            voice_clone_prompt=prompt,
+            instruct=self.config.providers.qwen_local.instructions or None,
+        )
+        _write_batch_wavs(requests, wavs, sample_rate)
 
     def _voice_prompt(self, model: object, spec: ReferenceCloneSpec) -> object:
         key = spec.payload.reference_fingerprint.strip() or spec.identity
@@ -381,6 +455,17 @@ class _SynthesisResult:
 
 @dataclass(slots=True)
 class _SynthesisWorkerOutcome:
+    batch: _SynthesisBatchWorkItem
+    payload: list[_SynthesisItemOutcome] | BaseException
+
+
+@dataclass(slots=True)
+class _SynthesisBatchWorkItem:
+    items: list[_SynthesisWorkItem]
+
+
+@dataclass(slots=True)
+class _SynthesisItemOutcome:
     item: _SynthesisWorkItem
     payload: _SynthesisResult | BaseException
 
@@ -533,13 +618,14 @@ def synthesize_segments(
             stage_total,
             "Synthesizing audio",
         )
-        max_workers = _synthesis_worker_count(config, len(work_items))
-        work_queue: queue.Queue[_SynthesisWorkItem] = queue.Queue()
+        work_batches = _synthesis_work_batches(config, list(work_items.values()))
+        max_workers = _synthesis_worker_count(config, len(work_batches))
+        work_queue: queue.Queue[_SynthesisBatchWorkItem] = queue.Queue()
         result_queue: queue.Queue[_SynthesisWorkerOutcome] = queue.Queue()
         stop_event = threading.Event()
 
-        for item in work_items.values():
-            work_queue.put(item)
+        for batch in work_batches:
+            work_queue.put(batch)
 
         worker_count = max_workers
         for index in range(worker_count):
@@ -552,40 +638,25 @@ def synthesize_segments(
 
         def handle_outcome(outcome: _SynthesisWorkerOutcome) -> None:
             nonlocal processed_segments
-            item = outcome.item
             payload = outcome.payload
             if isinstance(payload, KeyboardInterrupt):
                 raise payload
             if isinstance(payload, BaseException):
-                for pending in item.segments:
-                    segment = segments[pending.segment_index]
-                    _mark_segment_failed(segment, str(payload))
-                    processed_segments += 1
+                for item in outcome.batch.items:
+                    processed_segments += mark_item_failed(item, str(payload))
             else:
-                if item.cache_key and cache_store and fingerprints:
-                    cache_store.publish(
-                        "tts",
-                        item.cache_key,
-                        {"audio": payload.output_path},
-                        _build_tts_manifest(
-                            item.text_zh,
-                            item.target.spec,
-                            item.model,
-                            item.cache_key,
-                            tts_config_fingerprint,
-                            fingerprints,
-                        ),
-                    )
-                for pending in item.segments:
-                    destination = pending.audio_path
-                    if destination.resolve() != payload.output_path.resolve():
-                        copy_path(payload.output_path, destination)
-                    _mark_segment_completed(
-                        segments[pending.segment_index],
-                        destination,
-                        payload.duration_ms,
-                    )
-                    processed_segments += 1
+                for item_outcome in payload:
+                    item_payload = item_outcome.payload
+                    if isinstance(item_payload, KeyboardInterrupt):
+                        raise item_payload
+                    if isinstance(item_payload, BaseException):
+                        processed_segments += mark_item_failed(
+                            item_outcome.item, str(item_payload)
+                        )
+                    else:
+                        processed_segments += mark_item_completed(
+                            item_outcome.item, item_payload
+                        )
             write_json(output_path, segments)
             _emit_segment_progress(
                 progress_callback,
@@ -594,8 +665,46 @@ def synthesize_segments(
                 "Synthesizing audio",
             )
 
+        def mark_item_failed(item: _SynthesisWorkItem, error: str) -> int:
+            marked = 0
+            for pending in item.segments:
+                segment = segments[pending.segment_index]
+                _mark_segment_failed(segment, error)
+                marked += 1
+            return marked
+
+        def mark_item_completed(
+            item: _SynthesisWorkItem, item_payload: _SynthesisResult
+        ) -> int:
+            if item.cache_key and cache_store and fingerprints:
+                cache_store.publish(
+                    "tts",
+                    item.cache_key,
+                    {"audio": item_payload.output_path},
+                    _build_tts_manifest(
+                        item.text_zh,
+                        item.target.spec,
+                        item.model,
+                        item.cache_key,
+                        tts_config_fingerprint,
+                        fingerprints,
+                    ),
+                )
+            marked = 0
+            for pending in item.segments:
+                destination = pending.audio_path
+                if destination.resolve() != item_payload.output_path.resolve():
+                    copy_path(item_payload.output_path, destination)
+                _mark_segment_completed(
+                    segments[pending.segment_index],
+                    destination,
+                    item_payload.duration_ms,
+                )
+                marked += 1
+            return marked
+
         completed_items = 0
-        total_items = len(work_items)
+        total_items = len(work_batches)
         try:
             while completed_items < total_items:
                 try:
@@ -769,6 +878,40 @@ def _tts_work_key(segment: SegmentRecord, spec: VoiceSpec, model: str) -> str:
     )
 
 
+def _tts_batch_key(item: _SynthesisWorkItem) -> str:
+    return json.dumps(
+        {
+            "voice_spec": item.target.spec.model_dump(),
+            "model": item.model,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _synthesis_work_batches(
+    config: AppConfig, work_items: list[_SynthesisWorkItem]
+) -> list[_SynthesisBatchWorkItem]:
+    if config.tts.provider.strip().lower() != "qwen-local":
+        return [_SynthesisBatchWorkItem(items=[item]) for item in work_items]
+
+    batch_size = max(1, config.tts.batch_size)
+    if batch_size == 1:
+        return [_SynthesisBatchWorkItem(items=[item]) for item in work_items]
+
+    groups: dict[str, list[_SynthesisWorkItem]] = {}
+    for item in work_items:
+        groups.setdefault(_tts_batch_key(item), []).append(item)
+
+    batches: list[_SynthesisBatchWorkItem] = []
+    for group in groups.values():
+        for start in range(0, len(group), batch_size):
+            batches.append(
+                _SynthesisBatchWorkItem(items=group[start : start + batch_size])
+            )
+    return batches
+
+
 def _synthesize_work_item(
     backend: TTSBackend, item: _SynthesisWorkItem
 ) -> _SynthesisResult:
@@ -782,9 +925,73 @@ def _synthesize_work_item(
     return _SynthesisResult(output_path=item.output_path, duration_ms=duration_ms)
 
 
+def _synthesize_batch_work_item(
+    backend: TTSBackend, batch: _SynthesisBatchWorkItem
+) -> list[_SynthesisItemOutcome]:
+    items = batch.items
+    if not items:
+        return []
+    if len(items) == 1:
+        item = items[0]
+        try:
+            payload: _SynthesisResult | BaseException = _synthesize_work_item(
+                backend, item
+            )
+        except BaseException as exc:
+            payload = exc
+        return [_SynthesisItemOutcome(item=item, payload=payload)]
+
+    try:
+        _ensure_batch_compatible(backend, items)
+        first = items[0]
+        backend.synthesize_batch(
+            [
+                _TTSBatchRequest(text=item.text_zh, output_path=item.output_path)
+                for item in items
+            ],
+            first.target.spec,
+            first.model,
+        )
+        return [
+            _SynthesisItemOutcome(item=item, payload=_validated_synthesis_result(item))
+            for item in items
+        ]
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        outcomes: list[_SynthesisItemOutcome] = []
+        for item in items:
+            outcome = _synthesize_with_fallback(backend, item)
+            if isinstance(outcome.payload, KeyboardInterrupt):
+                raise outcome.payload
+            outcomes.append(outcome)
+        return outcomes
+
+
+def _synthesize_with_fallback(
+    backend: TTSBackend, item: _SynthesisWorkItem
+) -> _SynthesisItemOutcome:
+    try:
+        payload: _SynthesisResult | BaseException = _synthesize_work_item(backend, item)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as exc:
+        payload = exc
+    return _SynthesisItemOutcome(item=item, payload=payload)
+
+
+def _validated_synthesis_result(item: _SynthesisWorkItem) -> _SynthesisResult:
+    try:
+        duration_ms = _validated_tts_duration_ms(item.output_path)
+    except RuntimeError:
+        _discard_invalid_tts_audio(item.output_path)
+        raise
+    return _SynthesisResult(output_path=item.output_path, duration_ms=duration_ms)
+
+
 def _synthesis_worker(
     config: AppConfig,
-    work_queue: queue.Queue[_SynthesisWorkItem],
+    work_queue: queue.Queue[_SynthesisBatchWorkItem],
     result_queue: queue.Queue[_SynthesisWorkerOutcome],
     stop_event: threading.Event,
 ) -> None:
@@ -802,14 +1009,14 @@ def _synthesis_worker(
         try:
             if backend is None:
                 backend = build_tts_backend(config)
-            payload: _SynthesisResult | BaseException = _synthesize_work_item(
-                backend, item
+            payload: list[_SynthesisItemOutcome] | BaseException = (
+                _synthesize_batch_work_item(backend, item)
             )
         except (
             BaseException
         ) as exc:  # pragma: no cover - exercised through main-thread handling
             payload = exc
-        result_queue.put(_SynthesisWorkerOutcome(item=item, payload=payload))
+        result_queue.put(_SynthesisWorkerOutcome(batch=item, payload=payload))
         work_queue.task_done()
 
 
@@ -957,10 +1164,24 @@ def _ensure_backend_supports_spec(backend: TTSBackend, spec: VoiceSpec) -> None:
     raise RuntimeError(f"TTS provider does not support voice kind: {spec.kind}")
 
 
+def _ensure_batch_compatible(
+    backend: TTSBackend, items: list[_SynthesisWorkItem]
+) -> None:
+    first = items[0]
+    _ensure_backend_supports_spec(backend, first.target.spec)
+    first_key = _tts_batch_key(first)
+    for item in items[1:]:
+        _ensure_backend_supports_spec(backend, item.target.spec)
+        if _tts_batch_key(item) != first_key:
+            raise RuntimeError("TTS batch contains incompatible voice specs or models.")
+
+
 def _synthesis_worker_count(config: AppConfig, work_item_count: int) -> int:
     if config.tts.provider.strip().lower() == "qwen-local":
-        return 1
-    return min(max(1, config.tts.max_concurrency), work_item_count)
+        concurrency = config.providers.qwen_local.max_concurrency
+    else:
+        concurrency = config.tts.max_concurrency
+    return min(max(1, concurrency), work_item_count)
 
 
 def _normalize_qwen_model_size(size: str) -> str:
@@ -1064,3 +1285,21 @@ def _write_wav(output_path: Path, audio: object, sample_rate: int) -> None:
     buffer = io.BytesIO()
     sf.write(buffer, audio, sample_rate, format="WAV")
     atomic_write_bytes(output_path, buffer.getvalue())
+
+
+def _write_batch_wavs(
+    requests: list[_TTSBatchRequest], wavs: object, sample_rate: int
+) -> None:
+    try:
+        wav_list = list(wavs)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise RuntimeError(
+            "qwen-local batch synthesis returned non-iterable audio."
+        ) from exc
+    if len(wav_list) != len(requests):
+        raise RuntimeError(
+            "qwen-local batch synthesis returned "
+            f"{len(wav_list)} wav(s) for {len(requests)} request(s)."
+        )
+    for request, audio in zip(requests, wav_list, strict=True):
+        _write_wav(request.output_path, audio, sample_rate)

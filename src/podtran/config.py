@@ -26,6 +26,7 @@ DEFAULT_QWEN_LOCAL_MODEL_SIZE = "0.6B"
 DEFAULT_QWEN_LOCAL_LANGUAGE = "Chinese"
 DEFAULT_QWEN_LOCAL_TORCH_DTYPE = "auto"
 DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION = "auto"
+DEFAULT_QWEN_LOCAL_MAX_CONCURRENCY = 1
 DEFAULT_WORKDIR = Path("~/.podtran")
 DEFAULT_CONFIG_FILENAME = "podtran.toml"
 DEFAULT_FALLBACK_VOICES = ["Cherry", "Serena", "Ethan", "Chelsie"]
@@ -84,6 +85,7 @@ class QwenLocalProviderConfig(BaseModel):
 
     clone_model_size: str = DEFAULT_QWEN_LOCAL_MODEL_SIZE
     preset_model_size: str = DEFAULT_QWEN_LOCAL_MODEL_SIZE
+    max_concurrency: int = DEFAULT_QWEN_LOCAL_MAX_CONCURRENCY
     device: str = "auto"
     torch_dtype: str = DEFAULT_QWEN_LOCAL_TORCH_DTYPE
     attn_implementation: str = DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION
@@ -134,6 +136,7 @@ class TTSConfig(BaseModel):
     provider: str = DEFAULT_TTS_PROVIDER
     mode: VoiceMode = "auto"
     timeout_seconds: int = DEFAULT_TTS_TIMEOUT_SECONDS
+    batch_size: int = 1
     max_concurrency: int = 4
     preset: TTSPresetConfig = Field(default_factory=TTSPresetConfig)
     clone: TTSCloneConfig = Field(default_factory=TTSCloneConfig)
@@ -351,6 +354,8 @@ def render_config_toml(config: AppConfig) -> str:
         "[providers.qwen_local]",
         f'clone_model_size = "{config.providers.qwen_local.clone_model_size}"',
         f'preset_model_size = "{config.providers.qwen_local.preset_model_size}"',
+        "# qwen-local worker count. Each worker loads a model instance, increasing VRAM use.",
+        f"max_concurrency = {config.providers.qwen_local.max_concurrency}",
         f'device = "{config.providers.qwen_local.device}"',
         f'torch_dtype = "{config.providers.qwen_local.torch_dtype}"',
         f'attn_implementation = "{config.providers.qwen_local.attn_implementation}"',
@@ -370,7 +375,9 @@ def render_config_toml(config: AppConfig) -> str:
         f'provider = "{config.tts.provider}"',
         f'mode = "{config.tts.mode}"',
         f"timeout_seconds = {config.tts.timeout_seconds}",
-        "# Segment-level synthesis concurrency. Lower this if your TTS provider rate-limits aggressively.",
+        "# qwen-local only: number of text segments per local model call.",
+        f"batch_size = {config.tts.batch_size}",
+        "# API TTS worker concurrency. qwen-local uses providers.qwen_local.max_concurrency instead.",
         f"max_concurrency = {config.tts.max_concurrency}",
         "",
         "[tts.preset]",

@@ -50,6 +50,10 @@ class _DummyBackend:
         self.calls += 1
         output_path.write_bytes(b"wav")
 
+    def synthesize_batch(self, requests, spec, model: str) -> None:
+        for request in requests:
+            self.synthesize(request.text, spec, model, request.output_path)
+
 
 class _TrackingBackend:
     supported_voice_kinds = frozenset({"preset", "provider_clone", "reference_clone"})
@@ -80,6 +84,51 @@ class _TrackingBackend:
                 self.active_calls -= 1
 
 
+class _BatchTrackingBackend:
+    supported_voice_kinds = frozenset({"preset", "provider_clone", "reference_clone"})
+
+    def __init__(
+        self,
+        *,
+        fail_batch: bool = False,
+        fail_texts: set[str] | None = None,
+        sleep_seconds: float = 0.0,
+    ) -> None:
+        self.synthesize_calls: list[str] = []
+        self.batch_calls: list[list[str]] = []
+        self.fail_batch = fail_batch
+        self.fail_texts = fail_texts or set()
+        self.sleep_seconds = sleep_seconds
+        self.active_calls = 0
+        self.max_active_calls = 0
+        self._lock = threading.Lock()
+
+    def synthesize(self, text: str, spec, model: str, output_path: Path) -> None:
+        _ = (spec, model)
+        with self._lock:
+            self.synthesize_calls.append(text)
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            if self.sleep_seconds:
+                time.sleep(self.sleep_seconds)
+            if text in self.fail_texts:
+                raise RuntimeError(f"boom: {text}")
+            output_path.write_bytes(text.encode("utf-8"))
+        finally:
+            with self._lock:
+                self.active_calls -= 1
+
+    def synthesize_batch(self, requests, spec, model: str) -> None:
+        _ = (spec, model)
+        texts = [request.text for request in requests]
+        self.batch_calls.append(texts)
+        if self.fail_batch:
+            raise RuntimeError("batch failed")
+        for request in requests:
+            request.output_path.write_bytes(request.text.encode("utf-8"))
+
+
 class _InterruptingBackend:
     supported_voice_kinds = frozenset({"preset", "provider_clone", "reference_clone"})
 
@@ -93,6 +142,10 @@ class _InterruptingBackend:
             output_path.write_bytes(b"wav")
             return
         raise KeyboardInterrupt()
+
+    def synthesize_batch(self, requests, spec, model: str) -> None:
+        for request in requests:
+            self.synthesize(request.text, spec, model, request.output_path)
 
 
 def _paths(tmp_path: Path, task_id: str = "task-1") -> ArtifactPaths:
@@ -833,7 +886,7 @@ def test_synthesize_segments_respects_max_concurrency_of_one(
     assert backend.max_active_calls == 1
 
 
-def test_synthesize_segments_forces_qwen_local_concurrency_to_one(
+def test_synthesize_segments_ignores_global_tts_concurrency_for_qwen_local(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = _paths(tmp_path)
@@ -859,6 +912,147 @@ def test_synthesize_segments_forces_qwen_local_concurrency_to_one(
 
     assert backend.calls == 2
     assert backend.max_active_calls == 1
+
+
+def test_synthesize_segments_uses_qwen_local_provider_scoped_concurrency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "你好一"),
+        _segment_with_text("seg_2", "你好二"),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _TrackingBackend()
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(
+            tts=TTSConfig(provider="qwen-local", mode="preset", max_concurrency=1),
+            providers={"qwen_local": {"max_concurrency": 2}},
+        ),
+        paths,
+    )
+
+    assert backend.calls == 2
+    assert backend.max_active_calls >= 2
+
+
+def test_synthesize_segments_batches_qwen_local_same_voice_work_items(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "你好一"),
+        _segment_with_text("seg_2", "你好二"),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _BatchTrackingBackend()
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(
+            tts=TTSConfig(provider="qwen-local", mode="preset", batch_size=3),
+            providers={"qwen_local": {"max_concurrency": 1}},
+        ),
+        paths,
+    )
+
+    assert backend.batch_calls == [["你好一", "你好二"]]
+    assert backend.synthesize_calls == []
+
+
+def test_synthesize_segments_does_not_batch_non_qwen_local_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "你好一"),
+        _segment_with_text("seg_2", "你好二"),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _BatchTrackingBackend()
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(tts=TTSConfig(mode="preset", batch_size=3, max_concurrency=1)),
+        paths,
+    )
+
+    assert backend.batch_calls == []
+    assert backend.synthesize_calls == ["你好一", "你好二"]
+
+
+def test_synthesize_segments_does_not_mix_qwen_local_voices_in_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "你好一", voice="Cherry"),
+        _segment_with_text("seg_2", "你好二", voice="Serena").model_copy(
+            update={"speaker": "SPEAKER_01"}
+        ),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _BatchTrackingBackend()
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(tts=TTSConfig(provider="qwen-local", mode="preset", batch_size=2)),
+        paths,
+    )
+
+    assert backend.batch_calls == []
+    assert backend.synthesize_calls == ["你好一", "你好二"]
+
+
+def test_synthesize_segments_falls_back_to_single_items_when_qwen_local_batch_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    segments = [
+        _segment_with_text("seg_1", "good"),
+        _segment_with_text("seg_2", "bad"),
+    ]
+    write_json(paths.translated_json, segments)
+    backend = _BatchTrackingBackend(fail_batch=True, fail_texts={"bad"})
+
+    monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
+    monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
+
+    synthesized = synthesize_segments(
+        paths.translated_json,
+        paths.translated_json,
+        AppConfig(tts=TTSConfig(provider="qwen-local", mode="preset", batch_size=2)),
+        paths,
+    )
+
+    assert backend.batch_calls == [["good", "bad"]]
+    assert backend.synthesize_calls == ["good", "bad"]
+    assert synthesized[0].status == "completed"
+    assert synthesized[1].status == "failed"
+    assert synthesized[1].error == "boom: bad"
 
 
 def test_qwen_local_backend_generates_preset_audio(
@@ -899,6 +1093,50 @@ def test_qwen_local_backend_generates_preset_audio(
     assert calls[0]["repo"] == "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
     assert calls[1]["speaker"] == "Vivian"
     assert calls[1]["language"] == "Chinese"
+
+
+def test_qwen_local_backend_batches_preset_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class _Model:
+        @classmethod
+        def from_pretrained(cls, repo: str, **kwargs):
+            calls.append({"repo": repo, "kwargs": kwargs})
+            return cls()
+
+        def generate_custom_voice(self, **kwargs):
+            calls.append(kwargs)
+            return [["one"], ["two"]], 24000
+
+    monkeypatch.setitem(
+        sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=_Model)
+    )
+    monkeypatch.setattr(
+        "podtran.tts._write_wav",
+        lambda output_path, audio, sample_rate: output_path.write_text(str(audio)),
+    )
+
+    backend = QwenLocalTTSBackend(
+        AppConfig(tts={"provider": "qwen-local", "mode": "preset"})
+    )
+    one = tmp_path / "one.wav"
+    two = tmp_path / "two.wav"
+    backend.synthesize_batch(
+        [
+            types.SimpleNamespace(text="你好一", output_path=one),
+            types.SimpleNamespace(text="你好二", output_path=two),
+        ],
+        PresetVoiceSpec(identity="preset:Vivian", voice_name="Vivian"),
+        "qwen-local:customvoice:0.6B",
+    )
+
+    assert calls[1]["text"] == ["你好一", "你好二"]
+    assert calls[1]["language"] == ["Chinese", "Chinese"]
+    assert calls[1]["speaker"] == "Vivian"
+    assert one.read_text() == "['one']"
+    assert two.read_text() == "['two']"
 
 
 def test_qwen_local_backend_passes_dtype_and_attention_config(
@@ -1049,6 +1287,64 @@ def test_qwen_local_backend_prefers_spec_x_vector_flag_and_caches_prompt(
 
     assert prompt_calls == 1
     assert generate_calls == 2
+
+
+def test_qwen_local_backend_batches_clone_audio_and_reuses_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference_audio = tmp_path / "reference.wav"
+    reference_audio.write_bytes(b"ref")
+    prompt_calls = 0
+    generate_calls: list[dict[str, object]] = []
+
+    class _Model:
+        @classmethod
+        def from_pretrained(cls, repo: str, **kwargs):
+            _ = (repo, kwargs)
+            return cls()
+
+        def create_voice_clone_prompt(self, **kwargs):
+            nonlocal prompt_calls
+            prompt_calls += 1
+            return {"prompt": kwargs["ref_text"]}
+
+        def generate_voice_clone(self, **kwargs):
+            generate_calls.append(kwargs)
+            return [["one"], ["two"]], 24000
+
+    monkeypatch.setitem(
+        sys.modules, "qwen_tts", types.SimpleNamespace(Qwen3TTSModel=_Model)
+    )
+    monkeypatch.setattr(
+        "podtran.tts._write_wav",
+        lambda output_path, audio, sample_rate: output_path.write_text(str(audio)),
+    )
+    backend = QwenLocalTTSBackend(
+        AppConfig(tts={"provider": "qwen-local", "mode": "clone"})
+    )
+    spec = ReferenceCloneSpec(
+        identity="qwen-local:reference_clone:ref-1",
+        provider="qwen-local",
+        payload=ReferenceClonePayload(
+            reference_fingerprint="ref-1",
+            reference_audio_path=str(reference_audio),
+            reference_text="reference text",
+        ),
+    )
+
+    backend.synthesize_batch(
+        [
+            types.SimpleNamespace(text="你好一", output_path=tmp_path / "one.wav"),
+            types.SimpleNamespace(text="你好二", output_path=tmp_path / "two.wav"),
+        ],
+        spec,
+        "qwen-local:base:0.6B",
+    )
+
+    assert prompt_calls == 1
+    assert generate_calls[0]["text"] == ["你好一", "你好二"]
+    assert generate_calls[0]["language"] == ["Chinese", "Chinese"]
+    assert generate_calls[0]["voice_clone_prompt"] == {"prompt": "reference text"}
 
 
 def test_reference_clone_missing_text_error_is_provider_agnostic() -> None:

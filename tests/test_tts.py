@@ -1,3 +1,4 @@
+import base64
 from pathlib import Path
 import signal
 import sys
@@ -27,8 +28,10 @@ from podtran.models import (
 )
 from podtran.voices import UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE
 from podtran.tts import (
+    MimoTTSBackend,
     QwenLocalTTSBackend,
     VllmOmniTTSBackend,
+    _resolve_mimo_api_key,
     _resolve_reference_text,
     _resolve_qwen_local_torch_dtype,
     _resolve_openai_compatible_api_key,
@@ -241,6 +244,14 @@ def test_build_tts_backend_supports_qwen_local_clone_mode() -> None:
     assert isinstance(backend, QwenLocalTTSBackend)
 
 
+def test_build_tts_backend_supports_mimo_clone_mode() -> None:
+    config = AppConfig(tts=TTSConfig(provider="mimo", mode="clone"))
+
+    backend = build_tts_backend(config)
+
+    assert isinstance(backend, MimoTTSBackend)
+
+
 def test_build_tts_backend_rejects_unknown_provider() -> None:
     config = AppConfig(tts=TTSConfig(provider="custom", mode="preset"))
 
@@ -270,6 +281,172 @@ def test_resolve_vllm_omni_api_key_prefers_config_then_env(
     monkeypatch.setenv("PODTRAN_VLLM_OMNI_API_KEY", "env-key")
 
     assert _resolve_vllm_omni_api_key(config) == "config-key"
+
+
+def test_resolve_mimo_api_key_prefers_config_then_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = AppConfig(providers={"mimo": {"api_key": "config-key"}})
+    monkeypatch.setenv("MIMO_API_KEY", "env-key")
+
+    assert _resolve_mimo_api_key(config) == "config-key"
+
+
+def test_mimo_backend_sends_preset_request_and_decodes_audio(tmp_path: Path) -> None:
+    config = AppConfig(
+        tts={"provider": "mimo", "mode": "preset"},
+        providers={
+            "mimo": {
+                "api_key": "secret",
+                "base_url": "https://mimo.example/v1/",
+                "preset_voice": "冰糖",
+                "audio_format": "wav",
+                "instructions": "Warm broadcast tone.",
+            }
+        },
+    )
+    backend = MimoTTSBackend(config)
+    output_path = tmp_path / "speech.wav"
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "audio": {"data": base64.b64encode(b"wav").decode("ascii")}
+                        }
+                    }
+                ]
+            }
+
+    class _Client:
+        def post(
+            self, url: str, headers: dict[str, str], json: dict[str, object]
+        ) -> _Response:
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return _Response()
+
+    backend.client = _Client()  # type: ignore[assignment]
+
+    backend.synthesize(
+        "你好",
+        PresetVoiceSpec(identity="preset:Cherry", voice_name="Cherry"),
+        "mimo-v2.5-tts",
+        output_path,
+    )
+
+    assert output_path.read_bytes() == b"wav"
+    assert captured["url"] == "https://mimo.example/v1/chat/completions"
+    assert captured["headers"] == {"api-key": "secret"}
+    assert captured["json"] == {
+        "model": "mimo-v2.5-tts",
+        "messages": [
+            {"role": "user", "content": "Warm broadcast tone."},
+            {"role": "assistant", "content": "你好"},
+        ],
+        "audio": {"format": "wav", "voice": "冰糖"},
+    }
+
+
+def test_mimo_backend_sends_reference_clone_request(tmp_path: Path) -> None:
+    reference_audio = tmp_path / "reference.wav"
+    reference_audio.write_bytes(b"ref")
+    config = AppConfig(
+        tts={"provider": "mimo", "mode": "clone"},
+        providers={"mimo": {"base_url": "https://mimo.example/v1", "api_key": ""}},
+    )
+    backend = MimoTTSBackend(config)
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "audio": {"data": base64.b64encode(b"wav").decode("ascii")}
+                        }
+                    }
+                ]
+            }
+
+    class _Client:
+        def post(
+            self, url: str, headers: dict[str, str], json: dict[str, object]
+        ) -> _Response:
+            _ = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return _Response()
+
+    backend.client = _Client()  # type: ignore[assignment]
+    spec = ReferenceCloneSpec(
+        identity="mimo:reference_clone:ref-1",
+        provider="mimo",
+        payload=ReferenceClonePayload(
+            reference_fingerprint="ref-1",
+            reference_audio_path=str(reference_audio),
+            reference_text="reference text",
+        ),
+    )
+
+    backend.synthesize("你好", spec, "mimo-v2.5-tts-voiceclone", tmp_path / "out.wav")
+
+    payload = captured["json"]
+    assert captured["headers"] == {}
+    assert payload["messages"] == [{"role": "assistant", "content": "你好"}]
+    assert payload["audio"]["format"] == "wav"
+    assert payload["audio"]["voice"] == "data:audio/wav;base64,cmVm"
+
+
+def test_mimo_backend_raises_when_audio_data_is_missing(tmp_path: Path) -> None:
+    config = AppConfig(tts={"provider": "mimo", "mode": "preset"})
+    backend = MimoTTSBackend(config)
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"message": {}}]}
+
+    class _Client:
+        def post(self, url, headers, json) -> _Response:
+            _ = (url, headers, json)
+            return _Response()
+
+    backend.client = _Client()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="MiMo TTS returned no audio data"):
+        backend.synthesize(
+            "你好",
+            PresetVoiceSpec(identity="preset:Cherry", voice_name="Cherry"),
+            "mimo-v2.5-tts",
+            tmp_path / "speech.wav",
+        )
+
+
+def test_mimo_backend_rejects_provider_clone_specs(tmp_path: Path) -> None:
+    config = AppConfig(tts={"provider": "mimo", "mode": "clone"})
+    backend = MimoTTSBackend(config)
+    spec = ProviderCloneSpec(
+        identity="mimo:provider_clone:token",
+        provider="mimo",
+        payload=ProviderClonePayload(voice_token="token"),
+    )
+
+    with pytest.raises(RuntimeError, match="MiMo TTS does not support voice kind"):
+        backend.synthesize("你好", spec, "mimo-v2.5-tts-voiceclone", tmp_path / "x.wav")
 
 
 def test_vllm_omni_backend_sends_custom_voice_request_body(tmp_path: Path) -> None:

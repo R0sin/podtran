@@ -236,6 +236,27 @@ def test_init_can_write_vllm_omni_tts_provider(tmp_path: Path) -> None:
     assert "DashScope API key" not in result.output
 
 
+def test_init_can_write_mimo_tts_provider(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+
+    result = runner.invoke(
+        cli.app,
+        ["init", "--config", str(config_path), "--workdir", str(tmp_path)],
+        input="hf-token\n\nmimo\n\nmimo-key\nclone\n\n",
+    )
+
+    assert result.exit_code == 0
+    config = load_config(config_path)
+    assert config.tts.provider == "mimo"
+    assert config.tts.mode == "clone"
+    assert config.providers.mimo.api_key == "mimo-key"
+    assert config.providers.mimo.base_url == "https://api.xiaomimimo.com/v1"
+    assert config.providers.mimo.clone_model == "mimo-v2.5-tts-voiceclone"
+    assert "DashScope API key" not in result.output
+    assert "OpenAI-compatible TTS base URL" not in result.output
+    assert "vLLM-Omni TTS base URL" not in result.output
+
+
 def test_init_reprompts_required_values(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
 
@@ -351,6 +372,7 @@ def test_rebuild_legacy_config_preserves_provider_api_keys() -> None:
                     "tts_api_key": "tts-key",
                 },
                 "vllm_omni": {"api_key": "new-vllm-key"},
+                "mimo": {"api_key": "mimo-key"},
             },
             "tts": {
                 "vllm_omni": {"api_key": "legacy-vllm-key"},
@@ -363,6 +385,7 @@ def test_rebuild_legacy_config_preserves_provider_api_keys() -> None:
     assert rebuilt.providers.openai_compatible.translation_api_key == "translate-key"
     assert rebuilt.providers.openai_compatible.tts_api_key == "tts-key"
     assert rebuilt.providers.vllm_omni.api_key == "new-vllm-key"
+    assert rebuilt.providers.mimo.api_key == "mimo-key"
 
 
 def test_rebuild_legacy_config_preserves_legacy_vllm_omni_api_key() -> None:

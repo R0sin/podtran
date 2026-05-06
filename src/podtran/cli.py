@@ -39,6 +39,10 @@ from podtran.config import (
     DEFAULT_TTS_PROVIDER,
     DEFAULT_TTS_CLONE_MODEL,
     DEFAULT_QWEN_LOCAL_MODEL_SIZE,
+    DEFAULT_MIMO_BASE_URL,
+    DEFAULT_MIMO_CLONE_MODEL,
+    DEFAULT_MIMO_PRESET_MODEL,
+    DEFAULT_MIMO_PRESET_VOICE,
     detect_legacy_tts_keys,
     detect_legacy_translation_keys,
     load_config,
@@ -121,7 +125,13 @@ KNOWN_COMMANDS = {
 }
 DEFAULT_MIN_SPEAKERS = 2
 DEFAULT_MAX_SPEAKERS = 5
-TTS_PROVIDER_CHOICES = ("qwen-local", "dashscope", "openai-compatible", "vllm-omni")
+TTS_PROVIDER_CHOICES = (
+    "qwen-local",
+    "dashscope",
+    "openai-compatible",
+    "vllm-omni",
+    "mimo",
+)
 TRANSLATION_PROVIDER_CHOICES = ("google-free", "openai-compatible")
 TTS_MODE_CHOICES = ("auto", "preset", "clone")
 DEFAULT_VLLM_OMNI_BASE_URL = "http://localhost:8091/v1"
@@ -427,6 +437,16 @@ def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
             current_value=config.providers.vllm_omni.api_key,
         )
 
+    if provider == "mimo":
+        config.providers.mimo.base_url = _prompt_with_default(
+            "MiMo TTS base URL",
+            config.providers.mimo.base_url or DEFAULT_MIMO_BASE_URL,
+        )
+        config.providers.mimo.api_key = _prompt_optional(
+            "MiMo API key",
+            current_value=config.providers.mimo.api_key,
+        )
+
     config.tts.mode = _prompt_choice("TTS mode", TTS_MODE_CHOICES, config.tts.mode)
     effective_tts_mode = config.tts.effective_mode(provider)
     if effective_tts_mode == "preset":
@@ -435,6 +455,15 @@ def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
                 "Qwen local preset model size",
                 config.providers.qwen_local.preset_model_size
                 or DEFAULT_QWEN_LOCAL_MODEL_SIZE,
+            )
+        elif provider == "mimo":
+            config.providers.mimo.preset_model = _prompt_with_default(
+                "MiMo preset model",
+                config.providers.mimo.preset_model or DEFAULT_MIMO_PRESET_MODEL,
+            )
+            config.providers.mimo.preset_voice = _prompt_with_default(
+                "MiMo preset voice",
+                config.providers.mimo.preset_voice or DEFAULT_MIMO_PRESET_VOICE,
             )
         else:
             config.providers.dashscope.tts_preset_model = _prompt_with_default(
@@ -452,6 +481,11 @@ def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
             config.providers.vllm_omni.model = _prompt_optional(
                 "vLLM-Omni model",
                 current_value=config.providers.vllm_omni.model,
+            )
+        elif provider == "mimo":
+            config.providers.mimo.clone_model = _prompt_with_default(
+                "MiMo clone model",
+                config.providers.mimo.clone_model or DEFAULT_MIMO_CLONE_MODEL,
             )
         else:
             config.providers.dashscope.tts_clone_model = _prompt_with_default(
@@ -484,6 +518,9 @@ def _rebuild_config_with_preserved_auth(raw_config: dict[str, object]) -> AppCon
             rebuilt.providers.vllm_omni.api_key = str(
                 vllm_omni.get("api_key", "") or ""
             ).strip()
+        mimo = providers.get("mimo")
+        if isinstance(mimo, dict):
+            rebuilt.providers.mimo.api_key = str(mimo.get("api_key", "") or "").strip()
     tts = raw_config.get("tts")
     if isinstance(tts, dict):
         legacy_vllm_omni = tts.get("vllm_omni")

@@ -26,6 +26,11 @@ DEFAULT_QWEN_LOCAL_MODEL_SIZE = "0.6B"
 DEFAULT_QWEN_LOCAL_LANGUAGE = "Chinese"
 DEFAULT_QWEN_LOCAL_TORCH_DTYPE = "auto"
 DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION = "auto"
+DEFAULT_MIMO_BASE_URL = "https://api.xiaomimimo.com/v1"
+DEFAULT_MIMO_PRESET_MODEL = "mimo-v2.5-tts"
+DEFAULT_MIMO_CLONE_MODEL = "mimo-v2.5-tts-voiceclone"
+DEFAULT_MIMO_PRESET_VOICE = "mimo_default"
+DEFAULT_MIMO_AUDIO_FORMAT = "wav"
 DEFAULT_WORKDIR = Path("~/.podtran")
 DEFAULT_CONFIG_FILENAME = "config.toml"
 DEFAULT_FALLBACK_VOICES = ["Cherry", "Serena", "Ethan", "Chelsie"]
@@ -92,6 +97,18 @@ class QwenLocalProviderConfig(BaseModel):
     x_vector_only_mode: bool = False
 
 
+class MimoProviderConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    api_key: str = ""
+    base_url: str = DEFAULT_MIMO_BASE_URL
+    preset_model: str = DEFAULT_MIMO_PRESET_MODEL
+    clone_model: str = DEFAULT_MIMO_CLONE_MODEL
+    preset_voice: str = DEFAULT_MIMO_PRESET_VOICE
+    audio_format: str = DEFAULT_MIMO_AUDIO_FORMAT
+    instructions: str = ""
+
+
 class ProvidersConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -101,6 +118,7 @@ class ProvidersConfig(BaseModel):
     )
     vllm_omni: VllmOmniProviderConfig = Field(default_factory=VllmOmniProviderConfig)
     qwen_local: QwenLocalProviderConfig = Field(default_factory=QwenLocalProviderConfig)
+    mimo: MimoProviderConfig = Field(default_factory=MimoProviderConfig)
 
 
 class TranslationConfig(BaseModel):
@@ -196,6 +214,8 @@ class AppConfig(BaseModel):
                 return self.providers.openai_compatible.tts_api_key.strip()
         if normalized == "vllm-omni" and purpose == "tts":
             return self.providers.vllm_omni.api_key.strip()
+        if normalized == "mimo" and purpose == "tts":
+            return self.providers.mimo.api_key.strip()
         return ""
 
     def resolved_translation_base_url(self) -> str:
@@ -221,6 +241,11 @@ class AppConfig(BaseModel):
             return self.providers.openai_compatible.tts_base_url.strip().rstrip("/")
         if provider == "vllm-omni":
             return self.providers.vllm_omni.base_url.strip().rstrip("/")
+        if provider == "mimo":
+            return (
+                self.providers.mimo.base_url.strip().rstrip("/")
+                or DEFAULT_MIMO_BASE_URL
+            )
         return ""
 
     def tts_preset_model(self) -> str:
@@ -239,6 +264,8 @@ class AppConfig(BaseModel):
             return self.providers.vllm_omni.model.strip()
         if provider == "qwen-local":
             return f"qwen-local:customvoice:{self.providers.qwen_local.preset_model_size.strip() or DEFAULT_QWEN_LOCAL_MODEL_SIZE}"
+        if provider == "mimo":
+            return self.providers.mimo.preset_model.strip() or DEFAULT_MIMO_PRESET_MODEL
         return ""
 
     def tts_clone_model(self) -> str:
@@ -252,6 +279,8 @@ class AppConfig(BaseModel):
             return self.providers.vllm_omni.model.strip()
         if provider == "qwen-local":
             return f"qwen-local:base:{self.providers.qwen_local.clone_model_size.strip() or DEFAULT_QWEN_LOCAL_MODEL_SIZE}"
+        if provider == "mimo":
+            return self.providers.mimo.clone_model.strip() or DEFAULT_MIMO_CLONE_MODEL
         return ""
 
     def tts_enrollment_model(self) -> str:
@@ -358,6 +387,15 @@ def render_config_toml(config: AppConfig) -> str:
         f'language = "{config.providers.qwen_local.language}"',
         f'instructions = "{config.providers.qwen_local.instructions}"',
         f"x_vector_only_mode = {str(config.providers.qwen_local.x_vector_only_mode).lower()}",
+        "",
+        "[providers.mimo]",
+        f'api_key = "{config.providers.mimo.api_key}"',
+        f'base_url = "{config.providers.mimo.base_url}"',
+        f'preset_model = "{config.providers.mimo.preset_model}"',
+        f'clone_model = "{config.providers.mimo.clone_model}"',
+        f'preset_voice = "{config.providers.mimo.preset_voice}"',
+        f'audio_format = "{config.providers.mimo.audio_format}"',
+        f'instructions = "{config.providers.mimo.instructions}"',
         "",
         "[asr]",
         f'model = "{config.asr.model}"',

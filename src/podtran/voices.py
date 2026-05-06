@@ -273,6 +273,30 @@ class QwenLocalCloneProvider:
             backend._unload_model()
 
 
+class MimoCloneProvider:
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+
+    def create_voice_spec(
+        self,
+        reference_audio: Path,
+        reference_text: str,
+        target_model: str,
+        preferred_name: str,
+        reference_fingerprint: str,
+    ) -> ReferenceCloneSpec:
+        _ = (target_model, preferred_name)
+        return ReferenceCloneSpec(
+            identity=f"mimo:reference_clone:{reference_fingerprint}",
+            provider="mimo",
+            payload=ReferenceClonePayload(
+                reference_fingerprint=reference_fingerprint,
+                reference_audio_path=str(reference_audio.resolve()),
+                reference_text=reference_text.strip(),
+            ),
+        )
+
+
 @dataclass(slots=True)
 class ReferenceCandidate:
     start: float
@@ -532,6 +556,8 @@ class VoiceResolver:
             return VllmOmniCloneProvider(self.config)
         if provider == "qwen-local":
             return QwenLocalCloneProvider(self.config)
+        if provider == "mimo":
+            return MimoCloneProvider(self.config)
         raise RuntimeError(
             f"Clone mode is not supported for TTS provider: {self.config.tts.provider}"
         )
@@ -836,10 +862,11 @@ class VoiceResolver:
 
 def build_preset_targets(
     segments: list[SegmentRecord],
+    default_voice: str | None = None,
 ) -> dict[str, ResolvedVoiceTarget]:
     targets: dict[str, ResolvedVoiceTarget] = {}
     for segment in segments:
-        voice_name = segment.voice.strip()
+        voice_name = default_voice.strip() if default_voice else segment.voice.strip()
         targets.setdefault(
             segment.speaker,
             ResolvedVoiceTarget(

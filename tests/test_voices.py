@@ -17,6 +17,7 @@ from podtran.voices import (
     ANCHOR_REFERENCE_TEXT,
     UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE,
     DashScopeCloneProvider,
+    MimoCloneProvider,
     QwenLocalCloneProvider,
     VllmOmniCloneProvider,
     VoiceResolver,
@@ -344,6 +345,32 @@ def test_voice_resolver_uses_reference_clone_specs_for_qwen_local(
     assert Path(spec.payload.reference_audio_path).exists()
 
 
+def test_voice_resolver_uses_reference_clone_specs_for_mimo(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    paths.ensure()
+    source_audio = tmp_path / "source.wav"
+    source_audio.write_bytes(b"wav")
+    manager = VoiceResolver(
+        AppConfig(tts=TTSConfig(provider="mimo", mode="clone")), paths
+    )
+    manager._export_reference_audio = _stub_export(paths)  # type: ignore[method-assign]
+
+    resolved = manager.resolve_voice_targets(
+        [_segment("seg_1", 0.0, 12.0)], source_audio
+    )
+
+    spec = resolved["SPEAKER_00"].spec
+    assert spec.kind == "reference_clone"
+    assert spec.provider == "mimo"
+    assert (
+        spec.payload.reference_text
+        == "this is a suitable reference sentence for cloning quality"
+    )
+    assert Path(spec.payload.reference_audio_path).exists()
+
+
 def test_voice_resolver_uses_anchor_clone_for_vllm_omni_auto(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -619,6 +646,26 @@ def test_dashscope_clone_provider_uses_fixed_enrollment_model_and_derived_url(
         == "https://tts.example.com/root/services/audio/tts/customization"
     )
     assert captured["json"]["model"] == DEFAULT_TTS_ENROLLMENT_MODEL
+
+
+def test_mimo_clone_provider_creates_reference_clone_spec(tmp_path: Path) -> None:
+    provider = MimoCloneProvider(AppConfig(tts={"provider": "mimo"}))
+    reference_audio = tmp_path / "reference.wav"
+    reference_audio.write_bytes(b"wav")
+
+    spec = provider.create_voice_spec(
+        reference_audio, "ref text", "mimo-v2.5-tts-voiceclone", "speaker_00", "ref-1"
+    )
+
+    assert spec == ReferenceCloneSpec(
+        identity="mimo:reference_clone:ref-1",
+        provider="mimo",
+        payload=ReferenceClonePayload(
+            reference_fingerprint="ref-1",
+            reference_audio_path=str(reference_audio.resolve()),
+            reference_text="ref text",
+        ),
+    )
 
 
 def test_resolve_dashscope_api_key_prefers_provider_credentials(

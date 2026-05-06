@@ -245,6 +245,56 @@ class VllmOmniTTSBackend:
             self.synthesize(request.text, spec, model, request.output_path)
 
 
+class MimoTTSBackend:
+    supported_voice_kinds = frozenset({"preset", "reference_clone"})
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.client = httpx.Client(timeout=config.tts.timeout_seconds)
+        self.api_key = _resolve_mimo_api_key(config)
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(TTS_RETRY_ATTEMPTS),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        retry=retry_if_exception_type((RuntimeError, httpx.HTTPError)),
+    )
+    def synthesize(
+        self, text: str, spec: VoiceSpec, model: str, output_path: Path
+    ) -> None:
+        if isinstance(spec, PresetVoiceSpec):
+            voice = self.config.providers.mimo.preset_voice.strip() or spec.voice_name
+        elif isinstance(spec, ReferenceCloneSpec):
+            voice = _mimo_reference_voice_data_uri(spec)
+        else:
+            raise RuntimeError(f"MiMo TTS does not support voice kind: {spec.kind}")
+
+        payload = {
+            "model": model,
+            "messages": _mimo_messages(
+                self.config.providers.mimo.instructions,
+                text,
+            ),
+            "audio": {
+                "format": self.config.providers.mimo.audio_format.strip() or "wav",
+                "voice": voice,
+            },
+        }
+        response = self.client.post(
+            _mimo_chat_completions_url(self.config),
+            headers=_mimo_headers(self.api_key),
+            json=payload,
+        )
+        response.raise_for_status()
+        atomic_write_bytes(output_path, _mimo_audio_payload(response.json()))
+
+    def synthesize_batch(
+        self, requests: list[_TTSBatchRequest], spec: VoiceSpec, model: str
+    ) -> None:
+        for request in requests:
+            self.synthesize(request.text, spec, model, request.output_path)
+
+
 class QwenLocalTTSBackend:
     supported_voice_kinds = frozenset({"preset", "reference_clone"})
 
@@ -735,6 +785,8 @@ def build_tts_backend(config: AppConfig) -> TTSBackend:
         backend = OpenAICompatibleTTSBackend(config)
     elif provider == "vllm-omni":
         backend = VllmOmniTTSBackend(config)
+    elif provider == "mimo":
+        backend = MimoTTSBackend(config)
     elif provider == "qwen-local":
         backend = QwenLocalTTSBackend(config)
     else:
@@ -765,7 +817,12 @@ def _resolve_voice_targets(
     progress_callback: StageProgressCallback | None = None,
 ) -> dict[str, ResolvedVoiceTarget]:
     if config.tts.effective_mode(config.tts.provider) != "clone":
-        return build_preset_targets(segments)
+        preset_voice = (
+            config.providers.mimo.preset_voice
+            if config.tts.provider.strip().lower() == "mimo"
+            else None
+        )
+        return build_preset_targets(segments, default_voice=preset_voice)
     if source_audio is None:
         raise RuntimeError("Clone mode requires source audio.")
     resolved_source_audio = source_audio.resolve()
@@ -1120,10 +1177,23 @@ def _resolve_vllm_omni_api_key(config: AppConfig) -> str:
     return os.getenv("PODTRAN_VLLM_OMNI_API_KEY", "")
 
 
+def _resolve_mimo_api_key(config: AppConfig) -> str:
+    configured = config.providers.mimo.api_key.strip()
+    if configured:
+        return configured
+    return os.getenv("MIMO_API_KEY", "")
+
+
 def _bearer_headers(api_key: str) -> dict[str, str]:
     if not api_key.strip():
         return {}
     return {"Authorization": f"Bearer {api_key}"}
+
+
+def _mimo_headers(api_key: str) -> dict[str, str]:
+    if not api_key.strip():
+        return {}
+    return {"api-key": api_key}
 
 
 def _audio_data_uri(path: Path) -> str:
@@ -1131,6 +1201,55 @@ def _audio_data_uri(path: Path) -> str:
     mime_type = mimetypes.guess_type(path.name)[0] or "audio/wav"
     encoded = base64.b64encode(payload).decode("utf-8")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def _mimo_reference_voice_data_uri(spec: ReferenceCloneSpec) -> str:
+    if not spec.payload.reference_audio_path.strip():
+        raise RuntimeError("MiMo voice clone requires reference audio.")
+    path = Path(spec.payload.reference_audio_path)
+    mime_type = mimetypes.guess_type(path.name)[0] or "audio/wav"
+    if mime_type == "audio/x-wav":
+        mime_type = "audio/wav"
+    if mime_type not in {"audio/wav", "audio/mpeg", "audio/mp3"}:
+        raise RuntimeError(
+            f"MiMo voice clone supports only wav/mp3 reference audio: {path}"
+        )
+    payload = path.read_bytes()
+    encoded = base64.b64encode(payload).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _mimo_messages(instructions: str, text: str) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    if instructions.strip():
+        messages.append({"role": "user", "content": instructions.strip()})
+    messages.append({"role": "assistant", "content": text})
+    return messages
+
+
+def _mimo_audio_payload(payload: dict[str, object]) -> bytes:
+    try:
+        choices = payload["choices"]
+        if not isinstance(choices, list) or not choices:
+            raise KeyError("choices")
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise KeyError("choices[0]")
+        message = choice["message"]
+        if not isinstance(message, dict):
+            raise KeyError("message")
+        audio = message["audio"]
+        if not isinstance(audio, dict):
+            raise KeyError("audio")
+        encoded = str(audio["data"])
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"MiMo TTS returned no audio data: {json.dumps(payload, ensure_ascii=False)}"
+        ) from exc
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise RuntimeError("MiMo TTS returned invalid base64 audio data.") from exc
 
 
 def _resolve_reference_text(spec: ReferenceCloneSpec) -> str:
@@ -1156,6 +1275,13 @@ def _vllm_omni_speech_url(config: AppConfig) -> str:
     if not base_url:
         raise RuntimeError("vLLM-Omni TTS requires a TTS base URL.")
     return base_url.rstrip("/") + "/audio/speech"
+
+
+def _mimo_chat_completions_url(config: AppConfig) -> str:
+    base_url = config.resolved_tts_base_url()
+    if not base_url:
+        raise RuntimeError("MiMo TTS requires a TTS base URL.")
+    return base_url.rstrip("/") + "/chat/completions"
 
 
 def _ensure_backend_supports_spec(backend: TTSBackend, spec: VoiceSpec) -> None:

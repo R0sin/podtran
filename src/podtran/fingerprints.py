@@ -40,6 +40,10 @@ VOICE_CLONE_CONFIG_KEYS = [
     "providers.qwen_local.language",
     "providers.qwen_local.instructions",
     "providers.qwen_local.x_vector_only_mode",
+    "providers.mimo.base_url",
+    "providers.mimo.clone_model",
+    "providers.mimo.audio_format",
+    "providers.mimo.instructions",
 ]
 TTS_CONFIG_KEYS = [
     "tts.provider",
@@ -62,6 +66,12 @@ TTS_CONFIG_KEYS = [
     "providers.qwen_local.language",
     "providers.qwen_local.instructions",
     "providers.qwen_local.x_vector_only_mode",
+    "providers.mimo.base_url",
+    "providers.mimo.preset_model",
+    "providers.mimo.clone_model",
+    "providers.mimo.preset_voice",
+    "providers.mimo.audio_format",
+    "providers.mimo.instructions",
 ]
 SYNTHESIZE_CONFIG_KEYS = list(
     dict.fromkeys([*VOICE_CLONE_CONFIG_KEYS, *TTS_CONFIG_KEYS])

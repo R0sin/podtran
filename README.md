@@ -10,7 +10,7 @@
 
 - 本地用 `WhisperX` 做转写、对齐和说话人区分
 - 翻译支持 `google-free` 和 `openai-compatible`，DashScope 通过兼容 OpenAI 的端点接入；TTS 默认走 `qwen-local`
-- TTS 默认 `mode = "auto"`：本地、DashScope 和 vLLM-Omni 默认走音色克隆，OpenAI-compatible 默认走预置音色
+- TTS 默认 `mode = "auto"`：本地、DashScope、vLLM-Omni 和 MiMo 默认走音色克隆，OpenAI-compatible 默认走预置音色
 - 每次运行都会创建独立 task，避免旧结果污染新结果
 - 共享缓存会自动复用已完成的转写、翻译、声纹和逐段 TTS 结果
 - 中断后可用 `podtran resume` 从断点继续，已完成的翻译不会丢失
@@ -28,7 +28,7 @@
 - `ffmpeg` 和 `ffprobe` 需要在 `PATH` 中可执行
 - 需要一个 Hugging Face token 给 WhisperX diarization 使用
 - 默认翻译不需要 API key；如果用到 `openai-compatible`，再配置对应 provider key
-- TTS 可选 `dashscope`、`openai-compatible`、`vllm-omni` 或 `qwen-local`，所需配置取决于 provider
+- TTS 可选 `qwen-local`、`dashscope`、`openai-compatible`、`vllm-omni` 或 `mimo`，所需配置取决于 provider
 
 ## 安装
 
@@ -40,7 +40,7 @@ uv tool install --torch-backend auto "podtran[qwen-local] @ git+https://github.c
 
 `--torch-backend auto` 会让 `uv` 为 PyTorch 生态依赖自动选择合适后端；有可用 NVIDIA CUDA 驱动时会优先安装 CUDA 版，否则使用 CPU 版。这会同时影响 WhisperX 转写和本地 TTS 依赖。
 
-如果你不使用本地 TTS，也可以只安装基础依赖，然后在配置里把 TTS provider 改成 `dashscope`、`openai-compatible` 或 `vllm-omni`：
+如果你不使用本地 TTS，也可以只安装基础依赖，然后在配置里把 TTS provider 改成 `dashscope`、`openai-compatible`、`vllm-omni` 或 `mimo`：
 
 ```powershell
 uv tool install --torch-backend auto git+https://github.com/R0sin/podtran
@@ -102,6 +102,7 @@ TTS provider 说明：
 - `dashscope`：支持 `preset` 和 `clone`，`auto` 下使用 `clone`
 - `openai-compatible`：支持 `preset`，`auto` 下使用 `preset`
 - `vllm-omni`：支持 `preset` 和 `clone`，`auto` 下使用 `clone`，需要配置 `providers.vllm_omni.base_url`
+- `mimo`：支持 `preset` 和 `clone`，`auto` 下使用 `clone`，调用 Xiaomi MiMo 开放平台，API key 可写入配置或通过 `MIMO_API_KEY` 环境变量提供
 
 翻译 provider 说明：
 
@@ -134,6 +135,24 @@ translation_model = "qwen-flash"
 - `Qwen3-TTS` 官方说明：[QwenLM/Qwen3-TTS 的 vLLM Usage](https://github.com/QwenLM/Qwen3-TTS)
 
 对 `podtran` 来说，只需要一个可访问的 `vllm-omni` TTS 服务，并把 `providers.vllm_omni.base_url` 指向它；默认示例地址是 `http://localhost:8091/v1`。
+
+如果你想使用 MiMo-V2.5-TTS 或 MiMo-V2.5-TTS-VoiceClone，可配置：
+
+```toml
+[tts]
+provider = "mimo"
+mode = "auto"
+
+[providers.mimo]
+api_key = "..."
+# 注意：活动接口为 "https://token-plan-cn.xiaomimimo.com/v1"
+base_url = "https://api.xiaomimimo.com/v1"
+preset_model = "mimo-v2.5-tts"
+clone_model = "mimo-v2.5-tts-voiceclone"
+preset_voice = "mimo_default"
+audio_format = "wav"
+instructions = ""
+```
 
 默认 TTS 后端会直接在 podtran 进程内运行 Qwen3-TTS，需要安装 `qwen-local` 可选依赖。使用 `uv tool install` 安装 CLI 时，请按前面的默认安装命令启用 `podtran[qwen-local]`。
 

@@ -7,6 +7,11 @@ from podtran.config import (
     DEFAULT_QWEN_LOCAL_MODEL_SIZE,
     DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION,
     DEFAULT_QWEN_LOCAL_TORCH_DTYPE,
+    DEFAULT_MIMO_AUDIO_FORMAT,
+    DEFAULT_MIMO_BASE_URL,
+    DEFAULT_MIMO_CLONE_MODEL,
+    DEFAULT_MIMO_PRESET_MODEL,
+    DEFAULT_MIMO_PRESET_VOICE,
     DEFAULT_TRANSLATION_BASE_URL,
     DEFAULT_TRANSLATION_MODEL,
     DEFAULT_TTS_BASE_URL,
@@ -69,6 +74,15 @@ language = "Chinese"
 instructions = "steady"
 x_vector_only_mode = true
 
+[providers.mimo]
+api_key = "mimo-key"
+base_url = "https://mimo.example/v1"
+preset_model = "mimo-preset"
+clone_model = "mimo-clone"
+preset_voice = "冰糖"
+audio_format = "wav"
+instructions = "calm"
+
 [translation]
 provider = "openai-compatible"
 timeout_seconds = 90
@@ -107,6 +121,9 @@ max_ref_seconds = 18
     assert config.providers.qwen_local.clone_model_size == "1.7B"
     assert config.providers.qwen_local.torch_dtype == "float16"
     assert config.providers.qwen_local.attn_implementation == "flash_attention_2"
+    assert config.providers.mimo.api_key == "mimo-key"
+    assert config.providers.mimo.clone_model == "mimo-clone"
+    assert config.providers.mimo.instructions == "calm"
     assert config.translation.provider == "openai-compatible"
     assert config.translation.timeout_seconds == 90
     assert config.tts.provider == "qwen-local"
@@ -198,6 +215,11 @@ def test_provider_helpers_resolve_defaults_and_overrides() -> None:
         config.providers.qwen_local.attn_implementation
         == DEFAULT_QWEN_LOCAL_ATTN_IMPLEMENTATION
     )
+    assert config.providers.mimo.base_url == DEFAULT_MIMO_BASE_URL
+    assert config.providers.mimo.preset_model == DEFAULT_MIMO_PRESET_MODEL
+    assert config.providers.mimo.clone_model == DEFAULT_MIMO_CLONE_MODEL
+    assert config.providers.mimo.preset_voice == DEFAULT_MIMO_PRESET_VOICE
+    assert config.providers.mimo.audio_format == DEFAULT_MIMO_AUDIO_FORMAT
 
     dashscope = AppConfig(tts={"provider": "dashscope"})
     assert dashscope.resolved_tts_base_url() == DEFAULT_TTS_BASE_URL
@@ -219,6 +241,21 @@ def test_provider_helpers_resolve_defaults_and_overrides() -> None:
     assert custom.translation_model() == "m"
     assert custom.resolved_tts_base_url() == "https://tts.example.com/root"
     assert custom.tts_clone_model() == "tts"
+
+    mimo = AppConfig(
+        tts={"provider": "mimo"},
+        providers={
+            "mimo": {
+                "base_url": "https://mimo.example/v1/",
+                "preset_model": "mimo-preset",
+                "clone_model": "mimo-clone",
+            }
+        },
+    )
+    assert mimo.resolve_provider_api_key("mimo", purpose="tts") == ""
+    assert mimo.resolved_tts_base_url() == "https://mimo.example/v1"
+    assert mimo.tts_preset_model() == "mimo-preset"
+    assert mimo.tts_clone_model() == "mimo-clone"
 
 
 def test_build_init_config_sets_provider_managed_auth_and_models() -> None:
@@ -247,6 +284,7 @@ def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None
     assert "[providers.openai_compatible]" in rendered
     assert "[providers.vllm_omni]" in rendered
     assert "[providers.qwen_local]" in rendered
+    assert "[providers.mimo]" in rendered
     assert 'provider = "google-free"' in rendered
     assert 'provider = "qwen-local"' in rendered
     assert f'tts_clone_model = "{DEFAULT_TTS_CLONE_MODEL}"' in rendered
@@ -262,6 +300,8 @@ def test_write_default_config_renders_provider_structure(tmp_path: Path) -> None
     assert "\n[tts.preset]\n" in rendered
     assert "\n[tts.clone]\n" in rendered
     assert "\n[tts.vllm_omni]\n" not in rendered
+    assert f'base_url = "{DEFAULT_MIMO_BASE_URL}"' in rendered
+    assert f'clone_model = "{DEFAULT_MIMO_CLONE_MODEL}"' in rendered
     assert (
         "\nbase_url =" not in rendered.split("[translation]", 1)[1].split("[tts]", 1)[0]
     )
@@ -275,6 +315,7 @@ def test_render_config_toml_uses_provider_scoped_tts_sections() -> None:
         "[providers.openai_compatible]",
         "[providers.vllm_omni]",
         "[providers.qwen_local]",
+        "[providers.mimo]",
         "[asr]",
         "[translation]",
         "[tts]",
@@ -293,6 +334,7 @@ def test_render_config_toml_uses_provider_scoped_tts_sections() -> None:
     assert "[tts.preset.voice_map]" in rendered
     assert "[tts.clone]" in rendered
     assert "[providers.vllm_omni]" in rendered
+    assert "[providers.mimo]" in rendered
     assert "voice_mode" not in rendered
     assert "customization_url" not in rendered
 
@@ -306,6 +348,20 @@ def test_provider_api_keys_do_not_affect_tts_or_voice_clone_fingerprints(
     )
     second = AppConfig(
         tts={"provider": "vllm-omni"}, providers={"vllm_omni": {"api_key": "key-2"}}
+    )
+
+    assert fingerprints.hash_config_subset(
+        first, TTS_CONFIG_KEYS
+    ) == fingerprints.hash_config_subset(second, TTS_CONFIG_KEYS)
+    assert fingerprints.hash_config_subset(
+        first, VOICE_CLONE_CONFIG_KEYS
+    ) == fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
+
+    first = AppConfig(
+        tts={"provider": "mimo"}, providers={"mimo": {"api_key": "key-1"}}
+    )
+    second = AppConfig(
+        tts={"provider": "mimo"}, providers={"mimo": {"api_key": "key-2"}}
     )
 
     assert fingerprints.hash_config_subset(
@@ -365,6 +421,45 @@ def test_qwen_local_runtime_fields_affect_tts_and_voice_clone_fingerprints(
             "qwen_local": {
                 "torch_dtype": "float16",
                 "attn_implementation": "flash_attention_2",
+            }
+        },
+    )
+
+    assert fingerprints.hash_config_subset(
+        first, TTS_CONFIG_KEYS
+    ) != fingerprints.hash_config_subset(second, TTS_CONFIG_KEYS)
+    assert fingerprints.hash_config_subset(
+        first, VOICE_CLONE_CONFIG_KEYS
+    ) != fingerprints.hash_config_subset(second, VOICE_CLONE_CONFIG_KEYS)
+
+
+def test_mimo_runtime_fields_affect_tts_and_voice_clone_fingerprints(
+    tmp_path: Path,
+) -> None:
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    first = AppConfig(
+        tts={"provider": "mimo"},
+        providers={
+            "mimo": {
+                "base_url": "https://api.xiaomimimo.com/v1",
+                "preset_model": "mimo-v2.5-tts",
+                "clone_model": "mimo-v2.5-tts-voiceclone",
+                "preset_voice": "mimo_default",
+                "audio_format": "wav",
+                "instructions": "",
+            }
+        },
+    )
+    second = AppConfig(
+        tts={"provider": "mimo"},
+        providers={
+            "mimo": {
+                "base_url": "https://mimo.example/v1",
+                "preset_model": "mimo-preset",
+                "clone_model": "mimo-clone",
+                "preset_voice": "冰糖",
+                "audio_format": "pcm16",
+                "instructions": "warm",
             }
         },
     )

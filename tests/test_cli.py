@@ -139,6 +139,7 @@ def test_run_help_exposes_audio_and_preview_options() -> None:
     assert result.exit_code == 0
     assert "AUDIO" in normalized
     assert "--preview" in normalized
+    assert "--background" in normalized
     assert "--min_speakers" in normalized
     assert "--max_speakers" in normalized
     assert "Create a new task for AUDIO and run the full pipeline." in normalized
@@ -618,6 +619,186 @@ def test_root_audio_creates_task_and_executes_pipeline(
     assert captured["max_speakers"] == 6
     assert "--min_speakers 3" in captured["entry_command"]
     assert "--max_speakers 6" in captured["entry_command"]
+
+
+def test_run_background_creates_task_and_starts_resume_process(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path, _ = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 4321
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        captured["stdout_name"] = kwargs["stdout"].name
+        return FakeProcess()
+
+    def fail_execute_pipeline(*args, **kwargs):
+        raise AssertionError("background run must not execute pipeline inline")
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli, "_execute_pipeline", fail_execute_pipeline)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "run",
+            str(audio),
+            "--background",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+            "--min_speakers",
+            "3",
+            "--max_speakers",
+            "6",
+        ],
+    )
+
+    assert result.exit_code == 0
+    store = TaskStore(
+        tmp_path, FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    )
+    task = store.load_latest_task()
+    task_dir = tmp_path / "artifacts" / "tasks" / task.task_id
+    assert (
+        task.entry_command
+        == f"podtran --background --min_speakers 3 --max_speakers 6 {audio}"
+    )
+    assert (task_dir / "run.pid").read_text(encoding="utf-8") == "4321\n"
+    assert Path(captured["stdout_name"]) == task_dir / "run.log"
+    assert captured["kwargs"]["stderr"] == cli.subprocess.STDOUT
+    assert captured["command"] == [
+        cli.sys.executable,
+        "-m",
+        "podtran",
+        "resume",
+        task.task_id,
+        "--config",
+        str(config_path),
+        "--workdir",
+        str(tmp_path.resolve()),
+        "--min_speakers",
+        "3",
+        "--max_speakers",
+        "6",
+    ]
+    assert "Started background task:" in result.output
+    assert "pid=4321" in result.output
+    assert "run.log" in result.output
+    assert f"podtran status {task.task_id}" in result.output
+
+
+def test_root_background_shortcut_creates_task_and_starts_resume_process(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config_path, _ = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 9876
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        return FakeProcess()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        cli,
+        "_execute_pipeline",
+        lambda *args, **kwargs: pytest.fail("background run executed inline"),
+    )
+    monkeypatch.setattr(
+        cli.sys,
+        "argv",
+        [
+            "podtran",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+            str(audio),
+            "--background",
+        ],
+    )
+
+    cli.main()
+    stdout = capsys.readouterr().out
+
+    store = TaskStore(
+        tmp_path, FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    )
+    task = store.load_latest_task()
+    assert task.entry_command == f"podtran --background {audio}"
+    assert (tmp_path / "artifacts" / "tasks" / task.task_id / "run.pid").read_text(
+        encoding="utf-8"
+    ) == "9876\n"
+    assert captured["command"][3:5] == ["resume", task.task_id]
+    assert "Started background task:" in stdout
+
+
+def test_background_preview_creates_preview_before_starting_resume_process(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path, _ = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 2468
+
+    def fake_extract_audio_chunk(
+        ffmpeg_path: str,
+        source: Path,
+        output: Path,
+        start: float | None,
+        end: float | None,
+    ) -> Path:
+        captured["preview_exists_before_popen"] = False
+        output.write_bytes(b"preview")
+        return output
+
+    def fake_popen(command, **kwargs):
+        task_id = command[4]
+        preview_path = tmp_path / "artifacts" / "tasks" / task_id / "preview.wav"
+        captured["preview_exists_before_popen"] = preview_path.exists()
+        return FakeProcess()
+
+    monkeypatch.setattr(cli, "extract_audio_chunk", fake_extract_audio_chunk)
+    monkeypatch.setattr(cli, "ensure_command", lambda command: None)
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "run",
+            str(audio),
+            "--preview",
+            "--background",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    store = TaskStore(
+        tmp_path, FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    )
+    task = store.load_latest_task()
+    assert task.preview is True
+    assert Path(task.processing_audio_path).read_bytes() == b"preview"
+    assert captured["preview_exists_before_popen"] is True
 
 
 def test_status_reports_factual_stage_statuses_and_preview_mode(tmp_path: Path) -> None:

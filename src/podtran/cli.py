@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import gc
+import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,6 +24,7 @@ from rich.table import Table
 from podtran import __version__
 from podtran.artifacts import (
     ArtifactPaths,
+    atomic_write_text,
     output_refs_exist,
     read_model_list,
     remove_path,
@@ -295,6 +298,11 @@ def run(
     preview: bool = typer.Option(
         False, "--preview", help="Run only the first five minutes as a preview task."
     ),
+    background: bool = typer.Option(
+        False,
+        "--background",
+        help="Start the pipeline in a detached background process.",
+    ),
     min_speakers: int = typer.Option(
         DEFAULT_MIN_SPEAKERS,
         "--min_speakers",
@@ -314,6 +322,7 @@ def run(
         config,
         workdir,
         preview=preview,
+        background=background,
         min_speakers=min_speakers,
         max_speakers=max_speakers,
     )
@@ -878,7 +887,7 @@ def main() -> None:
 
 def _should_dispatch_root_task(argv: list[str]) -> bool:
     option_with_value = {"--config", "--workdir", "--min_speakers", "--max_speakers"}
-    boolean_options = {"--preview"}
+    boolean_options = {"--preview", "--background"}
     index = 0
     while index < len(argv):
         token = argv[index]
@@ -917,6 +926,7 @@ def _run_task(
     config_path: Optional[Path],
     workdir_override: Optional[Path],
     preview: bool = False,
+    background: bool = False,
     min_speakers: int = DEFAULT_MIN_SPEAKERS,
     max_speakers: int = DEFAULT_MAX_SPEAKERS,
 ) -> None:
@@ -924,7 +934,56 @@ def _run_task(
     cfg, _, task_store, cache_store, fingerprints = _load_runtime(
         config_path, workdir_override
     )
-    entry_command = _entry_command(audio, preview, min_speakers, max_speakers)
+    task_manifest = _create_run_task(
+        audio,
+        cfg,
+        task_store,
+        fingerprints,
+        preview=preview,
+        background=background,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+    )
+    console.print(f"[green]Created task:[/green] {task_manifest.task_id}")
+    if background:
+        _start_background_resume(
+            task_manifest,
+            task_store,
+            config_path,
+            workdir_override,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        )
+        return
+    _execute_pipeline(
+        task_manifest,
+        cfg,
+        task_store,
+        cache_store,
+        fingerprints,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+    )
+
+
+def _create_run_task(
+    audio: Path,
+    cfg: AppConfig,
+    task_store: TaskStore,
+    fingerprints: FingerprintService,
+    *,
+    preview: bool,
+    background: bool,
+    min_speakers: int,
+    max_speakers: int,
+) -> TaskManifest:
+    entry_command = _entry_command(
+        audio,
+        preview,
+        background,
+        min_speakers,
+        max_speakers,
+    )
     if preview:
         ensure_command(FFMPEG_COMMAND)
         task_id, source_audio_sha256 = task_store.reserve_task_id(audio)
@@ -936,7 +995,7 @@ def _run_task(
         except Exception:
             remove_path(paths.task_dir)
             raise
-        task_manifest = task_store.create_task_with_processing_audio(
+        return task_store.create_task_with_processing_audio(
             audio,
             cfg,
             entry_command=entry_command,
@@ -948,17 +1007,66 @@ def _run_task(
             preview_start_seconds=PREVIEW_START_SECONDS,
             preview_duration_seconds=PREVIEW_DURATION_SECONDS,
         )
+    return task_store.create_task(audio, cfg, entry_command=entry_command)
+
+
+def _start_background_resume(
+    task_manifest: TaskManifest,
+    task_store: TaskStore,
+    config_path: Optional[Path],
+    workdir_override: Optional[Path],
+    *,
+    min_speakers: int,
+    max_speakers: int,
+) -> None:
+    resolved_config_path = resolve_config_path(config_path, workdir_override)
+    resolved_workdir = resolve_workdir(
+        workdir_override, config_path=resolved_config_path
+    )
+    paths = task_store.paths_for(task_manifest)
+    paths.ensure()
+    log_path = paths.task_dir / "run.log"
+    pid_path = paths.task_dir / "run.pid"
+    command = [
+        sys.executable,
+        "-m",
+        "podtran",
+        "resume",
+        task_manifest.task_id,
+        "--config",
+        str(resolved_config_path),
+        "--workdir",
+        str(resolved_workdir),
+        "--min_speakers",
+        str(min_speakers),
+        "--max_speakers",
+        str(max_speakers),
+    ]
+    popen_kwargs: dict[str, object] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
     else:
-        task_manifest = task_store.create_task(audio, cfg, entry_command=entry_command)
-    console.print(f"[green]Created task:[/green] {task_manifest.task_id}")
-    _execute_pipeline(
-        task_manifest,
-        cfg,
-        task_store,
-        cache_store,
-        fingerprints,
-        min_speakers=min_speakers,
-        max_speakers=max_speakers,
+        popen_kwargs["start_new_session"] = True
+
+    with log_path.open("ab") as log_handle:
+        popen_kwargs["stdout"] = log_handle
+        popen_kwargs["stderr"] = subprocess.STDOUT
+        process = subprocess.Popen(command, **popen_kwargs)
+    atomic_write_text(pid_path, f"{process.pid}\n")
+    console.print(f"[green]Started background task:[/green] {task_manifest.task_id}")
+    console.print(f"pid={process.pid}")
+    console.print(f"log={log_path.resolve()}")
+    console.print(
+        "status="
+        f"podtran status {task_manifest.task_id} --config {resolved_config_path} "
+        f"--workdir {resolved_workdir}"
     )
 
 
@@ -974,15 +1082,20 @@ def _create_preview_audio(audio: Path, cfg: AppConfig, paths: ArtifactPaths) -> 
 
 
 def _entry_command(
-    audio: Path, preview: bool, min_speakers: int, max_speakers: int
+    audio: Path,
+    preview: bool,
+    background: bool,
+    min_speakers: int,
+    max_speakers: int,
 ) -> str:
     preview_flag = " --preview" if preview else ""
+    background_flag = " --background" if background else ""
     speaker_flags = ""
     if min_speakers != DEFAULT_MIN_SPEAKERS:
         speaker_flags += f" --min_speakers {min_speakers}"
     if max_speakers != DEFAULT_MAX_SPEAKERS:
         speaker_flags += f" --max_speakers {max_speakers}"
-    return f"podtran{preview_flag}{speaker_flags} {audio}"
+    return f"podtran{preview_flag}{background_flag}{speaker_flags} {audio}"
 
 
 def _load_task_context(

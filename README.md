@@ -66,7 +66,22 @@ podtran --help
 
 提示：CLI help 会把 `podtran run AUDIO` 作为正式入口展示，日常使用仍可直接写 `podtran AUDIO`。
 
-升级：
+升级时通常可以直接使用更短的 `uv tool upgrade`：
+
+```powershell
+uv tool upgrade podtran
+```
+
+这会按已安装 tool 的来源升级 `podtran`。如果你最初是按默认方式安装的
+`podtran[qwen-local]`，升级时会继续使用该安装来源。
+
+如果升级后本地 Qwen TTS 依赖异常，可用完整命令强制重装：
+
+```powershell
+uv tool install --force --torch-backend auto "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
+```
+
+基础依赖版本则使用：
 
 ```powershell
 uv tool install --force --torch-backend auto git+https://github.com/R0sin/podtran

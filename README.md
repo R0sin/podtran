@@ -256,6 +256,14 @@ podtran resume 20260415-083242-50ed61
 ```
 
 提示：如果翻译已经**完成**过，重新运行 `podtran <audio>` 也会通过共享缓存自动复用。但如果翻译**中途中断**，只有 `resume` 能恢复未完成的进度。
+如果任务通过 `--background` 在后台运行，可以用 `stop` 中止它：
+
+```powershell
+podtran stop 20260415-083242-50ed61
+```
+
+省略 task id 时，`stop` 默认选择最近一个 task。它会先确认 PID 确实属于该 task 的后台进程，再终止进程树并将任务标记为 `interrupted`；之后仍可用 `resume` 从兼容的断点继续。前台任务请直接使用 `Ctrl+C`。
+
 
 5. 查看最近任务状态
 

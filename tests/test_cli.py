@@ -1,6 +1,9 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import re
+import os
+import subprocess
+import sys
 
 from click.exceptions import Exit as ClickExit
 import pytest
@@ -103,6 +106,7 @@ def test_root_help_documents_run_and_shortcut_entrypoints() -> None:
     normalized = _normalize_help_output(result.output)
 
     assert result.exit_code == 0
+    assert "stop" in normalized
     assert "run" in normalized
     assert "resume" in normalized
     assert "tasks" in normalized
@@ -113,6 +117,7 @@ def test_root_help_documents_run_and_shortcut_entrypoints() -> None:
     assert "Shortcut" in normalized
     assert "podtran AUDIO [--preview]" in normalized
     assert "podtran resume [TASK]" in normalized
+    assert "podtran stop [TASK]" in normalized
 
 
 def test_version_command_prints_package_version() -> None:
@@ -146,6 +151,7 @@ def test_run_help_exposes_audio_and_preview_options() -> None:
 
 
 def test_stage_help_documents_task_requirements() -> None:
+    stop_result = runner.invoke(cli.app, ["stop", "--help"])
     status_result = runner.invoke(cli.app, ["status", "--help"])
     translate_result = runner.invoke(cli.app, ["translate", "--help"])
     synthesize_result = runner.invoke(cli.app, ["synthesize", "--help"])
@@ -153,6 +159,10 @@ def test_stage_help_documents_task_requirements() -> None:
     cache_clean_result = runner.invoke(cli.app, ["cache", "clean", "--help"])
     normalized_synthesize = _normalize_help_output(synthesize_result.output)
     normalized_compose = _normalize_help_output(compose_result.output)
+
+    assert stop_result.exit_code == 0
+    assert "running background task" in stop_result.output
+    assert "Defaults to latest" in stop_result.output
 
     assert status_result.exit_code == 0
     assert "If TASK is omitted" in status_result.output
@@ -673,6 +683,9 @@ def test_run_background_creates_task_and_starts_resume_process(
     )
     assert (task_dir / "run.pid").read_text(encoding="utf-8") == "4321\n"
     assert Path(captured["stdout_name"]) == task_dir / "run.log"
+    run_token = (task_dir / "run.token").read_text(encoding="utf-8").strip()
+    assert len(run_token) >= 32
+    assert captured["kwargs"]["env"]["PODTRAN_RUN_TOKEN"] == run_token
     assert captured["kwargs"]["stderr"] == cli.subprocess.STDOUT
     assert captured["command"] == [
         cli.sys.executable,
@@ -693,6 +706,212 @@ def test_run_background_creates_task_and_starts_resume_process(
     assert "pid=4321" in result.output
     assert "run.log" in result.output
     assert f"podtran status {task.task_id}" in result.output
+
+
+def test_stop_running_background_task_marks_task_and_stage_interrupted(
+    tmp_path: Path,
+) -> None:
+    config_path, cfg = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task = store.create_task(audio, cfg, entry_command=f"podtran {audio}")
+    paths = store.paths_for(task)
+
+    fake_package = tmp_path / "fake-package" / "podtran"
+    fake_package.mkdir(parents=True)
+    (fake_package / "__init__.py").write_text("", encoding="utf-8")
+    (fake_package / "__main__.py").write_text(
+        "import time\ntime.sleep(60)\n", encoding="utf-8"
+    )
+    run_token = "test-background-run-token"
+    process_env = os.environ.copy()
+    process_env["PODTRAN_RUN_TOKEN"] = run_token
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "podtran",
+            "resume",
+            task.task_id,
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path.resolve()),
+            "--min_speakers",
+            "2",
+            "--max_speakers",
+            "5",
+        ],
+        cwd=fake_package.parent,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=process_env,
+        creationflags=(
+            subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        ),
+        start_new_session=sys.platform != "win32",
+    )
+    try:
+        task.status = "running"
+        task.current_stage = "translate"
+        store.save_task(task)
+        write_json(
+            paths.manifest_path("translate"),
+            StageManifest(stage="translate", status="running", pid=process.pid),
+        )
+        (paths.task_dir / "run.pid").write_text(f"{process.pid}\n", encoding="utf-8")
+        (paths.task_dir / "run.token").write_text(f"{run_token}\n", encoding="utf-8")
+
+        result = runner.invoke(
+            cli.app,
+            [
+                "stop",
+                task.task_id,
+                "--config",
+                str(config_path),
+                "--workdir",
+                str(tmp_path),
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert f"Stopped task: {task.task_id}" in result.output
+        assert process.wait(timeout=5) is not None
+        assert store.load_task(task.task_id).status == "interrupted"
+        stage = read_model(paths.manifest_path("translate"), StageManifest)
+        assert stage.status == "interrupted"
+        assert stage.error == "Interrupted by user"
+        assert not (paths.task_dir / "run.pid").exists()
+        assert not (paths.task_dir / "run.token").exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_stop_stale_background_task_marks_latest_task_interrupted(
+    tmp_path: Path,
+) -> None:
+    config_path, cfg = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task = store.create_task(audio, cfg, entry_command=f"podtran {audio}")
+    paths = store.paths_for(task)
+    stale_pid = 2_147_483_647
+    task.status = "running"
+    task.current_stage = "translate"
+    store.save_task(task)
+    write_json(
+        paths.manifest_path("translate"),
+        StageManifest(stage="translate", status="running", pid=stale_pid),
+    )
+    (paths.task_dir / "run.pid").write_text(f"{stale_pid}\n", encoding="utf-8")
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "stop",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert f"Stopped task: {task.task_id}" in result.output
+    assert store.load_task(task.task_id).status == "interrupted"
+    stage = read_model(paths.manifest_path("translate"), StageManifest)
+    assert stage.status == "interrupted"
+    assert not (paths.task_dir / "run.pid").exists()
+
+
+def test_stop_refuses_pid_owned_by_another_process(tmp_path: Path) -> None:
+    config_path, cfg = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task = store.create_task(audio, cfg, entry_command=f"podtran {audio}")
+    paths = store.paths_for(task)
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        task.status = "running"
+        task.current_stage = "translate"
+        store.save_task(task)
+        write_json(
+            paths.manifest_path("translate"),
+            StageManifest(stage="translate", status="running", pid=process.pid),
+        )
+        (paths.task_dir / "run.pid").write_text(f"{process.pid}\n", encoding="utf-8")
+
+        result = runner.invoke(
+            cli.app,
+            [
+                "stop",
+                task.task_id,
+                "--config",
+                str(config_path),
+                "--workdir",
+                str(tmp_path),
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert f"Refusing to stop PID {process.pid}" in result.output
+        assert process.poll() is None
+        assert store.load_task(task.task_id).status == "running"
+        assert (paths.task_dir / "run.pid").exists()
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def test_stop_refuses_mismatched_running_stage_pid(tmp_path: Path) -> None:
+    config_path, cfg = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task = store.create_task(audio, cfg, entry_command=f"podtran {audio}")
+    paths = store.paths_for(task)
+    task.status = "running"
+    task.current_stage = "translate"
+    store.save_task(task)
+    write_json(
+        paths.manifest_path("translate"),
+        StageManifest(stage="translate", status="running", pid=1234),
+    )
+    (paths.task_dir / "run.pid").write_text("5678\n", encoding="utf-8")
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "stop",
+            task.task_id,
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "run.pid contains 5678" in result.output
+    assert "stage belongs to PID 1234" in result.output
+    assert store.load_task(task.task_id).status == "running"
+    stage = read_model(paths.manifest_path("translate"), StageManifest)
+    assert stage.status == "running"
+    assert (paths.task_dir / "run.pid").exists()
 
 
 def test_root_background_shortcut_creates_task_and_starts_resume_process(

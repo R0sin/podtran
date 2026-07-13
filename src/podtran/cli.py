@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import os
+import secrets
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -92,6 +93,9 @@ Shortcut:
 Resume an interrupted task:
   podtran resume [TASK]
 
+Stop a running background task:
+  podtran stop [TASK]
+
 Examples:
   podtran run path\\to\\episode.mp3 --preview
   podtran path\\to\\episode.mp3
@@ -116,6 +120,7 @@ console = Console()
 KNOWN_COMMANDS = {
     "run",
     "resume",
+    "stop",
     "init",
     "tasks",
     "status",
@@ -655,6 +660,92 @@ def resume(
     )
 
 
+STOP_HELP = """Stop a running background task.
+
+If TASK is omitted, picks the latest task. The process id is verified against the
+task's detached resume command before the process tree is terminated. The task and
+its running stage are then marked as interrupted so they can be resumed later.
+"""
+
+
+@app.command(
+    short_help="Stop a running background task.",
+    help=STOP_HELP,
+)
+def stop(
+    task: Optional[str] = typer.Argument(
+        None, metavar="TASK", help="Task id or unique prefix. Defaults to latest."
+    ),
+    config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
+    workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+) -> None:
+    _, resolved_workdir, task_store, _, _ = _load_runtime(config, workdir)
+    resolved_config_path = resolve_config_path(config, workdir)
+    try:
+        task_manifest = (
+            task_store.load_task(task) if task else task_store.load_latest_task()
+        )
+    except FileNotFoundError:
+        _abort("No tasks found. Use 'podtran run AUDIO' to create a new task.")
+        return
+
+    if task_manifest.status not in ("pending", "running"):
+        console.print(
+            f"[yellow]Task is not running:[/yellow] {task_manifest.task_id} "
+            f"(status={task_manifest.status})"
+        )
+        return
+
+    paths = task_store.paths_for(task_manifest)
+    pid_path = paths.task_dir / "run.pid"
+    if not pid_path.exists():
+        _abort(
+            f"Cannot stop task {task_manifest.task_id}: run.pid is missing. "
+            "Only detached background tasks can be stopped; use Ctrl+C for a foreground task."
+        )
+    pid = _read_background_pid(pid_path, task_manifest.task_id)
+    token_path = paths.task_dir / "run.token"
+    run_token = (
+        token_path.read_text(encoding="utf-8").strip() if token_path.exists() else None
+    )
+    if run_token == "":
+        _abort(f"Cannot stop task {task_manifest.task_id}: run.token is invalid.")
+
+    executor = StageExecutor(task_store, task_manifest, paths)
+    stage_manifest = (
+        executor.load_manifest(task_manifest.current_stage)
+        if task_manifest.current_stage
+        else None
+    )
+    running_stage = stage_manifest is not None and stage_manifest.status == "running"
+    if running_stage and stage_manifest.pid != pid:
+        _abort(
+            f"Cannot stop task {task_manifest.task_id}: run.pid contains {pid}, but the "
+            f"running {stage_manifest.stage} stage belongs to PID {stage_manifest.pid}."
+        )
+
+    process = _verified_background_process(
+        pid,
+        task_manifest.task_id,
+        resolved_config_path,
+        resolved_workdir,
+        run_token=run_token,
+        legacy_stage_started_at=stage_manifest.started_at if running_stage else None,
+    )
+    if process is not None:
+        _terminate_process_tree(process)
+
+    remove_path(token_path)
+    stopped = _record_stopped_task(task_store, task_manifest.task_id, pid)
+    remove_path(pid_path)
+    if stopped:
+        console.print(f"[green]Stopped task:[/green] {task_manifest.task_id}")
+    else:
+        console.print(
+            f"[yellow]Task finished before it could be stopped:[/yellow] {task_manifest.task_id}"
+        )
+
+
 @app.command(
     short_help="List recent tasks.",
     help="List recent tasks from the workdir so you can inspect task ids, modes, stages, and status.",
@@ -1025,6 +1116,7 @@ def _start_background_resume(
     )
     paths = task_store.paths_for(task_manifest)
     paths.ensure()
+    token_path = paths.task_dir / "run.token"
     log_path = paths.task_dir / "run.log"
     pid_path = paths.task_dir / "run.pid"
     command = [
@@ -1042,11 +1134,15 @@ def _start_background_resume(
         "--max_speakers",
         str(max_speakers),
     ]
+    run_token = secrets.token_urlsafe(32)
+    process_env = os.environ.copy()
+    process_env["PODTRAN_RUN_TOKEN"] = run_token
     popen_kwargs: dict[str, object] = {
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
         "stdin": subprocess.DEVNULL,
         "close_fds": True,
+        "env": process_env,
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = (
@@ -1059,6 +1155,7 @@ def _start_background_resume(
         popen_kwargs["stdout"] = log_handle
         popen_kwargs["stderr"] = subprocess.STDOUT
         process = subprocess.Popen(command, **popen_kwargs)
+    atomic_write_text(token_path, f"{run_token}\n")
     atomic_write_text(pid_path, f"{process.pid}\n")
     console.print(f"[green]Started background task:[/green] {task_manifest.task_id}")
     console.print(f"pid={process.pid}")
@@ -1068,6 +1165,146 @@ def _start_background_resume(
         f"podtran status {task_manifest.task_id} --config {resolved_config_path} "
         f"--workdir {resolved_workdir}"
     )
+
+
+def _read_background_pid(pid_path: Path, task_id: str) -> int:
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        _abort(f"Cannot stop task {task_id}: run.pid is invalid.")
+        raise AssertionError("unreachable")
+    if pid <= 0:
+        _abort(f"Cannot stop task {task_id}: run.pid is invalid.")
+    return pid
+
+
+def _verified_background_process(
+    pid: int,
+    task_id: str,
+    config_path: Path,
+    workdir: Path,
+    *,
+    run_token: str | None,
+    legacy_stage_started_at: str | None,
+):
+    import psutil
+
+    try:
+        process = psutil.Process(pid)
+        command = process.cmdline()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return None
+    except psutil.AccessDenied as exc:
+        _abort(f"Cannot inspect background process {pid} for task {task_id}: {exc}")
+        raise AssertionError("unreachable")
+
+    command_matches = (
+        len(command) == 13
+        and Path(command[0]).resolve() == Path(sys.executable).resolve()
+        and command[1:5] == ["-m", "podtran", "resume", task_id]
+        and command[5] == "--config"
+        and Path(command[6]).resolve() == config_path.resolve()
+        and command[7] == "--workdir"
+        and Path(command[8]).resolve() == workdir.resolve()
+        and command[9] == "--min_speakers"
+        and command[10].isdecimal()
+        and int(command[10]) >= 1
+        and command[11] == "--max_speakers"
+        and command[12].isdecimal()
+        and int(command[12]) >= int(command[10])
+    )
+    if not command_matches:
+        _abort(
+            f"Refusing to stop PID {pid}: it is not the background process for task {task_id}."
+        )
+
+    if run_token is not None:
+        try:
+            actual_token = process.environ().get("PODTRAN_RUN_TOKEN", "")
+        except psutil.AccessDenied as exc:
+            _abort(f"Cannot verify background process {pid} for task {task_id}: {exc}")
+            raise AssertionError("unreachable")
+        if not secrets.compare_digest(actual_token, run_token):
+            _abort(
+                f"Refusing to stop PID {pid}: its run token does not match task {task_id}."
+            )
+    else:
+        if not legacy_stage_started_at:
+            _abort(
+                f"Cannot safely verify PID {pid} for task {task_id}: run.token is missing "
+                "and the running stage has no start time."
+            )
+        try:
+            stage_started_at = datetime.fromisoformat(legacy_stage_started_at)
+            process_created_at = process.create_time()
+        except (ValueError, psutil.Error) as exc:
+            _abort(f"Cannot verify legacy background process {pid}: {exc}")
+            raise AssertionError("unreachable")
+        if process_created_at > stage_started_at.timestamp() + 1.0:
+            _abort(
+                f"Refusing to stop PID {pid}: it was created after the recorded "
+                f"{task_id} stage started."
+            )
+    return process
+
+
+def _terminate_process_tree(process) -> None:
+    import psutil
+
+    try:
+        descendants = process.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return
+    except psutil.AccessDenied as exc:
+        _abort(f"Cannot inspect child processes for PID {process.pid}: {exc}")
+
+    targets = [process, *descendants]
+    for target in targets:
+        try:
+            target.terminate()
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except psutil.AccessDenied as exc:
+            _abort(f"Cannot terminate PID {target.pid}: {exc}")
+
+    _, alive = psutil.wait_procs(targets, timeout=5)
+    for target in alive:
+        try:
+            target.kill()
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except psutil.AccessDenied as exc:
+            _abort(f"Cannot kill PID {target.pid}: {exc}")
+
+    _, alive = psutil.wait_procs(alive, timeout=5)
+    if alive:
+        pids = ", ".join(str(target.pid) for target in alive)
+        _abort(f"Unable to stop background process(es): {pids}")
+
+
+def _record_stopped_task(task_store: TaskStore, task_id: str, pid: int) -> bool:
+    task_manifest = task_store.load_task(task_id)
+    if task_manifest.status not in ("pending", "running"):
+        return False
+
+    paths = task_store.paths_for(task_manifest)
+    executor = StageExecutor(task_store, task_manifest, paths)
+    stage_manifest = (
+        executor.load_manifest(task_manifest.current_stage)
+        if task_manifest.current_stage
+        else None
+    )
+    if stage_manifest is not None and stage_manifest.status == "running":
+        if stage_manifest.pid != pid:
+            _abort(
+                f"Cannot stop task {task_id}: run.pid contains {pid}, but the "
+                f"running {stage_manifest.stage} stage belongs to PID {stage_manifest.pid}."
+            )
+        executor.interrupt(stage_manifest)
+        return True
+
+    executor.interrupt_task()
+    return True
 
 
 def _create_preview_audio(audio: Path, cfg: AppConfig, paths: ArtifactPaths) -> Path:

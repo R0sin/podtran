@@ -94,6 +94,7 @@ uv run podtran run path\to\episode.mp3 --preview
 uv run podtran path\to\episode.mp3
 uv run podtran resume
 uv run podtran tasks
+uv run podtran stop
 uv run podtran status
 uv run podtran version
 ```
@@ -118,6 +119,8 @@ runs `uv run ruff check src tests`, then `uv run pytest -q`.
   preview task.
 - `--min_speakers` and `--max_speakers` default to 2 and 5 and are passed to
   WhisperX diarization.
+- `stop [TASK]` verifies and terminates a detached background task, defaulting
+  to the latest task. Foreground tasks continue to use `Ctrl+C`.
 - `resume [TASK]` loads a task id or unique prefix, defaulting to the latest
   task.
 - Single-stage commands are `transcribe`, `translate`, `synthesize`, and
@@ -137,6 +140,9 @@ Each task lives under:
   segments.json
   translated.json
   preview.wav
+  run.log
+  run.pid
+  run.token
   voices.json
   refs/
   tts/

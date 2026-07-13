@@ -86,6 +86,9 @@ class StageExecutor:
         self._update_task(stage=manifest.stage, status="interrupted")
         return manifest
 
+    def interrupt_task(self) -> None:
+        self._update_task(stage=self.task_manifest.current_stage, status="interrupted")
+
     def save_completed(self, manifest: StageManifest) -> StageManifest:
         manifest.status = "completed"
         if not manifest.started_at:

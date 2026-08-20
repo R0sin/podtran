@@ -301,7 +301,12 @@ def test_bing_free_backend_bootstraps_session_and_translates_segment() -> None:
 
     backend = BingFreeTranslationBackend(AppConfig())
     assert backend.client.follow_redirects is False
-    backend.client = httpx.Client(transport=httpx.MockTransport(handle))
+    default_headers = dict(backend.client.headers)
+    backend.client.close()
+    backend.client = httpx.Client(
+        transport=httpx.MockTransport(handle),
+        headers=default_headers,
+    )
 
     translated = backend.translate_batch([_segment("seg_1")])
 
@@ -312,6 +317,8 @@ def test_bing_free_backend_bootstraps_session_and_translates_segment() -> None:
     ]
     assert requests[0].url.host == "cn.bing.com"
     assert requests[1].url.host == "cn.bing.com"
+    assert "Edg/" in requests[0].headers["User-Agent"]
+    assert requests[1].headers["User-Agent"] == requests[0].headers["User-Agent"]
     assert dict(requests[1].url.params) == {
         "isVertical": "1",
         "IG": "ig-value",

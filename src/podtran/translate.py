@@ -32,6 +32,11 @@ GOOGLE_FREE_TRANSLATE_URL = "https://translate.google.com/translate_a/t"
 BING_FREE_TRANSLATOR_URL = "https://cn.bing.com/Translator"
 BING_FREE_TRANSLATE_URL = "https://cn.bing.com/ttranslatev3"
 BING_FREE_TEXT_LIMIT = 1000
+BING_FREE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/150.0.0.0 Safari/537.36 Edg/151.0.4129.59"
+)
 
 
 class TranslationRuntime(BaseModel):
@@ -180,7 +185,7 @@ class BingFreeTranslationBackend:
         self.client = httpx.Client(
             timeout=config.translation.timeout_seconds,
             follow_redirects=False,
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={"User-Agent": BING_FREE_USER_AGENT},
         )
         self._session: _BingSessionState | None = None
         self._session_lock = threading.Lock()

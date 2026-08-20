@@ -1569,13 +1569,14 @@ def test_pipeline_progress_reporter_stage_only_skip_message_is_concise() -> None
 
 def test_resume_help_documents_task_argument_and_latest_default() -> None:
     result = runner.invoke(cli.app, ["resume", "--help"])
+    normalized = _normalize_help_output(result.output)
 
     assert result.exit_code == 0
-    assert "TASK" in result.output
-    assert "latest" in result.output.lower()
-    assert "Interrupted or failed translate/tts stages resume" in result.output
-    assert "--translation-provider" in result.output
-    assert "--background" in result.output
+    assert "TASK" in normalized
+    assert "latest" in normalized.lower()
+    assert "Interrupted or failed translate/tts stages resume" in normalized
+    assert "--translation-provider" in normalized
+    assert "--background" in normalized
 
 
 def test_resume_loads_latest_task_and_executes_pipeline(

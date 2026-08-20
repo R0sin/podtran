@@ -4,11 +4,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 from urllib.parse import urlencode
 
 import httpx
 from openai import APIError, APITimeoutError, OpenAI, RateLimitError
+from pydantic import BaseModel
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -24,6 +25,12 @@ TRANSLATION_RETRY_ATTEMPTS = 3
 GOOGLE_FREE_TRANSLATE_URL = "https://translate.google.com/translate_a/t"
 
 
+class TranslationRuntime(BaseModel):
+    provider: str
+    base_url: str = ""
+    model: str = ""
+
+
 class TranslationBackend(Protocol):
     batch_size_limit: int | None
 
@@ -35,9 +42,10 @@ class OpenAICompatibleTranslationBackend:
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self.runtime = resolve_translation_runtime(config)
         self.client = OpenAI(
             api_key=_resolve_translation_key(config),
-            base_url=config.resolved_translation_base_url(),
+            base_url=self.runtime.base_url,
             timeout=config.translation.timeout_seconds,
         )
 
@@ -58,7 +66,7 @@ class OpenAICompatibleTranslationBackend:
         )
         user_prompt = json.dumps(payload, ensure_ascii=False)
         response = self.client.chat.completions.create(
-            model=self.config.translation_model(),
+            model=self.runtime.model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -107,6 +115,45 @@ class GoogleFreeTranslationBackend:
         )
         response.raise_for_status()
         return _parse_google_free_translation_response(response.text, batch)
+
+
+def _resolve_google_free_runtime(config: AppConfig) -> TranslationRuntime:
+    _ = config
+    return TranslationRuntime(provider="google-free")
+
+
+def _resolve_openai_compatible_runtime(config: AppConfig) -> TranslationRuntime:
+    return TranslationRuntime(
+        provider="openai-compatible",
+        base_url=config.resolved_translation_base_url(),
+        model=config.translation_model().strip(),
+    )
+
+
+TranslationProviderRegistration = tuple[
+    Callable[[AppConfig], TranslationRuntime], type[TranslationBackend]
+]
+_TRANSLATION_PROVIDERS: dict[str, TranslationProviderRegistration] = {
+    "google-free": (_resolve_google_free_runtime, GoogleFreeTranslationBackend),
+    "openai-compatible": (
+        _resolve_openai_compatible_runtime,
+        OpenAICompatibleTranslationBackend,
+    ),
+}
+
+
+def translation_provider_names() -> tuple[str, ...]:
+    return tuple(_TRANSLATION_PROVIDERS)
+
+
+def resolve_translation_runtime(config: AppConfig) -> TranslationRuntime:
+    """Resolve the active translation settings without credentials or I/O."""
+    provider = config.translation.provider.strip().lower()
+    registration = _TRANSLATION_PROVIDERS.get(provider)
+    if registration is None:
+        raise RuntimeError(f"Unsupported translation provider: {provider}")
+    resolve_runtime, _ = registration
+    return resolve_runtime(config)
 
 
 class Translator:
@@ -181,14 +228,9 @@ class Translator:
 
 
 def build_translation_backend(config: AppConfig) -> TranslationBackend:
-    provider = config.translation.provider.strip().lower()
-    if provider == "google-free":
-        return GoogleFreeTranslationBackend(config)
-    if provider == "openai-compatible":
-        return OpenAICompatibleTranslationBackend(config)
-    raise RuntimeError(
-        f"Unsupported translation provider: {config.translation.provider}"
-    )
+    runtime = resolve_translation_runtime(config)
+    _, backend_type = _TRANSLATION_PROVIDERS[runtime.provider]
+    return backend_type(config)
 
 
 def _load_resume_segments(input_path: Path, output_path: Path) -> list[SegmentRecord]:

@@ -1477,9 +1477,9 @@ def test_translate_config_fingerprint_ignores_batch_size(tmp_path: Path) -> None
     second = AppConfig()
     second.translation.batch_size = first.translation.batch_size + 1
 
-    assert fingerprints.hash_config_subset(
-        first, cli.TRANSLATE_CONFIG_KEYS
-    ) == fingerprints.hash_config_subset(second, cli.TRANSLATE_CONFIG_KEYS)
+    assert cli._translation_config_fingerprint(
+        fingerprints, first
+    ) == cli._translation_config_fingerprint(fingerprints, second)
 
 
 def test_translate_config_fingerprint_ignores_max_concurrency(tmp_path: Path) -> None:
@@ -1488,9 +1488,37 @@ def test_translate_config_fingerprint_ignores_max_concurrency(tmp_path: Path) ->
     second = AppConfig()
     second.translation.max_concurrency = first.translation.max_concurrency + 1
 
-    assert fingerprints.hash_config_subset(
-        first, cli.TRANSLATE_CONFIG_KEYS
-    ) == fingerprints.hash_config_subset(second, cli.TRANSLATE_CONFIG_KEYS)
+    assert cli._translation_config_fingerprint(
+        fingerprints, first
+    ) == cli._translation_config_fingerprint(fingerprints, second)
+
+
+def test_translate_config_fingerprint_uses_only_canonical_active_runtime(
+    tmp_path: Path,
+) -> None:
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    first = AppConfig(
+        translation={"provider": "google-free"},
+        providers={
+            "openai_compatible": {
+                "translation_base_url": "https://first.example/v1",
+                "translation_model": "first-model",
+            }
+        },
+    )
+    second = AppConfig(
+        translation={"provider": " GOOGLE-FREE "},
+        providers={
+            "openai_compatible": {
+                "translation_base_url": "https://second.example/v1/",
+                "translation_model": "second-model",
+            }
+        },
+    )
+
+    assert cli._translation_config_fingerprint(
+        fingerprints, first
+    ) == cli._translation_config_fingerprint(fingerprints, second)
 
 
 def test_pipeline_progress_reporter_renders_overall_and_stage_lines() -> None:
@@ -1546,6 +1574,8 @@ def test_resume_help_documents_task_argument_and_latest_default() -> None:
     assert "TASK" in result.output
     assert "latest" in result.output.lower()
     assert "Interrupted or failed translate/tts stages resume" in result.output
+    assert "--translation-provider" in result.output
+    assert "--background" in result.output
 
 
 def test_resume_loads_latest_task_and_executes_pipeline(
@@ -1581,6 +1611,255 @@ def test_resume_loads_latest_task_and_executes_pipeline(
     assert result.exit_code == 0
     assert "Resuming task:" in result.output
     assert captured["task_id"] == task_manifest.task_id
+
+
+def test_resume_translation_provider_override_is_one_shot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path, cfg = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task_manifest = store.create_task(audio, cfg, f"podtran {audio}")
+    captured: dict[str, str] = {}
+
+    def fake_execute_pipeline(task_manifest, cfg, *args, **kwargs):
+        captured["provider"] = cfg.translation.provider
+        return []
+
+    monkeypatch.setattr(cli, "_execute_pipeline", fake_execute_pipeline)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            task_manifest.task_id,
+            "--translation-provider",
+            " OPENAI-COMPATIBLE ",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["provider"] == "openai-compatible"
+    assert load_config(config_path).translation.provider == "google-free"
+
+
+def test_resume_background_passes_translation_provider_to_child(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path, cfg = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task_manifest = store.create_task(audio, cfg, f"podtran {audio}")
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 4321
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        return FakeProcess()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        cli,
+        "_execute_pipeline",
+        lambda *args, **kwargs: pytest.fail("background resume executed inline"),
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            task_manifest.task_id,
+            "--background",
+            "--translation-provider",
+            "openai-compatible",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    command = captured["command"]
+    assert command[-2:] == ["--translation-provider", "openai-compatible"]
+    assert "--background" not in command
+
+
+def test_resume_background_does_not_start_completed_task(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path, cfg = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task_manifest = store.create_task(audio, cfg, f"podtran {audio}")
+    task_manifest.status = "completed"
+    store.save_task(task_manifest)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("completed task started a child process"),
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            task_manifest.task_id,
+            "--background",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Task is already complete" in result.output
+
+
+def test_resume_background_rejects_live_background_process(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path, cfg = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task_manifest = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task_manifest)
+    (paths.task_dir / "run.pid").write_text("4321\n", encoding="utf-8")
+    (paths.task_dir / "run.token").write_text("active-token\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cli, "_verified_background_process", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("duplicate background process started"),
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            task_manifest.task_id,
+            "--background",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "already running in background with PID 4321" in result.output
+
+
+def test_resume_background_replaces_stale_process_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path, cfg = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task_manifest = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task_manifest)
+    (paths.task_dir / "run.pid").write_text("999999\n", encoding="utf-8")
+    (paths.task_dir / "run.token").write_text("stale-token\n", encoding="utf-8")
+
+    class FakeProcess:
+        pid = 4321
+
+    monkeypatch.setattr(
+        cli, "_verified_background_process", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            task_manifest.task_id,
+            "--background",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert (paths.task_dir / "run.pid").read_text(encoding="utf-8") == "4321\n"
+    assert (paths.task_dir / "run.token").read_text(
+        encoding="utf-8"
+    ).strip() != "stale-token"
+
+
+def test_resume_background_rejects_unknown_provider_before_spawning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path, cfg = _create_config(tmp_path)
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task_manifest = store.create_task(audio, cfg, f"podtran {audio}")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("invalid provider spawned a process"),
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "resume",
+            task_manifest.task_id,
+            "--background",
+            "--translation-provider",
+            "future-provider",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert not (store.paths_for(task_manifest).task_dir / "run.pid").exists()
+
+
+def test_background_resume_options_accept_optional_translation_provider() -> None:
+    options = cli._background_resume_options(
+        [
+            "--config",
+            "config.toml",
+            "--workdir",
+            "workdir",
+            "--min_speakers",
+            "2",
+            "--max_speakers",
+            "5",
+            "--translation-provider",
+            "openai-compatible",
+        ]
+    )
+
+    assert options is not None
+    assert options["--translation-provider"] == "openai-compatible"
 
 
 def test_resume_with_explicit_task_id(tmp_path: Path, monkeypatch) -> None:
@@ -1661,7 +1940,9 @@ def test_can_resume_partial_returns_true_for_interrupted_with_matching_fingerpri
     )
 
 
-def test_can_resume_partial_returns_false_when_config_changed(tmp_path: Path) -> None:
+def test_can_resume_translate_partial_returns_true_when_config_changed(
+    tmp_path: Path,
+) -> None:
     audio = tmp_path / "episode.mp3"
     audio.write_bytes(b"audio")
     fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
@@ -1679,11 +1960,13 @@ def test_can_resume_partial_returns_false_when_config_changed(tmp_path: Path) ->
     )
     write_json(paths.manifest_path("translate"), manifest)
 
-    assert (
-        cli._can_resume_partial(
-            executor, "translate", 1, {"segments_json": "abc123"}, "new-cfg-hash"
-        )
-        is False
+    assert cli._can_resume_partial(
+        executor,
+        "translate",
+        1,
+        {"segments_json": "abc123"},
+        "new-cfg-hash",
+        require_config_match=False,
     )
 
 
@@ -1753,8 +2036,7 @@ def test_ensure_translate_preserves_partial_results_on_resume(
     )
     write_json(paths.manifest_path("translate"), interrupted_manifest)
     # Write partial translated output
-    partial = [_segment("seg_00000", None)]
-    partial[0].text_zh = "你好"
+    partial = [segments[0].model_copy(update={"text_zh": "你好"})]
     write_json(paths.translated_json, partial)
 
     class FakeTranslator:
@@ -1776,10 +2058,234 @@ def test_ensure_translate_preserves_partial_results_on_resume(
         task, cfg, paths, executor, cache_store, fingerprints
     )
 
-    assert result.action == "run"
+    assert result.action == "up-to-date"
     assert paths.translated_json.exists()
     restored = read_model_list(paths.translated_json, SegmentRecord)
     assert restored[0].text_zh == "你好"
+
+
+def test_ensure_translate_preserves_partial_across_provider_change_and_skips_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import podtran.translate as translate_module
+
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    old_cfg = AppConfig(translation={"provider": "google-free"})
+    new_cfg = AppConfig(translation={"provider": "openai-compatible"})
+    task = store.create_task(audio, old_cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    transcript = [
+        TranscriptSegment(
+            segment_id="ts_1",
+            start=0.0,
+            end=1.0,
+            text="hello",
+            speaker="SPEAKER_00",
+        ),
+        TranscriptSegment(
+            segment_id="ts_2",
+            start=1.0,
+            end=2.0,
+            text="world",
+            speaker="SPEAKER_01",
+        ),
+    ]
+    write_json(paths.transcript_json, transcript)
+    segments = cli._write_segments(paths, old_cfg)
+    input_fps = {
+        "segments_json": cli._translate_input_fingerprint(fingerprints, segments)
+    }
+    write_json(
+        paths.manifest_path("translate"),
+        StageManifest(
+            stage="translate",
+            status="failed",
+            stage_version=cli.TRANSLATE_STAGE_VERSION,
+            input_fingerprints=input_fps,
+            config_fingerprint=cli._translation_config_fingerprint(
+                fingerprints, old_cfg
+            ),
+            output_refs={
+                "translated_json": "translated.json",
+                "segments_json": "segments.json",
+            },
+        ),
+    )
+    write_json(
+        paths.translated_json,
+        [
+            segments[0].model_copy(update={"text_zh": "你好"}),
+            segments[1].model_copy(update={"error": "blocked"}),
+        ],
+    )
+
+    class FakeTranslator:
+        def __init__(self, config: AppConfig) -> None:
+            assert config.translation.provider == "openai-compatible"
+
+        def translate_segments(self, input_path, output_path, progress_callback=None):
+            loaded = read_model_list(output_path, SegmentRecord)
+            assert loaded[0].text_zh == "你好"
+            return [
+                loaded[0],
+                loaded[1].model_copy(update={"text_zh": "世界", "error": None}),
+            ]
+
+    monkeypatch.setattr(translate_module, "Translator", FakeTranslator)
+    monkeypatch.setattr(
+        cache_store,
+        "lookup",
+        lambda *args, **kwargs: pytest.fail("partial task consulted shared cache"),
+    )
+    monkeypatch.setattr(
+        cache_store,
+        "publish",
+        lambda *args, **kwargs: pytest.fail("resumed partial was published"),
+    )
+
+    result = cli._ensure_translate(
+        task, new_cfg, paths, executor, cache_store, fingerprints
+    )
+
+    assert result.action == "run"
+    translated = read_model_list(paths.translated_json, SegmentRecord)
+    assert [item.text_zh for item in translated] == ["你好", "世界"]
+
+
+def test_ensure_translate_complete_output_ignores_provider_change(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import podtran.translate as translate_module
+
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    old_cfg = AppConfig(translation={"provider": "google-free"})
+    new_cfg = AppConfig(translation={"provider": "openai-compatible"})
+    task = store.create_task(audio, old_cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    write_json(
+        paths.transcript_json,
+        [
+            TranscriptSegment(
+                segment_id="ts_1",
+                start=0.0,
+                end=1.0,
+                text="hello",
+                speaker="SPEAKER_00",
+            )
+        ],
+    )
+    segments = cli._write_segments(paths, old_cfg)
+    input_fps = {
+        "segments_json": cli._translate_input_fingerprint(fingerprints, segments)
+    }
+    write_json(
+        paths.translated_json,
+        [segments[0].model_copy(update={"text_zh": "你好"})],
+    )
+    write_json(
+        paths.manifest_path("translate"),
+        StageManifest(
+            stage="translate",
+            status="completed",
+            stage_version=cli.TRANSLATE_STAGE_VERSION,
+            input_fingerprints=input_fps,
+            config_fingerprint=cli._translation_config_fingerprint(
+                fingerprints, old_cfg
+            ),
+            output_refs={
+                "translated_json": "translated.json",
+                "segments_json": "segments.json",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        translate_module,
+        "Translator",
+        lambda *args, **kwargs: pytest.fail("complete translation was re-run"),
+    )
+
+    result = cli._ensure_translate(
+        task, new_cfg, paths, executor, cache_store, fingerprints
+    )
+
+    assert result.action == "up-to-date"
+
+
+def test_ensure_translate_discards_partial_when_segment_structure_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import podtran.translate as translate_module
+
+    audio = tmp_path / "episode.mp3"
+    audio.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache_store = CacheStore(tmp_path / "artifacts" / "cache")
+    cfg = AppConfig()
+    task = store.create_task(audio, cfg, f"podtran {audio}")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    write_json(
+        paths.transcript_json,
+        [
+            TranscriptSegment(
+                segment_id="ts_1",
+                start=0.0,
+                end=1.0,
+                text="new source text",
+                speaker="SPEAKER_00",
+            )
+        ],
+    )
+    old_segment = _segment("seg_00000", None, text_zh="旧译文")
+    old_input_fps = {
+        "segments_json": cli._translate_input_fingerprint(fingerprints, [old_segment])
+    }
+    write_json(paths.translated_json, [old_segment])
+    write_json(
+        paths.manifest_path("translate"),
+        StageManifest(
+            stage="translate",
+            status="failed",
+            stage_version=cli.TRANSLATE_STAGE_VERSION,
+            input_fingerprints=old_input_fps,
+            config_fingerprint=cli._translation_config_fingerprint(fingerprints, cfg),
+            output_refs={
+                "translated_json": "translated.json",
+                "segments_json": "segments.json",
+            },
+        ),
+    )
+
+    class FakeTranslator:
+        def __init__(self, config: AppConfig) -> None:
+            pass
+
+        def translate_segments(self, input_path, output_path, progress_callback=None):
+            assert not output_path.exists()
+            current = read_model_list(input_path, SegmentRecord)
+            return [current[0].model_copy(update={"text_zh": "新译文"})]
+
+    monkeypatch.setattr(translate_module, "Translator", FakeTranslator)
+
+    result = cli._ensure_translate(
+        task, cfg, paths, executor, cache_store, fingerprints
+    )
+
+    assert result.action == "run"
+    translated = read_model_list(paths.translated_json, SegmentRecord)
+    assert translated[0].text == "new source text"
+    assert translated[0].text_zh == "新译文"
 
 
 def test_ensure_translate_fails_when_any_segment_fails_and_preserves_output(

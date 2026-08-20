@@ -17,6 +17,8 @@ from podtran.translate import (
     _parse_translation_response,
     _resolve_translation_key,
     build_translation_backend,
+    resolve_translation_runtime,
+    translation_provider_names,
 )
 
 
@@ -53,6 +55,7 @@ def test_resolve_translation_key_prefers_provider_credentials(monkeypatch) -> No
 
 
 def test_build_translation_backend_supports_known_providers() -> None:
+    assert translation_provider_names() == ("google-free", "openai-compatible")
     assert isinstance(
         build_translation_backend(AppConfig()), GoogleFreeTranslationBackend
     )
@@ -74,6 +77,47 @@ def test_build_translation_backend_supports_known_providers() -> None:
 def test_build_translation_backend_rejects_unknown_provider() -> None:
     with pytest.raises(RuntimeError, match="Unsupported translation provider"):
         build_translation_backend(AppConfig(translation={"provider": "custom"}))
+
+
+def test_resolve_translation_runtime_normalizes_active_provider_config() -> None:
+    google = resolve_translation_runtime(
+        AppConfig(
+            translation={"provider": "  GOOGLE-FREE  "},
+            providers={
+                "openai_compatible": {
+                    "translation_base_url": "https://unused.example/v1/",
+                    "translation_model": "unused",
+                }
+            },
+        )
+    )
+    openai = resolve_translation_runtime(
+        AppConfig(
+            translation={"provider": "  OPENAI-COMPATIBLE  "},
+            providers={
+                "openai_compatible": {
+                    "translation_base_url": "https://api.example/v1/",
+                    "translation_model": " model-a ",
+                }
+            },
+        )
+    )
+
+    assert google.model_dump() == {
+        "provider": "google-free",
+        "base_url": "",
+        "model": "",
+    }
+    assert openai.model_dump() == {
+        "provider": "openai-compatible",
+        "base_url": "https://api.example/v1",
+        "model": "model-a",
+    }
+
+
+def test_resolve_translation_runtime_rejects_unknown_provider() -> None:
+    with pytest.raises(RuntimeError, match="Unsupported translation provider: custom"):
+        resolve_translation_runtime(AppConfig(translation={"provider": " custom "}))
 
 
 def test_parse_translation_response_accepts_valid_payload() -> None:

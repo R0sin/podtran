@@ -140,7 +140,6 @@ TTS_PROVIDER_CHOICES = (
     "vllm-omni",
     "mimo",
 )
-TRANSLATION_PROVIDER_CHOICES = ("google-free", "openai-compatible")
 TTS_MODE_CHOICES = ("auto", "preset", "clone")
 DEFAULT_VLLM_OMNI_BASE_URL = "http://localhost:8091/v1"
 UNKNOWN_SPEAKER = "UNKNOWN"
@@ -376,6 +375,8 @@ def init(
 
 
 def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
+    from podtran.translate import translation_provider_names
+
     config = (
         existing_config.model_copy(deep=True)
         if existing_config is not None
@@ -395,7 +396,7 @@ def _prompt_init_config(existing_config: AppConfig | None = None) -> AppConfig:
     )
     config.translation.provider = _prompt_choice(
         "Translation provider",
-        TRANSLATION_PROVIDER_CHOICES,
+        translation_provider_names(),
         config.translation.provider or DEFAULT_TRANSLATION_PROVIDER,
     )
     if config.translation.provider == "openai-compatible":
@@ -613,6 +614,7 @@ RESUME_HELP = """Resume an existing task and re-run the pipeline from where it l
 
 If TASK is omitted, picks the latest task. Completed stages are skipped automatically.
 Interrupted or failed translate/tts stages resume from the last compatible checkpoint.
+Use --translation-provider to change the provider only for this resume invocation.
 """
 
 
@@ -638,9 +640,20 @@ def resume(
         min=1,
         help="Maximum speaker count hint for diarization.",
     ),
+    translation_provider: Optional[str] = typer.Option(
+        None,
+        "--translation-provider",
+        help="Override the translation provider for this resume only.",
+    ),
+    background: bool = typer.Option(
+        False,
+        "--background",
+        help="Resume the pipeline in a detached background process.",
+    ),
 ) -> None:
     _validate_speaker_bounds(min_speakers, max_speakers)
     cfg, _, task_store, cache_store, fingerprints = _load_runtime(config, workdir)
+    cfg = _with_translation_provider(cfg, translation_provider)
     try:
         task_manifest = (
             task_store.load_task(task) if task else task_store.load_latest_task()
@@ -648,6 +661,26 @@ def resume(
     except FileNotFoundError:
         _abort("No tasks found. Use 'podtran run AUDIO' to create a new task.")
         return  # unreachable, _abort raises
+    if background:
+        if task_manifest.status == "completed":
+            console.print(
+                f"[yellow]Task is already complete:[/yellow] {task_manifest.task_id}"
+            )
+            return
+        _ensure_background_resume_available(task_manifest, task_store, config, workdir)
+        _start_background_resume(
+            task_manifest,
+            task_store,
+            config,
+            workdir,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            translation_provider=cfg.translation.provider
+            if translation_provider is not None
+            else None,
+        )
+        return
+
     console.print(f"[green]Resuming task:[/green] {task_manifest.task_id}")
     _execute_pipeline(
         task_manifest,
@@ -1109,6 +1142,7 @@ def _start_background_resume(
     *,
     min_speakers: int,
     max_speakers: int,
+    translation_provider: str | None = None,
 ) -> None:
     resolved_config_path = resolve_config_path(config_path, workdir_override)
     resolved_workdir = resolve_workdir(
@@ -1134,6 +1168,8 @@ def _start_background_resume(
         "--max_speakers",
         str(max_speakers),
     ]
+    if translation_provider is not None:
+        command.extend(["--translation-provider", translation_provider])
     run_token = secrets.token_urlsafe(32)
     process_env = os.environ.copy()
     process_env["PODTRAN_RUN_TOKEN"] = run_token
@@ -1167,6 +1203,57 @@ def _start_background_resume(
     )
 
 
+def _ensure_background_resume_available(
+    task_manifest: TaskManifest,
+    task_store: TaskStore,
+    config_path: Path | None,
+    workdir_override: Path | None,
+) -> None:
+    paths = task_store.paths_for(task_manifest)
+    pid_path = paths.task_dir / "run.pid"
+    token_path = paths.task_dir / "run.token"
+    if not pid_path.exists():
+        if token_path.exists():
+            remove_path(token_path)
+        return
+
+    pid = _read_background_pid(pid_path, task_manifest.task_id)
+    run_token = (
+        token_path.read_text(encoding="utf-8").strip() if token_path.exists() else None
+    )
+    if run_token == "":
+        _abort(f"Cannot resume task {task_manifest.task_id}: run.token is invalid.")
+    resolved_config_path = resolve_config_path(config_path, workdir_override)
+    resolved_workdir = resolve_workdir(
+        workdir_override, config_path=resolved_config_path
+    )
+    executor = StageExecutor(task_store, task_manifest, paths)
+    stage_manifest = (
+        executor.load_manifest(task_manifest.current_stage)
+        if task_manifest.current_stage
+        else None
+    )
+    process = _verified_background_process(
+        pid,
+        task_manifest.task_id,
+        resolved_config_path,
+        resolved_workdir,
+        run_token=run_token,
+        legacy_stage_started_at=(
+            stage_manifest.started_at
+            if stage_manifest is not None and stage_manifest.status == "running"
+            else None
+        ),
+    )
+    if process is not None:
+        _abort(
+            f"Task {task_manifest.task_id} is already running in background "
+            f"with PID {pid}."
+        )
+    remove_path(pid_path)
+    remove_path(token_path)
+
+
 def _read_background_pid(pid_path: Path, task_id: str) -> int:
     try:
         pid = int(pid_path.read_text(encoding="utf-8").strip())
@@ -1198,20 +1285,18 @@ def _verified_background_process(
         _abort(f"Cannot inspect background process {pid} for task {task_id}: {exc}")
         raise AssertionError("unreachable")
 
+    options = _background_resume_options(command[5:])
     command_matches = (
-        len(command) == 13
+        len(command) >= 13
         and Path(command[0]).resolve() == Path(sys.executable).resolve()
         and command[1:5] == ["-m", "podtran", "resume", task_id]
-        and command[5] == "--config"
-        and Path(command[6]).resolve() == config_path.resolve()
-        and command[7] == "--workdir"
-        and Path(command[8]).resolve() == workdir.resolve()
-        and command[9] == "--min_speakers"
-        and command[10].isdecimal()
-        and int(command[10]) >= 1
-        and command[11] == "--max_speakers"
-        and command[12].isdecimal()
-        and int(command[12]) >= int(command[10])
+        and options is not None
+        and Path(options["--config"]).resolve() == config_path.resolve()
+        and Path(options["--workdir"]).resolve() == workdir.resolve()
+        and options["--min_speakers"].isdecimal()
+        and int(options["--min_speakers"]) >= 1
+        and options["--max_speakers"].isdecimal()
+        and int(options["--max_speakers"]) >= int(options["--min_speakers"])
     )
     if not command_matches:
         _abort(
@@ -1246,6 +1331,28 @@ def _verified_background_process(
                 f"{task_id} stage started."
             )
     return process
+
+
+def _background_resume_options(arguments: list[str]) -> dict[str, str] | None:
+    required = {
+        "--config",
+        "--workdir",
+        "--min_speakers",
+        "--max_speakers",
+    }
+    allowed = {*required, "--translation-provider"}
+    if len(arguments) % 2 != 0:
+        return None
+    options: dict[str, str] = {}
+    for index in range(0, len(arguments), 2):
+        option = arguments[index]
+        value = arguments[index + 1]
+        if option not in allowed or option in options or not value:
+            return None
+        options[option] = value
+    if not required.issubset(options):
+        return None
+    return options
 
 
 def _terminate_process_tree(process) -> None:
@@ -1501,26 +1608,57 @@ def _validate_speaker_bounds(min_speakers: int, max_speakers: int) -> None:
         )
 
 
+def _with_translation_provider(
+    cfg: AppConfig, provider_override: str | None
+) -> AppConfig:
+    if provider_override is not None:
+        cfg = cfg.model_copy(
+            update={
+                "translation": cfg.translation.model_copy(
+                    update={"provider": provider_override}
+                )
+            }
+        )
+
+    from podtran.translate import resolve_translation_runtime
+
+    try:
+        runtime = resolve_translation_runtime(cfg)
+    except RuntimeError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--translation-provider") from exc
+    if cfg.translation.provider == runtime.provider:
+        return cfg
+    return cfg.model_copy(
+        update={
+            "translation": cfg.translation.model_copy(
+                update={"provider": runtime.provider}
+            )
+        }
+    )
+
+
 def _can_resume_partial(
     executor: StageExecutor,
     stage: str,
     stage_version: int,
     input_fingerprints: dict[str, str],
     config_fingerprint: str,
+    *,
+    require_config_match: bool = True,
 ) -> bool:
     """Check if a non-current stage can resume with partial results intact.
 
     Returns True only when the previous manifest exists with status 'running',
-    'interrupted', or 'failed' AND the stage version, input and config
-    fingerprints all still match, meaning the partial results are compatible
-    with the current run.
+    'interrupted', or 'failed' and the required compatibility fingerprints match.
+    Translation may opt out of config matching because provider/model changes only
+    affect pending segments; other stages keep the strict default.
     """
     manifest = executor.load_manifest(stage)
     if manifest is None or manifest.status not in ("running", "interrupted", "failed"):
         return False
     if manifest.stage_version != stage_version:
         return False
-    if manifest.config_fingerprint != config_fingerprint:
+    if require_config_match and manifest.config_fingerprint != config_fingerprint:
         return False
     for key, value in input_fingerprints.items():
         if manifest.input_fingerprints.get(key) != value:
@@ -1662,18 +1800,40 @@ def _translate_input_fingerprint(
     fingerprints: FingerprintService, segments: list[SegmentRecord]
 ) -> str:
     return fingerprints.hash_value(
-        [
-            {
-                "segment_id": item.segment_id,
-                "block_id": item.block_id,
-                "start": item.start,
-                "end": item.end,
-                "text": item.text,
-                "speaker": item.speaker,
-                "words": [word.model_dump() for word in item.words],
-            }
-            for item in segments
-        ]
+        [_translation_segment_identity(item) for item in segments]
+    )
+
+
+def _translation_segment_identity(segment: SegmentRecord) -> dict[str, object]:
+    return {
+        "segment_id": segment.segment_id,
+        "block_id": segment.block_id,
+        "start": segment.start,
+        "end": segment.end,
+        "text": segment.text,
+        "speaker": segment.speaker,
+        "words": [word.model_dump() for word in segment.words],
+    }
+
+
+def _translation_config_fingerprint(
+    fingerprints: FingerprintService, cfg: AppConfig
+) -> str:
+    from podtran.translate import resolve_translation_runtime
+
+    return fingerprints.hash_value(resolve_translation_runtime(cfg).model_dump())
+
+
+def _translate_output_matches_input(
+    paths: ArtifactPaths,
+    fingerprints: FingerprintService,
+    expected_fingerprint: str,
+) -> bool:
+    if not paths.translated_json.exists():
+        return False
+    translated = read_model_list(paths.translated_json, SegmentRecord)
+    return (
+        _translate_input_fingerprint(fingerprints, translated) == expected_fingerprint
     )
 
 
@@ -1695,7 +1855,11 @@ def _sync_translated_output(
                 "error": previous.error,
             }
         )
-        if (previous := translated_by_id.get(segment.segment_id)) is not None
+        if (
+            (previous := translated_by_id.get(segment.segment_id)) is not None
+            and _translation_segment_identity(previous)
+            == _translation_segment_identity(segment)
+        )
         else segment
         for segment in segments
     ]
@@ -1723,7 +1887,7 @@ def _ensure_translate(
     input_fingerprints = {
         "segments_json": _translate_input_fingerprint(fingerprints, segments)
     }
-    config_fingerprint = fingerprints.hash_config_subset(cfg, TRANSLATE_CONFIG_KEYS)
+    config_fingerprint = _translation_config_fingerprint(fingerprints, cfg)
     output_refs = {
         "translated_json": "translated.json",
         "segments_json": "segments.json",
@@ -1749,7 +1913,47 @@ def _ensure_translate(
             reporter.skip_stage("translate", "up-to-date")
         return StageDecision("translate", "up-to-date", "task outputs current")
 
-    entry = cache_store.lookup("translate", cache_key)
+    previous_manifest = executor.load_manifest("translate")
+    structure_matches = (
+        previous_manifest is not None
+        and previous_manifest.stage_version == TRANSLATE_STAGE_VERSION
+        and all(
+            previous_manifest.input_fingerprints.get(key) == value
+            for key, value in input_fingerprints.items()
+        )
+        and _translate_output_matches_input(
+            paths, fingerprints, input_fingerprints["segments_json"]
+        )
+    )
+    if structure_matches:
+        _sync_translated_output(paths, segments)
+        existing = read_model_list(paths.translated_json, SegmentRecord)
+        if _all_segments_translated(existing):
+            if previous_manifest.status != "completed":
+                executor.save_completed(manifest)
+            if reporter is not None:
+                reporter.skip_stage("translate", "complete task output")
+            return StageDecision(
+                "translate", "up-to-date", "task translation already complete"
+            )
+
+    resumable = structure_matches and _can_resume_partial(
+        executor,
+        "translate",
+        TRANSLATE_STAGE_VERSION,
+        input_fingerprints,
+        config_fingerprint,
+        require_config_match=False,
+    )
+    had_successful_partial = False
+    if resumable:
+        existing = read_model_list(paths.translated_json, SegmentRecord)
+        had_successful_partial = any(item.text_zh.strip() for item in existing)
+
+    if not had_successful_partial:
+        entry = cache_store.lookup("translate", cache_key)
+    else:
+        entry = None
     if entry is not None:
         cache_store.restore(entry, {"translated_json": paths.translated_json})
         _sync_translated_output(paths, segments)
@@ -1758,13 +1962,6 @@ def _ensure_translate(
             reporter.skip_stage("translate", "cache hit")
         return StageDecision("translate", "cache hit", reason or "cache available")
 
-    resumable = _can_resume_partial(
-        executor,
-        "translate",
-        TRANSLATE_STAGE_VERSION,
-        input_fingerprints,
-        config_fingerprint,
-    )
     executor.start(manifest)
     try:
         if reporter is not None:
@@ -1789,9 +1986,13 @@ def _ensure_translate(
             _print_stage_failure_summary("translate", translated)
             raise RuntimeError("Translation failed for one or more segments.")
         executor.complete(manifest)
-        cache_store.publish(
-            "translate", cache_key, {"translated_json": paths.translated_json}, manifest
-        )
+        if not had_successful_partial:
+            cache_store.publish(
+                "translate",
+                cache_key,
+                {"translated_json": paths.translated_json},
+                manifest,
+            )
         if reporter is not None:
             reporter.complete_stage("translate", _translate_stage_summary(translated))
         return StageDecision("translate", "run", reason or "cache miss")

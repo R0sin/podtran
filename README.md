@@ -255,6 +255,18 @@ podtran resume
 podtran resume 20260415-083242-50ed61
 ```
 
+如果原翻译渠道无法处理剩余片段，可以只为本次恢复切换翻译 provider。已成功的片段会保留，新 provider 只处理失败或缺失的片段；model、endpoint 和密钥仍从当前配置读取：
+
+```powershell
+podtran resume 20260415-083242-50ed61 --translation-provider openai-compatible
+```
+
+恢复任务也可以转到后台运行：
+
+```powershell
+podtran resume 20260415-083242-50ed61 --translation-provider openai-compatible --background
+```
+
 提示：如果翻译已经**完成**过，重新运行 `podtran <audio>` 也会通过共享缓存自动复用。但如果翻译**中途中断**，只有 `resume` 能恢复未完成的进度。
 如果任务通过 `--background` 在后台运行，可以用 `stop` 中止它：
 

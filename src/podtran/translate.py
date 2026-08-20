@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
+import re
+import threading
+import time
 from typing import Callable, Protocol
 from urllib.parse import urlencode
 
@@ -12,6 +16,7 @@ from openai import APIError, APITimeoutError, OpenAI, RateLimitError
 from pydantic import BaseModel
 from tenacity import (
     retry,
+    retry_if_exception,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
@@ -23,12 +28,62 @@ from podtran.models import SegmentRecord, StageProgressCallback
 
 TRANSLATION_RETRY_ATTEMPTS = 3
 GOOGLE_FREE_TRANSLATE_URL = "https://translate.google.com/translate_a/t"
+# Protocol reference (MIT): https://github.com/plainheart/bing-translate-api
+BING_FREE_TRANSLATOR_URL = "https://cn.bing.com/Translator"
+BING_FREE_TRANSLATE_URL = "https://cn.bing.com/ttranslatev3"
+BING_FREE_TEXT_LIMIT = 1000
 
 
 class TranslationRuntime(BaseModel):
     provider: str
     base_url: str = ""
     model: str = ""
+
+
+class _BingSessionState(BaseModel):
+    ig: str
+    iid: str
+    key: str
+    token: str
+    expires_at: float
+
+
+class _BingTranslatorPageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.iid = ""
+        self._in_script = False
+        self.script_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "script":
+            self._in_script = True
+        for name, value in attrs:
+            if name == "data-iid" and value:
+                self.iid = value
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script":
+            self._in_script = False
+
+    def handle_data(self, data: str) -> None:
+        if self._in_script:
+            self.script_parts.append(data)
+
+
+def _is_retryable_bing_error(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.RequestError):
+        return True
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
+
+
+def _retry_bing_free_request():
+    return retry(
+        reraise=True,
+        stop=stop_after_attempt(TRANSLATION_RETRY_ATTEMPTS),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        retry=retry_if_exception(_is_retryable_bing_error),
+    )
 
 
 class TranslationBackend(Protocol):
@@ -117,9 +172,203 @@ class GoogleFreeTranslationBackend:
         return _parse_google_free_translation_response(response.text, batch)
 
 
+class BingFreeTranslationBackend:
+    batch_size_limit = 1
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.client = httpx.Client(
+            timeout=config.translation.timeout_seconds,
+            follow_redirects=False,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        self._session: _BingSessionState | None = None
+        self._session_lock = threading.Lock()
+
+    def translate_batch(self, batch: list[SegmentRecord]) -> list[dict[str, str]]:
+        if len(batch) != 1:
+            raise RuntimeError(
+                f"Bing-free expects one segment per batch, got {len(batch)}."
+            )
+        segment = batch[0]
+        translated = "".join(
+            self._translate_text(chunk) for chunk in _split_bing_free_text(segment.text)
+        )
+        return [{"segment_id": segment.segment_id, "text_zh": translated}]
+
+    def _translate_text(self, text: str) -> str:
+        for refresh_attempt in range(2):
+            session = self._get_session(force=refresh_attempt == 1)
+            response = self._request_translation(text, session)
+            parsed = _decode_bing_free_response(response.text)
+            blocking_error = _bing_free_blocking_error(parsed)
+            if blocking_error is not None:
+                raise RuntimeError(blocking_error)
+            if response.status_code == 400 and refresh_attempt == 0:
+                continue
+            if response.status_code == 401:
+                raise RuntimeError(
+                    "Bing-free translation limit was exceeded (HTTP 401)."
+                )
+            if response.status_code == 429:
+                raise RuntimeError("Bing-free translation was rate limited (HTTP 429).")
+            response.raise_for_status()
+            return _parse_bing_free_translation_response(response.text, parsed)
+        raise RuntimeError("Bing-free translation failed after refreshing its session.")
+
+    @_retry_bing_free_request()
+    def _request_translation(
+        self, text: str, session: _BingSessionState
+    ) -> httpx.Response:
+        response = self.client.post(
+            BING_FREE_TRANSLATE_URL,
+            params={"isVertical": "1", "IG": session.ig, "IID": session.iid},
+            data={
+                "fromLang": "en",
+                "to": "zh-Hans",
+                "text": text,
+                "key": session.key,
+                "token": session.token,
+            },
+            headers={"Referer": BING_FREE_TRANSLATOR_URL},
+        )
+        if response.status_code >= 500:
+            response.raise_for_status()
+        return response
+
+    def _get_session(self, *, force: bool = False) -> _BingSessionState:
+        with self._session_lock:
+            if (
+                not force
+                and self._session is not None
+                and time.monotonic() < self._session.expires_at
+            ):
+                return self._session
+            response = self._request_session_page()
+            self._session = _parse_bing_free_session(response.text)
+            return self._session
+
+    @_retry_bing_free_request()
+    def _request_session_page(self) -> httpx.Response:
+        response = self.client.get(BING_FREE_TRANSLATOR_URL)
+        response.raise_for_status()
+        return response
+
+
+def _parse_bing_free_session(content: str) -> _BingSessionState:
+    page = _BingTranslatorPageParser()
+    page.feed(content)
+    scripts = "\n".join(page.script_parts)
+    ig_match = re.search(r'IG:"([^"]+)"', scripts)
+    abuse_match = re.search(r"params_AbusePreventionHelper\s*=\s*(\[[^\]]+\])", scripts)
+    if not ig_match or not page.iid or not abuse_match:
+        raise RuntimeError("Bing-free translator page was missing session data.")
+    try:
+        key, token, expires_ms = json.loads(abuse_match.group(1))
+        issued_at_ms = float(key)
+        expires_ms = float(expires_ms)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Bing-free translator page had invalid session data."
+        ) from exc
+    if not key or not token or expires_ms <= 0:
+        raise RuntimeError("Bing-free translator page had incomplete session data.")
+    remaining_ms = min(
+        expires_ms,
+        max(issued_at_ms + expires_ms - time.time() * 1000, 0),
+    )
+    return _BingSessionState(
+        ig=ig_match.group(1),
+        iid=page.iid,
+        key=str(key),
+        token=str(token),
+        expires_at=time.monotonic() + remaining_ms / 1000,
+    )
+
+
+def _split_bing_free_text(text: str) -> list[str]:
+    remaining = text.strip()
+    if not remaining:
+        raise RuntimeError("Bing-free translation input was empty.")
+    chunks: list[str] = []
+    while len(remaining) > BING_FREE_TEXT_LIMIT:
+        window = remaining[:BING_FREE_TEXT_LIMIT]
+        sentence_matches = list(re.finditer(r'[.!?](?:["\')\]]*)\s+', window))
+        if sentence_matches:
+            split_at = sentence_matches[-1].end()
+        else:
+            split_at = window.rfind(" ")
+            if split_at <= 0:
+                split_at = BING_FREE_TEXT_LIMIT
+        chunk = remaining[:split_at].strip()
+        if not chunk:
+            split_at = BING_FREE_TEXT_LIMIT
+            chunk = remaining[:split_at]
+        chunks.append(chunk)
+        remaining = remaining[split_at:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _decode_bing_free_response(content: str) -> object:
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return None
+
+
+def _parse_bing_free_translation_response(content: str, parsed: object) -> str:
+    cleaned = content.strip()
+    if not cleaned:
+        raise RuntimeError("Bing-free translation response was empty.")
+    if parsed is None:
+        raise RuntimeError(
+            "Bing-free translation response was not valid JSON. "
+            f"Response: {_excerpt(cleaned)}"
+        )
+    blocking_error = _bing_free_blocking_error(parsed)
+    if blocking_error is not None:
+        raise RuntimeError(blocking_error)
+    if isinstance(parsed, dict):
+        raise RuntimeError(
+            "Bing-free translation returned an error response. "
+            f"Response: {_excerpt(cleaned)}"
+        )
+    try:
+        translated = parsed[0]["translations"][0]["text"]
+    except (IndexError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            "Bing-free translation response structure was unexpected. "
+            f"Response: {_excerpt(cleaned)}"
+        ) from exc
+    translated_text = str(translated).strip()
+    if not translated_text:
+        raise RuntimeError("Bing-free translation response returned empty text.")
+    return translated_text
+
+
+def _bing_free_blocking_error(parsed: object) -> str | None:
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get("ShowCaptcha"):
+        return "Bing-free translation requested a captcha."
+    status_code = parsed.get("StatusCode", parsed.get("statusCode"))
+    if status_code == 401:
+        return "Bing-free translation limit was exceeded."
+    if status_code == 429:
+        return "Bing-free translation was rate limited."
+    return None
+
+
 def _resolve_google_free_runtime(config: AppConfig) -> TranslationRuntime:
     _ = config
     return TranslationRuntime(provider="google-free")
+
+
+def _resolve_bing_free_runtime(config: AppConfig) -> TranslationRuntime:
+    _ = config
+    return TranslationRuntime(provider="bing-free")
 
 
 def _resolve_openai_compatible_runtime(config: AppConfig) -> TranslationRuntime:
@@ -135,6 +384,7 @@ TranslationProviderRegistration = tuple[
 ]
 _TRANSLATION_PROVIDERS: dict[str, TranslationProviderRegistration] = {
     "google-free": (_resolve_google_free_runtime, GoogleFreeTranslationBackend),
+    "bing-free": (_resolve_bing_free_runtime, BingFreeTranslationBackend),
     "openai-compatible": (
         _resolve_openai_compatible_runtime,
         OpenAICompatibleTranslationBackend,

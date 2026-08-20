@@ -1,6 +1,7 @@
 from pathlib import Path
 import threading
 import time
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -9,6 +10,7 @@ from podtran.artifacts import read_model_list
 from podtran.config import AppConfig
 from podtran.models import SegmentRecord
 from podtran.translate import (
+    BingFreeTranslationBackend,
     GoogleFreeTranslationBackend,
     OpenAICompatibleTranslationBackend,
     Translator,
@@ -34,6 +36,22 @@ def _segment(segment_id: str) -> SegmentRecord:
     )
 
 
+def _bing_page(
+    *,
+    ig: str = "ig-value",
+    iid: str = "translator.5028.1",
+    key: int = 1_700_000_000_000,
+    token: str = "token-value",
+    expires_ms: int = 3_600_000,
+) -> str:
+    return (
+        f'<html><body data-iid="{iid}"><script>'
+        f'var params_AbusePreventionHelper = [{key},"{token}",{expires_ms}];'
+        f'var pageData = {{IG:"{ig}"}};'
+        "</script></body></html>"
+    )
+
+
 class _FakeBackend:
     batch_size_limit: int | None = None
 
@@ -55,9 +73,17 @@ def test_resolve_translation_key_prefers_provider_credentials(monkeypatch) -> No
 
 
 def test_build_translation_backend_supports_known_providers() -> None:
-    assert translation_provider_names() == ("google-free", "openai-compatible")
+    assert translation_provider_names() == (
+        "google-free",
+        "bing-free",
+        "openai-compatible",
+    )
     assert isinstance(
         build_translation_backend(AppConfig()), GoogleFreeTranslationBackend
+    )
+    assert isinstance(
+        build_translation_backend(AppConfig(translation={"provider": "bing-free"})),
+        BingFreeTranslationBackend,
     )
     assert isinstance(
         build_translation_backend(
@@ -102,9 +128,17 @@ def test_resolve_translation_runtime_normalizes_active_provider_config() -> None
             },
         )
     )
+    bing = resolve_translation_runtime(
+        AppConfig(translation={"provider": "  BING-FREE  "})
+    )
 
     assert google.model_dump() == {
         "provider": "google-free",
+        "base_url": "",
+        "model": "",
+    }
+    assert bing.model_dump() == {
+        "provider": "bing-free",
         "base_url": "",
         "model": "",
     }
@@ -246,6 +280,194 @@ def test_google_free_backend_retries_http_failures_and_surfaces_error() -> None:
 
     with pytest.raises(httpx.HTTPStatusError, match="rate limited"):
         backend.translate_batch([_segment("seg_1")])
+
+
+def test_bing_free_backend_bootstraps_session_and_translates_segment() -> None:
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, text=_bing_page())
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "detectedLanguage": {"language": "en"},
+                    "translations": [{"text": "你好", "to": "zh-Hans"}],
+                }
+            ],
+        )
+
+    backend = BingFreeTranslationBackend(AppConfig())
+    assert backend.client.follow_redirects is False
+    backend.client = httpx.Client(transport=httpx.MockTransport(handle))
+
+    translated = backend.translate_batch([_segment("seg_1")])
+
+    assert translated == [{"segment_id": "seg_1", "text_zh": "你好"}]
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/Translator"),
+        ("POST", "/ttranslatev3"),
+    ]
+    assert requests[0].url.host == "cn.bing.com"
+    assert requests[1].url.host == "cn.bing.com"
+    assert dict(requests[1].url.params) == {
+        "isVertical": "1",
+        "IG": "ig-value",
+        "IID": "translator.5028.1",
+    }
+    assert parse_qs(requests[1].content.decode()) == {
+        "fromLang": ["en"],
+        "to": ["zh-Hans"],
+        "text": ["hello"],
+        "key": ["1700000000000"],
+        "token": ["token-value"],
+    }
+
+
+def test_bing_free_backend_splits_long_segment_and_reassembles_translation() -> None:
+    requested_texts: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, text=_bing_page())
+        requested_texts.append(parse_qs(request.content.decode())["text"][0])
+        translated = "甲。" if len(requested_texts) == 1 else "乙。"
+        return httpx.Response(
+            200,
+            json=[{"translations": [{"text": translated, "to": "zh-Hans"}]}],
+        )
+
+    segment = _segment("seg_long").model_copy(
+        update={"text": f"{'a' * 600}. {'b' * 500}."}
+    )
+    backend = BingFreeTranslationBackend(AppConfig())
+    backend.client = httpx.Client(transport=httpx.MockTransport(handle))
+
+    translated = backend.translate_batch([segment])
+
+    assert translated == [{"segment_id": "seg_long", "text_zh": "甲。乙。"}]
+    assert requested_texts == [f"{'a' * 600}.", f"{'b' * 500}."]
+    assert all(len(text) <= 1000 for text in requested_texts)
+
+
+def test_bing_free_backend_refreshes_session_once_after_bad_request() -> None:
+    get_count = 0
+    post_tokens: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        if request.method == "GET":
+            get_count += 1
+            return httpx.Response(
+                200,
+                text=_bing_page(token=f"token-{get_count}"),
+            )
+        post_tokens.append(parse_qs(request.content.decode())["token"][0])
+        if len(post_tokens) == 1:
+            return httpx.Response(400, text="stale token")
+        return httpx.Response(
+            200,
+            json=[{"translations": [{"text": "你好", "to": "zh-Hans"}]}],
+        )
+
+    backend = BingFreeTranslationBackend(AppConfig())
+    backend.client = httpx.Client(transport=httpx.MockTransport(handle))
+
+    translated = backend.translate_batch([_segment("seg_1")])
+
+    assert translated == [{"segment_id": "seg_1", "text_zh": "你好"}]
+    assert get_count == 2
+    assert post_tokens == ["token-1", "token-2"]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "payload", "message"),
+    [
+        (401, {}, "translation limit"),
+        (429, {}, "rate limited"),
+        (200, {"ShowCaptcha": True}, "captcha"),
+        (400, {"ShowCaptcha": True}, "captcha"),
+    ],
+)
+def test_bing_free_backend_does_not_retry_blocking_responses(
+    status_code: int,
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    post_count = 0
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        if request.method == "GET":
+            return httpx.Response(200, text=_bing_page())
+        post_count += 1
+        return httpx.Response(status_code, json=payload)
+
+    backend = BingFreeTranslationBackend(AppConfig())
+    backend.client = httpx.Client(transport=httpx.MockTransport(handle))
+
+    with pytest.raises(RuntimeError, match=message):
+        backend.translate_batch([_segment("seg_1")])
+
+    assert post_count == 1
+
+
+def test_bing_free_backend_uses_token_age_when_deciding_to_refresh(
+    monkeypatch,
+) -> None:
+    clock = {"wall": 1_000.0, "monotonic": 50.0}
+    get_count = 0
+
+    monkeypatch.setattr("podtran.translate.time.time", lambda: clock["wall"])
+    monkeypatch.setattr("podtran.translate.time.monotonic", lambda: clock["monotonic"])
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        if request.method == "GET":
+            get_count += 1
+            return httpx.Response(
+                200,
+                text=_bing_page(key=998_000, expires_ms=3_000),
+            )
+        return httpx.Response(
+            200,
+            json=[{"translations": [{"text": "你好", "to": "zh-Hans"}]}],
+        )
+
+    backend = BingFreeTranslationBackend(AppConfig())
+    backend.client = httpx.Client(transport=httpx.MockTransport(handle))
+
+    backend.translate_batch([_segment("seg_1")])
+    clock["monotonic"] = 51.5
+    backend.translate_batch([_segment("seg_2")])
+
+    assert get_count == 2
+
+
+def test_bing_free_backend_retries_transient_network_failure() -> None:
+    post_count = 0
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        if request.method == "GET":
+            return httpx.Response(200, text=_bing_page())
+        post_count += 1
+        if post_count == 1:
+            raise httpx.ConnectError("temporary failure", request=request)
+        return httpx.Response(
+            200,
+            json=[{"translations": [{"text": "你好", "to": "zh-Hans"}]}],
+        )
+
+    backend = BingFreeTranslationBackend(AppConfig())
+    backend.client = httpx.Client(transport=httpx.MockTransport(handle))
+
+    translated = backend.translate_batch([_segment("seg_1")])
+
+    assert translated == [{"segment_id": "seg_1", "text_zh": "你好"}]
+    assert post_count == 2
 
 
 def test_format_batch_error_includes_exception_type_and_segment_ids() -> None:

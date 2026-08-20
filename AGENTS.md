@@ -29,7 +29,7 @@ moves config, tasks, cache, and indexes together.
 | CLI | Typer + Rich |
 | Config | TOML via `tomllib` / `tomli`, Pydantic v2 models |
 | ASR | WhisperX with alignment and speaker diarization |
-| Translation | `google-free` by default; `openai-compatible` for LLM endpoints |
+| Translation | `google-free` by default; `bing-free`; `openai-compatible` for LLM endpoints |
 | TTS | `qwen-local` by default; also `dashscope`, `openai-compatible`, `vllm-omni` |
 | Audio | external `ffmpeg` / `ffprobe` |
 | HTTP / SDK | `httpx`, `openai` SDK |
@@ -50,7 +50,7 @@ podtran/
 │   ├── models.py           # Task, stage, segment, voice, and voice-spec models
 │   ├── asr.py              # WhisperX transcription
 │   ├── merge.py            # Transcript -> block SegmentRecord aggregation
-│   ├── translate.py        # google-free and OpenAI-compatible translation backends
+│   ├── translate.py        # Free web and OpenAI-compatible translation backends
 │   ├── tts.py              # TTS backends, segment synthesis, per-segment TTS cache
 │   ├── voices.py           # Clone reference selection, voice resolver, voice profile cache
 │   ├── compose.py          # Final audio composition
@@ -246,6 +246,8 @@ Translation providers:
 
 - `google-free`: default, no API key, uses an unofficial Google Translate web
   endpoint and can be affected by network/rate limits.
+- `bing-free`: no API key, uses the Bing China translator web endpoint, and
+  splits inputs above 1000 characters while sending one text per request.
 - `openai-compatible`: uses Chat Completions via the OpenAI SDK. DashScope
   translation is configured through this provider and its compatible-mode URL.
 

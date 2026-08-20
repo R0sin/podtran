@@ -9,7 +9,7 @@
 特点：
 
 - 本地用 `WhisperX` 做转写、对齐和说话人区分
-- 翻译支持 `google-free` 和 `openai-compatible`，DashScope 通过兼容 OpenAI 的端点接入；TTS 默认走 `qwen-local`
+- 翻译支持 `google-free`、`bing-free` 和 `openai-compatible`，DashScope 通过兼容 OpenAI 的端点接入；TTS 默认走 `qwen-local`
 - TTS 默认 `mode = "auto"`：本地、DashScope、vLLM-Omni 和 MiMo 默认走音色克隆，OpenAI-compatible 默认走预置音色
 - 每次运行都会创建独立 task，避免旧结果污染新结果
 - 共享缓存会自动复用已完成的转写、翻译、声纹和逐段 TTS 结果
@@ -105,7 +105,7 @@ podtran init
 
 - 先去接受 Hugging Face 的 `speaker-diarization-community-1` 协议
 - 填写 `hf_token`
-- 选择翻译 provider；如果选 `google-free`，则不需要翻译 API key
+- 选择翻译 provider；如果选 `google-free` 或 `bing-free`，则不需要翻译 API key
 - 选择 TTS provider；向导只会询问该 provider 实际需要的 `base_url`、API key、mode 或 model
 - 只有当 TTS 实际使用 `dashscope` 时，才会要求填写 DashScope API key
 
@@ -122,6 +122,7 @@ TTS provider 说明：
 翻译 provider 说明：
 
 - `google-free`：默认选项，免费，无需 API key；走 Google 非公开网页接口，可能受地区、风控、请求频率影响
+- `bing-free`：免费，无需 API key；走 Bing 中国站网页接口，单个片段超过 1000 字符时会自动拆分并重组
 - `openai-compatible`：适合自建、DashScope compatible-mode 或其他兼容 OpenAI Chat Completions 的翻译端点；需要设置 `providers.openai_compatible.translation_base_url`
 
 如果你手动编辑 `config.toml`，最常见的翻译配置是：
@@ -129,6 +130,13 @@ TTS provider 说明：
 ```toml
 [translation]
 provider = "google-free"  # 默认；忽略 base_url 和 model
+```
+
+国内网络可以先尝试 Bing 网页渠道：
+
+```toml
+[translation]
+provider = "bing-free"
 ```
 
 如果你想切到 DashScope compatible-mode，可改成：

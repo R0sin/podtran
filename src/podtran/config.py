@@ -406,7 +406,7 @@ def render_config_toml(config: AppConfig) -> str:
         f'align_model = "{config.asr.align_model}"',
         "",
         "[translation]",
-        "# google-free uses the unofficial Google Translate web endpoint and ignores base_url/model.",
+        "# google-free and bing-free use web endpoints and ignore base_url/model.",
         f'provider = "{config.translation.provider}"',
         f"timeout_seconds = {config.translation.timeout_seconds}",
         f"batch_size = {config.translation.batch_size}",

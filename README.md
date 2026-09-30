@@ -1,352 +1,110 @@
 # podtran
 
-`podtran` 是一个面向长播客的分阶段翻译 CLI，用于把英文播客转成可听的中文版本。它把转写、翻译、TTS 和合成拆成可恢复、可缓存的阶段，并支持按资源条件选择本地模型、自托管服务或云端兼容服务。
+把英文播客转成中文音频的命令行工具。默认保留英文原声并穿插中文配音，也可输出纯中文版本。
 
-它默认走这条流水线：
-
-`transcribe -> translate -> synthesize -> compose`
-
-特点：
-
-- 本地用 `WhisperX` 做转写、对齐和说话人区分
-- 翻译支持 `google-free`、`bing-free` 和 `openai-compatible`，DashScope 通过兼容 OpenAI 的端点接入；TTS 默认走 `qwen-local`
-- TTS 默认 `mode = "auto"`：本地、DashScope、vLLM-Omni 和 MiMo 默认走音色克隆，OpenAI-compatible 默认走预置音色
-- 每次运行都会创建独立 task，避免旧结果污染新结果
-- 共享缓存会自动复用已完成的转写、翻译、声纹和逐段 TTS 结果
-- 中断后可用 `podtran resume` 从断点继续，已完成的翻译不会丢失
-- 支持 `--preview`，先用前 5 分钟低成本试跑
-
-## 适合什么场景
-
-- 你想把英文播客、访谈或对话音频翻成中文音频
-- 你不想一次性跑一个黑盒脚本，而是希望看到每个阶段的结果
-- 你希望失败后可以从某个阶段继续，而不是全部重来
-
-## 运行前准备
-
-- Python `3.11` 推荐，支持 `>=3.10,<3.13`
-- `ffmpeg` 和 `ffprobe` 需要在 `PATH` 中可执行
-- 需要一个 Hugging Face token 给 WhisperX diarization 使用
-- 默认翻译不需要 API key；如果用到 `openai-compatible`，再配置对应 provider key
-- TTS 可选 `qwen-local`、`dashscope`、`openai-compatible`、`vllm-omni` 或 `mimo`，所需配置取决于 provider
+- **先试听**：用前 5 分钟音频预览翻译和配音效果。
+- **可恢复**：转写、翻译、配音、合成分阶段执行，中断后从兼容的断点继续。
+- **复用结果**：自动缓存转写、翻译、音色和逐段配音，减少重复处理。
+- **灵活选择**：默认本地 WhisperX 转写、免费网页翻译、本地 Qwen TTS，也支持云端和自托管服务。
 
 ## 安装
 
-标准方式是直接从 Git 仓库安装 CLI，并启用默认 TTS 后端需要的 `qwen-local` 可选依赖：
+需要先准备：
+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) 和 [Git](https://git-scm.com/downloads)；推荐 Python 3.11，支持 3.10–3.12。
+- [FFmpeg](https://ffmpeg.org/download.html)，确保终端可执行 `ffmpeg` 和 `ffprobe`。
+- [Hugging Face token](https://huggingface.co/settings/tokens)，并接受 [说话人区分模型的使用条款](https://huggingface.co/pyannote/speaker-diarization-community-1)。
+
+安装默认的本地 TTS 版本：
 
 ```powershell
-uv tool install --torch-backend auto "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
-```
-
-`--torch-backend auto` 会让 `uv` 为 PyTorch 生态依赖自动选择合适后端；有可用 NVIDIA CUDA 驱动时会优先安装 CUDA 版，否则使用 CPU 版。这会同时影响 WhisperX 转写和本地 TTS 依赖。
-
-如果你不使用本地 TTS，也可以只安装基础依赖，然后在配置里把 TTS provider 改成 `dashscope`、`openai-compatible`、`vllm-omni` 或 `mimo`：
-
-```powershell
-uv tool install --torch-backend auto git+https://github.com/R0sin/podtran
-```
-
-如果已经安装过，可以用同一条命令加 `--force` 重新安装：
-
-```powershell
-uv tool install --force --torch-backend auto "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
-```
-
-基础依赖版本则使用：
-
-```powershell
-uv tool install --force --torch-backend auto git+https://github.com/R0sin/podtran
-```
-
-安装完成后可以先确认命令已可用：
-
-```powershell
+uv tool install --python 3.11 --torch-backend auto "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
 podtran --help
 ```
 
-提示：CLI help 会把 `podtran run AUDIO` 作为正式入口展示，日常使用仍可直接写 `podtran AUDIO`。
+`--torch-backend auto` 让 uv 根据设备选择 PyTorch 后端，详见 [uv 的 PyTorch 指南](https://docs.astral.sh/uv/guides/integration/pytorch/)。转写默认使用 CPU；首次运行需要下载模型，处理时间取决于硬件与音频长度。
 
-升级时通常可以直接使用更短的 `uv tool upgrade`：
-
-```powershell
-uv tool upgrade podtran
-```
-
-这会按已安装 tool 的来源升级 `podtran`。如果你最初是按默认方式安装的
-`podtran[qwen-local]`，升级时会继续使用该安装来源。
-
-如果升级后本地 Qwen TTS 依赖异常，可用完整命令强制重装：
+**使用云端或自托管 TTS？** 可只安装基础依赖，再在初始化时选择对应服务：
 
 ```powershell
-uv tool install --force --torch-backend auto "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
+uv tool install --python 3.11 --torch-backend auto git+https://github.com/R0sin/podtran
 ```
 
-基础依赖版本则使用：
-
-```powershell
-uv tool install --force --torch-backend auto git+https://github.com/R0sin/podtran
-```
-
-卸载：
-
-```powershell
-uv tool uninstall podtran
-```
+远程 TTS 按服务要求配置地址和密钥；转写仍在本地运行。
 
 ## 快速开始
 
-1. 初始化配置
+### 1. 初始化配置
 
 ```powershell
 podtran init
 ```
 
-`init` 现在会进入交互式向导，默认帮你生成一份完整配置。向导会提示你：
+跟随向导填写 Hugging Face token，选择翻译和 TTS 服务。默认使用 `google-free` 翻译和 `qwen-local` 配音，无需翻译或 TTS API key。配置保存在 `~/.podtran/config.toml`。
 
-- 先去接受 Hugging Face 的 `speaker-diarization-community-1` 协议
-- 填写 `hf_token`
-- 选择翻译 provider；如果选 `google-free` 或 `bing-free`，则不需要翻译 API key
-- 选择 TTS provider；向导只会询问该 provider 实际需要的 `base_url`、API key、mode 或 model
-- 只有当 TTS 实际使用 `dashscope` 时，才会要求填写 DashScope API key
+### 2. 先试听前 5 分钟
 
-默认配置会写到 `~/.podtran/config.toml`。如果传 `--workdir <path>`，则会写到 `<path>/config.toml`，同时任务和缓存也会放到这个目录下。
-
-TTS provider 说明：
-
-- `qwen-local`：默认选项，支持 `preset` 和 `clone`，`auto` 下使用优化过的 `clone`，需要安装 `qwen-local` extra，默认使用 0.6B 模型
-- `dashscope`：支持 `preset` 和 `clone`，`auto` 下使用 `clone`
-- `openai-compatible`：支持 `preset`，`auto` 下使用 `preset`
-- `vllm-omni`：支持 `preset` 和 `clone`，`auto` 下使用 `clone`，需要配置 `providers.vllm_omni.base_url`
-- `mimo`：支持 `preset` 和 `clone`，`auto` 下使用 `clone`，调用 Xiaomi MiMo 开放平台，API key 可写入配置或通过 `MIMO_API_KEY` 环境变量提供
-
-翻译 provider 说明：
-
-- `google-free`：默认选项，免费，无需 API key；走 Google 非公开网页接口，可能受地区、风控、请求频率影响
-- `bing-free`：免费，无需 API key；走 Bing 中国站网页接口，单个片段超过 1000 字符时会自动拆分并重组
-- `openai-compatible`：适合自建、DashScope compatible-mode 或其他兼容 OpenAI Chat Completions 的翻译端点；需要设置 `providers.openai_compatible.translation_base_url`
-
-如果你手动编辑 `config.toml`，最常见的翻译配置是：
-
-```toml
-[translation]
-provider = "google-free"  # 默认；忽略 base_url 和 model
-```
-
-国内网络可以先尝试 Bing 网页渠道：
-
-```toml
-[translation]
-provider = "bing-free"
-```
-
-如果你想切到 DashScope compatible-mode，可改成：
-
-```toml
-[translation]
-provider = "openai-compatible"
-
-[providers.openai_compatible]
-translation_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-translation_api_key = "sk-..."
-translation_model = "qwen-flash"
-```
-
-如果你准备自己部署 `vllm-omni` 的 `Qwen3-TTS` 服务，可先看这些官方资料：
-
-- `vLLM-Omni` 文档：[Installation / Quickstart](https://vllm-omni.readthedocs.io/)
-- `vLLM-Omni` 仓库：[vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni)
-- `Qwen3-TTS` 官方说明：[QwenLM/Qwen3-TTS 的 vLLM Usage](https://github.com/QwenLM/Qwen3-TTS)
-
-对 `podtran` 来说，只需要一个可访问的 `vllm-omni` TTS 服务，并把 `providers.vllm_omni.base_url` 指向它；默认示例地址是 `http://localhost:8091/v1`。
-
-如果你想使用 MiMo-V2.5-TTS 或 MiMo-V2.5-TTS-VoiceClone，可配置：
-
-```toml
-[tts]
-provider = "mimo"
-mode = "auto"
-
-[providers.mimo]
-api_key = "..."
-# 注意：活动接口为 "https://token-plan-cn.xiaomimimo.com/v1"
-base_url = "https://api.xiaomimimo.com/v1"
-preset_model = "mimo-v2.5-tts"
-clone_model = "mimo-v2.5-tts-voiceclone"
-preset_voice = "mimo_default"
-audio_format = "wav"
-instructions = ""
-```
-
-默认 TTS 后端会直接在 podtran 进程内运行 Qwen3-TTS，需要安装 `qwen-local` 可选依赖。使用 `uv tool install` 安装 CLI 时，请按前面的默认安装命令启用 `podtran[qwen-local]`。
-
-如果是在源码 checkout 中开发或运行，可同步 extra：
+将 `podcast.mp3` 替换为你的音频文件路径：
 
 ```powershell
-uv sync --extra qwen-local
+podtran run "podcast.mp3" --preview
 ```
 
-然后配置：
-
-```toml
-[tts]
-provider = "qwen-local"
-mode = "auto"
-batch_size = 4
-max_concurrency = 1
-
-[providers.qwen_local]
-clone_model_size = "0.6B"
-preset_model_size = "0.6B"
-device = "auto"
-language = "Chinese"
-```
-
-`batch_size` 可以根据设备资源微调；显存或内存紧张时调小，资源更充足时可以适当调大。
-
-转录相关设置默认来自 `config.toml` 里的 `[asr]` 配置：
-
-```toml
-[asr]
-model = "medium"
-compute_type = "int8"
-device = "cpu"
-batch_size = 4
-```
-
-`medium + cpu + int8` 是面向普通笔记本的默认组合。如果有实力或想尝试不同效果，可以手动调整 `model`、`device` 和 `compute_type`。
-
-可选值参考：
-
-- `model`：`base`、`small`、`medium`、`large-v2`、`large-v3`、`turbo`、`distil-large-v3`
-- `compute_type`：`int8`、`float16`
-
-一般建议：
-
-- CPU 环境优先用 `int8`
-- CUDA 环境优先用 `float16`
-
-以下是单卡 3090 的示例：
-
-```toml
-[asr]
-model = "distil-large-v3"
-compute_type = "float16"
-device = "cuda"
-batch_size = 16
-```
-
-2. 先跑一个 5 分钟预览
+预览只处理前 300 秒音频。确认说话人区分、翻译和配音效果后，再运行完整版：
 
 ```powershell
-podtran path\to\podcast.mp3 --preview
+podtran run "podcast.mp3"
 ```
 
-这一步就是首选验证方式。对长播客也一样，先用预览模式确认配置、说话人区分、翻译质量和 TTS 效果，再决定是否跑完整音频。
+也可简写为 `podtran "podcast.mp3"`。默认按 2–5 位说话人识别；已知人数时可[指定说话人数量](docs/usage.md#说话人数量)。
 
-如果你知道说话人大致数量，可以用 `--min_speakers` 和 `--max_speakers` 给 diarization 提示；默认是 `--min_speakers 2 --max_speakers 5`。
+### 3. 找到输出
 
-3. 预览效果没问题后，跑完整音频
-
-```powershell
-podtran path\to\podcast.mp3
-```
-
-4. 如果运行中断（Ctrl+C 或意外退出），用 `resume` 从断点继续
-
-```powershell
-podtran resume
-```
-
-`resume` 默认恢复最近一个 task。已完成的阶段会自动跳过，翻译阶段会从上次保存的进度继续翻译。也可以指定 task id：
-
-```powershell
-podtran resume 20260415-083242-50ed61
-```
-
-如果原翻译渠道无法处理剩余片段，可以只为本次恢复切换翻译 provider。已成功的片段会保留，新 provider 只处理失败或缺失的片段；model、endpoint 和密钥仍从当前配置读取：
-
-```powershell
-podtran resume 20260415-083242-50ed61 --translation-provider openai-compatible
-```
-
-恢复任务也可以转到后台运行：
-
-```powershell
-podtran resume 20260415-083242-50ed61 --translation-provider openai-compatible --background
-```
-
-提示：如果翻译已经**完成**过，重新运行 `podtran <audio>` 也会通过共享缓存自动复用。但如果翻译**中途中断**，只有 `resume` 能恢复未完成的进度。
-如果任务通过 `--background` 在后台运行，可以用 `stop` 中止它：
-
-```powershell
-podtran stop 20260415-083242-50ed61
-```
-
-省略 task id 时，`stop` 默认选择最近一个 task。它会先确认 PID 确实属于该 task 的后台进程，再终止进程树并将任务标记为 `interrupted`；之后仍可用 `resume` 从兼容的断点继续。前台任务请直接使用 `Ctrl+C`。
-
-
-5. 查看最近任务状态
-
-```powershell
-podtran tasks
-podtran status
-```
-
-## 你会得到什么
-
-默认输出会放在工作目录下的 `artifacts/tasks/<task_id>/final/` 中：
-
-- 完整任务通常生成 `<原文件名>.interleave.mp3`
-- 预览任务通常生成 `<原文件名>.preview.interleave.mp3`
-
-`interleave` 是默认模式，表示保留英文原声并穿插中文配音。
-
-如果在 `[compose]` 里设置 `mode = "replace"`，则会生成 `<原文件名>.replace.mp3`，表示只保留中文配音。
-
-可在配置文件的 `[compose]` 中分别调整英文原声和中文译声的播放倍速：
-
-```toml
-[compose]
-english_speed = 1.0
-chinese_speed = 1.0
-```
-
-两项默认均为 `1.0`，允许范围为 `0.5–2.0`（含边界），保持音高；例如 `1.25` 表示加快到 1.25 倍速。
-按原声和译声区分，中文译声中夹杂的英文词语仍采用中文倍速。`replace` 模式只使用中文倍速。
-原声中的停顿、音乐和片尾一起变速，程序额外插入的切换停顿、段间静音及缺失配音替代静音保持原时长。
-修改倍速后可运行 `podtran compose TASK` 重新合成；已有转录、翻译和 TTS 音频可继续复用。
-
-## 常见问题
-
-### transcribe 在 Loading ASR model 阶段下载模型失败
-
-如果新环境首次运行时报错类似：
+完成后，终端会显示输出文件路径。默认保存在：
 
 ```text
-An error happened while trying to locate the files on the Hub and we cannot find the appropriate snapshot folder for the specified revision on the local disk.
+~/.podtran/artifacts/tasks/<task_id>/final/
 ```
 
-通常表示本地还没有 Hugging Face 模型缓存，同时当前网络无法直接访问 Hugging Face Hub。这个错误发生在 WhisperX 加载 ASR 模型阶段，通常不是 `hf_token` 配错导致的。
+| 任务 | 默认输出文件 |
+| --- | --- |
+| 完整音频 | `<原文件名>.interleave.mp3` |
+| 5 分钟预览 | `<原文件名>.preview.interleave.mp3` |
 
-在 PowerShell 中可以尝试把 Hugging Face Hub endpoint 切到镜像：
+`interleave` 表示英文原声与中文配音交替播放。需要纯中文或调整倍速，见[输出模式与倍速](docs/configuration.md#输出模式与倍速)。
+
+## 查看与恢复任务
 
 ```powershell
-$env:HF_ENDPOINT = "https://hf-mirror.com"
-podtran resume <task_id>
+podtran tasks         # 列出任务
+podtran status        # 查看最近任务
+podtran resume        # 继续最近任务
 ```
 
-如果希望长期生效：
+每次 `run` 都会创建新任务。**中断后请用 `resume`**，它会跳过仍有效的已完成阶段，并恢复兼容的翻译和配音进度。`status` 和 `resume` 也可接任务 ID 或唯一前缀。
 
-```powershell
-[Environment]::SetEnvironmentVariable("HF_ENDPOINT", "https://hf-mirror.com", "User")
-```
+长任务可加 `--background` 在后台运行，用 `podtran stop` 停止最近的后台任务；前台运行时使用 `Ctrl+C`。更多用法见[任务与维护](docs/usage.md)。
 
-重新打开 PowerShell 后确认变量已生效：
+## 选择翻译与配音服务
 
-```powershell
-echo $env:HF_ENDPOINT
-```
+在 `podtran init` 中选择，或按[配置指南](docs/configuration.md)修改配置文件。
 
-## License
+| 用途 | 服务 | 说明 |
+| --- | --- | --- |
+| 翻译 | `google-free`（默认）、`bing-free` | 无需 API key，非官方网页接口可能受网络及频率限制影响 |
+| 翻译 | `openai-compatible` | 兼容 Chat Completions 的服务，包括 DashScope |
+| 配音 | `qwen-local`（默认） | 本地 Qwen3-TTS，默认 0.6B 模型，支持音色克隆和预置音色 |
+| 配音 | `dashscope`、`mimo` | 云端服务，支持音色克隆和预置音色 |
+| 配音 | `openai-compatible` | 兼容语音接口，仅支持预置音色 |
+| 配音 | `vllm-omni` | 自托管服务，支持音色克隆和预置音色 |
 
-本项目采用 MIT License，详见 [LICENSE](LICENSE)。
+## 更多文档
+
+- [配置指南](docs/configuration.md)：服务商配置、GPU 与批量大小、输出模式与倍速。
+- [任务与维护](docs/usage.md)：后台运行、切换翻译服务、工作目录、单阶段执行、升级与开发。
+- [常见问题](docs/troubleshooting.md)：安装、模型下载、权限、内存及翻译失败排查。
+- [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/R0sin/podtran/issues)
+
+## 许可证
+
+[MIT](LICENSE)

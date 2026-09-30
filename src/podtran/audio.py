@@ -48,32 +48,42 @@ def extract_audio_chunk(
     output: Path,
     start: float | None,
     end: float | None,
+    *,
+    speed: float = 1.0,
 ) -> Path:
     args: list[str] = []
     if start is not None:
         args.extend(["-ss", seconds_arg(start)])
-    args.extend(["-i", str(source)])
     if end is not None:
         clip_start = start or 0.0
         duration = max(end - clip_start, 0.0)
         args.extend(["-t", seconds_arg(duration)])
+    # Limit source duration before filtering so slow playback is not truncated.
+    args.extend(["-i", str(source)])
+    if speed != 1.0:
+        args.extend(["-af", f"atempo={speed}"])
     args.extend(["-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le", str(output)])
     run_ffmpeg(ffmpeg_path, args)
     return output
 
 
-def normalize_audio(ffmpeg_path: str, source: Path, output: Path) -> Path:
-    args = [
-        "-i",
-        str(source),
-        "-ar",
-        "24000",
-        "-ac",
-        "1",
-        "-c:a",
-        "pcm_s16le",
-        str(output),
-    ]
+def normalize_audio(
+    ffmpeg_path: str, source: Path, output: Path, *, speed: float = 1.0
+) -> Path:
+    args = ["-i", str(source)]
+    if speed != 1.0:
+        args.extend(["-af", f"atempo={speed}"])
+    args.extend(
+        [
+            "-ar",
+            "24000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            str(output),
+        ]
+    )
     run_ffmpeg(ffmpeg_path, args)
     return output
 

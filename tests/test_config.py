@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from podtran.config import (
     AppConfig,
@@ -28,11 +31,48 @@ from podtran.config import (
     write_default_config,
 )
 from podtran.fingerprints import (
+    COMPOSE_CONFIG_KEYS,
+    TRANSCRIBE_CONFIG_KEYS,
+    TRANSLATE_CONFIG_KEYS,
     FingerprintService,
     SYNTHESIZE_CONFIG_KEYS,
     TTS_CONFIG_KEYS,
     VOICE_CLONE_CONFIG_KEYS,
 )
+
+
+@pytest.mark.parametrize("field", ["english_speed", "chinese_speed"])
+@pytest.mark.parametrize(
+    "value", [0, 0.49, 2.01, float("nan"), float("inf"), -float("inf")]
+)
+def test_compose_rejects_invalid_speed(field, value):
+    with pytest.raises(ValidationError):
+        AppConfig(compose={field: value})
+
+
+@pytest.mark.parametrize("field", ["english_speed", "chinese_speed"])
+@pytest.mark.parametrize("value", [0.5, 1.25, 2.0])
+def test_compose_speed_roundtrip_and_fingerprints(tmp_path, field, value):
+    original = AppConfig()
+    assert original.compose.english_speed == original.compose.chinese_speed == 1.0
+    changed = AppConfig(compose={field: value})
+    path = tmp_path / "config.toml"
+    path.write_text(render_config_toml(changed), encoding="utf-8")
+    assert load_config(path).compose == changed.compose
+    fingerprints = FingerprintService(tmp_path / "indexes")
+    assert fingerprints.hash_config_subset(
+        original, COMPOSE_CONFIG_KEYS
+    ) != fingerprints.hash_config_subset(changed, COMPOSE_CONFIG_KEYS)
+    for keys in [
+        TRANSCRIBE_CONFIG_KEYS,
+        TRANSLATE_CONFIG_KEYS,
+        SYNTHESIZE_CONFIG_KEYS,
+        TTS_CONFIG_KEYS,
+        VOICE_CLONE_CONFIG_KEYS,
+    ]:
+        assert fingerprints.hash_config_subset(
+            original, keys
+        ) == fingerprints.hash_config_subset(changed, keys)
 
 
 def test_load_config_accepts_provider_scoped_fields(tmp_path: Path) -> None:

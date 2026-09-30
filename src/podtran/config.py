@@ -186,6 +186,8 @@ class ComposeConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     mode: str = "interleave"
+    english_speed: float = Field(default=1.0, ge=0.5, le=2.0, allow_inf_nan=False)
+    chinese_speed: float = Field(default=1.0, ge=0.5, le=2.0, allow_inf_nan=False)
     block_pause_threshold: float = 0.8
     max_block_duration: float = 15.0
     gap_en_to_cn_ms: int = 200
@@ -435,6 +437,9 @@ def render_config_toml(config: AppConfig) -> str:
         "[compose]",
         "# interleave = English + Chinese, replace = Chinese only.",
         f'mode = "{config.compose.mode}"',
+        "# Playback speed (0.5–2.0), preserving pitch; applied only during compose.",
+        f"english_speed = {config.compose.english_speed}",
+        f"chinese_speed = {config.compose.chinese_speed}",
         f"block_pause_threshold = {config.compose.block_pause_threshold}",
         f"max_block_duration = {config.compose.max_block_duration}",
         f"gap_en_to_cn_ms = {config.compose.gap_en_to_cn_ms}",

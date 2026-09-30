@@ -78,6 +78,8 @@ SYNTHESIZE_CONFIG_KEYS = list(
 )
 COMPOSE_CONFIG_KEYS = [
     "compose.mode",
+    "compose.english_speed",
+    "compose.chinese_speed",
     "compose.gap_en_to_cn_ms",
     "compose.gap_cn_to_en_ms",
     "compose.output_bitrate",

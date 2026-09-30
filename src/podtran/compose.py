@@ -98,6 +98,7 @@ def build_interleave_chunks(
                 english_chunk,
                 cursor,
                 segment.end,
+                speed=config.compose.english_speed,
             )
             chunks.append(english_chunk)
             cursor = segment.end
@@ -113,7 +114,12 @@ def build_interleave_chunks(
             chunks.append(pre_gap)
             _emit_step(step_callback, "Building chunks")
             cn_chunk = temp_dir / f"{index:05d}_cn.wav"
-            normalize_audio(FFMPEG_COMMAND, Path(segment.tts_audio_path), cn_chunk)
+            normalize_audio(
+                FFMPEG_COMMAND,
+                Path(segment.tts_audio_path),
+                cn_chunk,
+                speed=config.compose.chinese_speed,
+            )
             chunks.append(cn_chunk)
             _emit_step(step_callback, "Building chunks")
             post_gap = temp_dir / f"{index:05d}_gap_after.wav"
@@ -123,7 +129,14 @@ def build_interleave_chunks(
 
     if cursor < resolved_audio_duration:
         tail = temp_dir / "tail_en.wav"
-        extract_audio_chunk(FFMPEG_COMMAND, source_audio, tail, cursor, None)
+        extract_audio_chunk(
+            FFMPEG_COMMAND,
+            source_audio,
+            tail,
+            cursor,
+            None,
+            speed=config.compose.english_speed,
+        )
         chunks.append(tail)
         _emit_step(step_callback, "Building chunks")
 
@@ -153,7 +166,12 @@ def build_replace_chunks(
             and Path(segment.tts_audio_path).exists()
         ):
             cn_chunk = temp_dir / f"{index:05d}_replace_cn.wav"
-            normalize_audio(FFMPEG_COMMAND, Path(segment.tts_audio_path), cn_chunk)
+            normalize_audio(
+                FFMPEG_COMMAND,
+                Path(segment.tts_audio_path),
+                cn_chunk,
+                speed=config.compose.chinese_speed,
+            )
             chunks.append(cn_chunk)
             _emit_step(step_callback, "Building chunks")
         else:

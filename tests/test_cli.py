@@ -2847,3 +2847,158 @@ def test_execute_pipeline_prints_resume_hint_on_stage_failure(
     assert "Task failed at translate." in rendered
     assert f"podtran resume {task_manifest.task_id}" in rendered
     assert "Task complete" not in rendered
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_url_shortcut_creates_task_before_download(tmp_path, monkeypatch, background):
+    config_path, _ = _create_config(tmp_path)
+    url = "https://example.com/watch?v=abc&list=xyz"
+    captured = []
+
+    def capture(task, *args, **kwargs):
+        captured.append(task)
+
+    monkeypatch.setattr(cli, "_start_background_resume", capture)
+    monkeypatch.setattr(cli, "_execute_pipeline", capture)
+    monkeypatch.setattr(
+        cli.sys,
+        "argv",
+        [
+            "podtran",
+            url,
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+            *(["--background"] if background else []),
+        ],
+    )
+    cli.main()
+    task = captured[0]
+    assert task.source_url == url
+    assert task.source_audio_path == ""
+    assert task.source_audio_sha256 == ""
+    assert task.current_stage == "download"
+
+
+@pytest.mark.parametrize("error", [RuntimeError("offline"), KeyboardInterrupt()])
+def test_download_failure_and_resume(tmp_path, monkeypatch, error):
+    cfg = AppConfig()
+    fingerprints = FingerprintService(tmp_path / "indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task = store.create_url_task("https://example.com/audio", cfg, "podtran URL")
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    monkeypatch.setattr(cli, "ensure_command", lambda command: None)
+
+    def fail(*args):
+        raise error
+
+    monkeypatch.setattr(cli, "download_audio", fail)
+    with pytest.raises(type(error)):
+        cli._ensure_download(task, cfg, paths, executor, fingerprints)
+    assert store.load_task(task.task_id).status == (
+        "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+    )
+    audio = paths.task_dir / "source" / "episode.opus"
+    audio.parent.mkdir()
+    audio.write_bytes(b"downloaded")
+    monkeypatch.setattr(cli, "download_audio", lambda *args: audio)
+    task = store.load_task(task.task_id)
+    executor = StageExecutor(store, task, paths)
+    cli._ensure_download(task, cfg, paths, executor, fingerprints)
+    assert task.processing_audio_sha256 == fingerprints.hash_audio(audio)
+    assert executor.load_manifest("download").status == "completed"
+    monkeypatch.setattr(cli, "download_audio", fail)
+    cli._ensure_download(task, cfg, paths, executor, fingerprints)
+
+
+def test_url_preview_failure_reuses_download_and_stop_records_stage(
+    tmp_path, monkeypatch
+):
+    cfg = AppConfig()
+    fingerprints = FingerprintService(tmp_path / "indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task = store.create_url_task(
+        "https://example.com/audio", cfg, "podtran URL", preview=True
+    )
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    monkeypatch.setattr(cli, "ensure_command", lambda command: None)
+    audio = paths.task_dir / "episode.opus"
+    audio.write_bytes(b"full episode")
+    monkeypatch.setattr(cli, "download_audio", lambda *args: audio)
+
+    def fail_preview(*args):
+        raise RuntimeError("preview failed")
+
+    monkeypatch.setattr(cli, "_create_preview_audio", fail_preview)
+    with pytest.raises(RuntimeError):
+        cli._ensure_download(task, cfg, paths, executor, fingerprints)
+    task = store.load_task(task.task_id)
+    executor = StageExecutor(store, task, paths)
+    monkeypatch.setattr(
+        cli, "download_audio", lambda *args: pytest.fail("download repeated")
+    )
+
+    def preview(*args):
+        paths.preview_audio_path.write_bytes(b"preview")
+        return paths.preview_audio_path
+
+    monkeypatch.setattr(cli, "_create_preview_audio", preview)
+    cli._ensure_download(task, cfg, paths, executor, fingerprints)
+    assert task.processing_audio_path == str(paths.preview_audio_path)
+    assert task.processing_audio_sha256 != task.source_audio_sha256
+    stage = executor.start(StageManifest(stage="download"))
+    assert cli._record_stopped_task(store, task.task_id, stage.pid)
+    assert executor.load_manifest("download").status == "interrupted"
+    assert audio.exists()
+
+
+def test_url_pipeline_downloads_before_transcribe_and_status_shows_download(
+    tmp_path, monkeypatch, capsys
+):
+    cfg = AppConfig()
+    fingerprints = FingerprintService(tmp_path / "indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task = store.create_url_task("https://example.com/audio", cfg, "podtran URL")
+    paths = store.paths_for(task)
+    audio = paths.task_dir / "episode.opus"
+    audio.write_bytes(b"audio")
+    monkeypatch.setattr(cli, "ensure_command", lambda command: None)
+    monkeypatch.setattr(cli, "download_audio", lambda *args: audio)
+    seen = []
+
+    def stage(task, *args, **kwargs):
+        assert task.processing_audio_path == str(audio)
+        assert task.processing_audio_sha256 == fingerprints.hash_audio(audio)
+        seen.append(task.task_id)
+
+    for name in [
+        "_ensure_transcribe",
+        "_ensure_translate",
+        "_ensure_synthesize",
+        "_ensure_compose",
+    ]:
+        monkeypatch.setattr(cli, name, stage)
+    cli._execute_pipeline(task, cfg, store, CacheStore(paths.cache_dir), fingerprints)
+    assert len(seen) == 4
+    cli._print_task_stage_status(task, cfg, paths, StageExecutor(store, task, paths))
+    assert "download" in capsys.readouterr().out
+
+
+def test_transcribe_rejects_url_with_incomplete_download(tmp_path):
+    cfg = AppConfig()
+    fingerprints = FingerprintService(tmp_path / "indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task = store.create_url_task("https://example.com/audio", cfg, "podtran URL")
+    paths = store.paths_for(task)
+    with pytest.raises(ClickExit):
+        cli._ensure_transcribe(
+            task,
+            cfg,
+            paths,
+            StageExecutor(store, task, paths),
+            CacheStore(paths.cache_dir),
+            fingerprints,
+        )

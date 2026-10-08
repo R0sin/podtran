@@ -58,6 +58,17 @@ podtran run "podcast.mp3"
 
 也可简写为 `podtran "podcast.mp3"`。默认按 2–5 位说话人识别；已知人数时可[指定说话人数量](docs/usage.md#说话人数量)。
 
+也可以直接粘贴 YouTube 等网站的单集链接，自动下载并翻译：
+
+```powershell
+podtran "https://www.youtube.com/watch?v=VIDEO_ID" --background
+podtran run "https://example.com/episode.mp3" --preview
+```
+
+下载工具会随 podtran 自动安装。支持的网站取决于 yt-dlp，请使用公开可访问的单集链接；暂不支持播放列表、频道页和直播。
+
+链接预览会先下载完整音频，再处理前五分钟。下载中断后用 `podtran resume` 继续，无需重新提交链接。
+
 ### 3. 找到输出
 
 完成后，终端会显示输出文件路径。默认保存在：

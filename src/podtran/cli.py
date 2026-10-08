@@ -62,6 +62,7 @@ from podtran.fingerprints import (
     TRANSLATE_CONFIG_KEYS,
     FingerprintService,
 )
+from podtran.download import download_audio, is_http_url
 from podtran.merge import merge_transcript_segments
 from podtran.models import (
     TaskManifest,
@@ -83,6 +84,8 @@ PREVIEW_DURATION_SECONDS = 300.0
 PREVIEW_START_SECONDS = 0.0
 
 ROOT_HELP = """Translate English podcast audio into Chinese with a staged CLI.
+
+AUDIO accepts a local file or a single-episode HTTP(S) URL.
 
 Recommended entrypoint:
   podtran run AUDIO [--preview]
@@ -107,6 +110,8 @@ RUN_HELP = """Create a new task for AUDIO and run the full pipeline.
 
 This command executes transcribe, translate, synthesize, and compose for a new task.
 Use --preview to process only the first five minutes before running the full audio.
+URLs are downloaded in full before processing, including previews. --background
+also runs the download in the background; use status, stop, and resume to manage it.
 """
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help=ROOT_HELP)
@@ -294,8 +299,10 @@ class PipelineProgressReporter:
     help=RUN_HELP,
 )
 def run(
-    audio: Path = typer.Argument(
-        ..., metavar="AUDIO", help="Input podcast audio for a new task."
+    audio: str = typer.Argument(
+        ...,
+        metavar="AUDIO",
+        help="Local podcast audio or a single-episode HTTP(S) URL.",
     ),
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
     workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
@@ -1046,7 +1053,7 @@ def _load_runtime(
 
 
 def _run_task(
-    audio: Path,
+    audio: Path | str,
     config_path: Optional[Path],
     workdir_override: Optional[Path],
     preview: bool = False,
@@ -1054,7 +1061,9 @@ def _run_task(
     min_speakers: int = DEFAULT_MIN_SPEAKERS,
     max_speakers: int = DEFAULT_MAX_SPEAKERS,
 ) -> None:
-    ensure_audio_file(audio)
+    if not is_http_url(str(audio)):
+        audio = Path(audio)
+        ensure_audio_file(audio)
     cfg, _, task_store, cache_store, fingerprints = _load_runtime(
         config_path, workdir_override
     )
@@ -1091,7 +1100,7 @@ def _run_task(
 
 
 def _create_run_task(
-    audio: Path,
+    audio: Path | str,
     cfg: AppConfig,
     task_store: TaskStore,
     fingerprints: FingerprintService,
@@ -1108,6 +1117,11 @@ def _create_run_task(
         min_speakers,
         max_speakers,
     )
+    if is_http_url(str(audio)):
+        return task_store.create_url_task(
+            str(audio), cfg, entry_command, preview=preview
+        )
+    audio = Path(audio)
     if preview:
         ensure_command(FFMPEG_COMMAND)
         task_id, source_audio_sha256 = task_store.reserve_task_id(audio)
@@ -1426,7 +1440,7 @@ def _create_preview_audio(audio: Path, cfg: AppConfig, paths: ArtifactPaths) -> 
 
 
 def _entry_command(
-    audio: Path,
+    audio: Path | str,
     preview: bool,
     background: bool,
     min_speakers: int,
@@ -1464,6 +1478,51 @@ def _load_task_context(
     return cfg, task_manifest, paths, executor, cache_store, fingerprints
 
 
+def _ensure_download(
+    task: TaskManifest,
+    cfg: AppConfig,
+    paths: ArtifactPaths,
+    executor: StageExecutor,
+    fingerprints: FingerprintService,
+) -> None:
+    manifest = executor.load_manifest("download") or StageManifest(stage="download")
+    if (
+        manifest.status == "completed"
+        and task.processing_audio_path
+        and Path(task.processing_audio_path).is_file()
+        and Path(task.source_audio_path).is_file()
+    ):
+        return
+    executor.start(manifest)
+    try:
+        ensure_command(FFMPEG_COMMAND)
+        ensure_command(FFPROBE_COMMAND)
+        console.print("Downloading source audio...")
+        audio = Path(task.source_audio_path) if task.source_audio_path else None
+        if audio is None or not audio.is_file():
+            audio = download_audio(task.source_url, paths.task_dir / "source")
+        task.source_audio_path = str(audio.resolve())
+        task.source_audio_name = audio.name
+        task.source_audio_sha256 = fingerprints.hash_audio(audio)
+        # Save the full download before preview extraction so a failed preview can resume.
+        executor.task_store.save_task(task)
+        processing = _create_preview_audio(audio, cfg, paths) if task.preview else audio
+        task.processing_audio_path = str(processing.resolve())
+        task.processing_audio_sha256 = fingerprints.hash_audio(processing)
+        manifest.output_refs = {
+            "audio": paths.relative_to_task(audio),
+            "processing_audio": paths.relative_to_task(processing),
+        }
+        executor.complete(manifest)
+    except KeyboardInterrupt:
+        executor.interrupt(manifest)
+        raise
+    except Exception as exc:
+        executor.fail(manifest, exc)
+        console.print(f"[red]Download failed:[/red] {exc}")
+        raise
+
+
 def _execute_pipeline(
     task_manifest: TaskManifest,
     cfg: AppConfig,
@@ -1480,6 +1539,8 @@ def _execute_pipeline(
 
     with PipelineProgressReporter(console, show_overall=True) as reporter:
         try:
+            if task_manifest.source_url:
+                _ensure_download(task_manifest, cfg, paths, executor, fingerprints)
             decisions.append(
                 _ensure_transcribe(
                     task_manifest,
@@ -1558,6 +1619,16 @@ def _print_task_stage_status(
         ("compose", _compose_output_refs(task_manifest, cfg)),
     ]
 
+    if task_manifest.source_url:
+        download_manifest = executor.load_manifest("download")
+        stage_specs.insert(
+            0,
+            (
+                "download",
+                download_manifest.output_refs if download_manifest else {},
+            ),
+        )
+
     table = Table(title="podtran status")
     table.add_column("Stage")
     table.add_column("Status")
@@ -1567,7 +1638,9 @@ def _print_task_stage_status(
         manifest = executor.load_manifest(stage)
         stage_status = manifest.status if manifest else "pending"
         outputs_present = (
-            "yes" if output_refs_exist(paths.task_dir, output_refs) else "no"
+            "yes"
+            if output_refs and output_refs_exist(paths.task_dir, output_refs)
+            else "no"
         )
         error = _truncate(manifest.error) if manifest and manifest.error else "-"
         table.add_row(stage, stage_status, outputs_present, error)
@@ -1696,6 +1769,16 @@ def _ensure_transcribe(
 ) -> StageDecision:
     from podtran.asr import transcription_stage_count
 
+    download_manifest = (
+        executor.load_manifest("download") if task_manifest.source_url else None
+    )
+    if not task_manifest.processing_audio_path or (
+        task_manifest.source_url
+        and (download_manifest is None or download_manifest.status != "completed")
+    ):
+        _abort(
+            "Source audio is not ready. Use 'podtran resume' to finish downloading first."
+        )
     audio = Path(task_manifest.processing_audio_path)
     input_fingerprints = {"audio": task_manifest.processing_audio_sha256}
     config_fingerprint = _transcribe_config_fingerprint(

@@ -33,6 +33,34 @@ class TaskStore:
             processing_audio_sha256=source_audio_sha256,
         )
 
+    def create_url_task(
+        self,
+        url: str,
+        config_snapshot: AppConfig,
+        entry_command: str,
+        *,
+        preview: bool = False,
+    ) -> TaskManifest:
+        task_id = self._build_unique_task_id(self.fingerprints.hash_value(url))
+        timestamp = _utc_now()
+        manifest = TaskManifest(
+            task_id=task_id,
+            created_at=timestamp,
+            updated_at=timestamp,
+            source_url=url,
+            source_audio_path="",
+            source_audio_name="download",
+            source_audio_sha256="",
+            preview=preview,
+            preview_duration_seconds=300.0 if preview else 0.0,
+            entry_command=entry_command,
+            config_hash=self.fingerprints.hash_value(model_dump(config_snapshot)),
+            config_snapshot=model_dump(config_snapshot),
+            current_stage="download",
+        )
+        self.save_task(manifest)
+        return manifest
+
     def reserve_task_id(self, audio: Path) -> tuple[str, str]:
         resolved_audio = audio.resolve()
         source_audio_sha256 = self.fingerprints.hash_audio(resolved_audio)

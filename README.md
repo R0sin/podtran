@@ -111,7 +111,7 @@ podtran resume        # 继续最近任务
 
 ## 更多文档
 
-- [配置指南](docs/configuration.md)：服务商配置、GPU 与批量大小、输出模式与倍速。
+- [配置指南](docs/configuration.md)：网络代理、服务商配置、GPU 与批量大小、输出模式与倍速。
 - [任务与维护](docs/usage.md)：后台运行、切换翻译服务、工作目录、单阶段执行、升级与开发。
 - [常见问题](docs/troubleshooting.md)：安装、模型下载、权限、内存及翻译失败排查。
 - [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/R0sin/podtran/issues)

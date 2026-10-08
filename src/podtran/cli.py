@@ -79,6 +79,7 @@ from podtran.stage_versions import (
     TRANSLATE_STAGE_VERSION,
 )
 from podtran.tasks import TaskStore
+from podtran.network import proxy_environment, validate_proxy
 
 PREVIEW_DURATION_SECONDS = 300.0
 PREVIEW_START_SECONDS = 0.0
@@ -326,12 +327,20 @@ def run(
         min=1,
         help="Maximum speaker count hint for diarization.",
     ),
+    proxy: Optional[str] = typer.Option(
+        None, "--proxy", help="HTTP proxy URL; saved for future resumes."
+    ),
+    no_proxy: bool = typer.Option(
+        False, "--no-proxy", help="Force direct connections; saved for future resumes."
+    ),
 ) -> None:
+    override = _proxy_override(proxy, no_proxy)
     _validate_speaker_bounds(min_speakers, max_speakers)
     _run_task(
         audio,
         config,
         workdir,
+        proxy_override=override,
         preview=preview,
         background=background,
         min_speakers=min_speakers,
@@ -657,7 +666,14 @@ def resume(
         "--background",
         help="Resume the pipeline in a detached background process.",
     ),
+    proxy: Optional[str] = typer.Option(
+        None, "--proxy", help="HTTP proxy URL; saved for future resumes."
+    ),
+    no_proxy: bool = typer.Option(
+        False, "--no-proxy", help="Force direct connections; saved for future resumes."
+    ),
 ) -> None:
+    override = _proxy_override(proxy, no_proxy)
     _validate_speaker_bounds(min_speakers, max_speakers)
     cfg, _, task_store, cache_store, fingerprints = _load_runtime(config, workdir)
     cfg = _with_translation_provider(cfg, translation_provider)
@@ -668,36 +684,39 @@ def resume(
     except FileNotFoundError:
         _abort("No tasks found. Use 'podtran run AUDIO' to create a new task.")
         return  # unreachable, _abort raises
-    if background:
-        if task_manifest.status == "completed":
-            console.print(
-                f"[yellow]Task is already complete:[/yellow] {task_manifest.task_id}"
+    if background and task_manifest.status != "completed":
+        _ensure_background_resume_available(task_manifest, task_store, config, workdir)
+    effective_proxy = _save_proxy_override(cfg, task_manifest, task_store, override)
+    with proxy_environment(effective_proxy, cfg.no_proxy):
+        if background:
+            if task_manifest.status == "completed":
+                console.print(
+                    f"[yellow]Task is already complete:[/yellow] {task_manifest.task_id}"
+                )
+                return
+            _start_background_resume(
+                task_manifest,
+                task_store,
+                config,
+                workdir,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                translation_provider=cfg.translation.provider
+                if translation_provider is not None
+                else None,
             )
             return
-        _ensure_background_resume_available(task_manifest, task_store, config, workdir)
-        _start_background_resume(
+
+        console.print(f"[green]Resuming task:[/green] {task_manifest.task_id}")
+        _execute_pipeline(
             task_manifest,
+            cfg,
             task_store,
-            config,
-            workdir,
+            cache_store,
+            fingerprints,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
-            translation_provider=cfg.translation.provider
-            if translation_provider is not None
-            else None,
         )
-        return
-
-    console.print(f"[green]Resuming task:[/green] {task_manifest.task_id}")
-    _execute_pipeline(
-        task_manifest,
-        cfg,
-        task_store,
-        cache_store,
-        fingerprints,
-        min_speakers=min_speakers,
-        max_speakers=max_speakers,
-    )
 
 
 STOP_HELP = """Stop a running background task.
@@ -898,23 +917,34 @@ def transcribe(
         min=1,
         help="Maximum speaker count hint for diarization.",
     ),
+    proxy: Optional[str] = typer.Option(
+        None, "--proxy", help="HTTP proxy URL; saved for future resumes."
+    ),
+    no_proxy: bool = typer.Option(
+        False, "--no-proxy", help="Force direct connections; saved for future resumes."
+    ),
 ) -> None:
+    override = _proxy_override(proxy, no_proxy)
     _validate_speaker_bounds(min_speakers, max_speakers)
     cfg, task_manifest, paths, executor, cache_store, fingerprints = _load_task_context(
         task, config, workdir
     )
-    with PipelineProgressReporter(console, show_overall=False) as reporter:
-        _ensure_transcribe(
-            task_manifest,
-            cfg,
-            paths,
-            executor,
-            cache_store,
-            fingerprints,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
-            reporter=reporter,
-        )
+    effective_proxy = _save_proxy_override(
+        cfg, task_manifest, executor.task_store, override
+    )
+    with proxy_environment(effective_proxy, cfg.no_proxy):
+        with PipelineProgressReporter(console, show_overall=False) as reporter:
+            _ensure_transcribe(
+                task_manifest,
+                cfg,
+                paths,
+                executor,
+                cache_store,
+                fingerprints,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                reporter=reporter,
+            )
 
 
 @app.command(
@@ -925,21 +955,32 @@ def translate(
     task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
     workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+    proxy: Optional[str] = typer.Option(
+        None, "--proxy", help="HTTP proxy URL; saved for future resumes."
+    ),
+    no_proxy: bool = typer.Option(
+        False, "--no-proxy", help="Force direct connections; saved for future resumes."
+    ),
 ) -> None:
+    override = _proxy_override(proxy, no_proxy)
     cfg, task_manifest, paths, executor, cache_store, fingerprints = _load_task_context(
         task, config, workdir
     )
-    _require_artifact(paths.transcript_json, "translate", "transcript.json")
-    with PipelineProgressReporter(console, show_overall=False) as reporter:
-        _ensure_translate(
-            task_manifest,
-            cfg,
-            paths,
-            executor,
-            cache_store,
-            fingerprints,
-            reporter=reporter,
-        )
+    effective_proxy = _save_proxy_override(
+        cfg, task_manifest, executor.task_store, override
+    )
+    with proxy_environment(effective_proxy, cfg.no_proxy):
+        _require_artifact(paths.transcript_json, "translate", "transcript.json")
+        with PipelineProgressReporter(console, show_overall=False) as reporter:
+            _ensure_translate(
+                task_manifest,
+                cfg,
+                paths,
+                executor,
+                cache_store,
+                fingerprints,
+                reporter=reporter,
+            )
 
 
 @app.command(
@@ -950,21 +991,32 @@ def synthesize(
     task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
     workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+    proxy: Optional[str] = typer.Option(
+        None, "--proxy", help="HTTP proxy URL; saved for future resumes."
+    ),
+    no_proxy: bool = typer.Option(
+        False, "--no-proxy", help="Force direct connections; saved for future resumes."
+    ),
 ) -> None:
+    override = _proxy_override(proxy, no_proxy)
     cfg, task_manifest, paths, executor, cache_store, fingerprints = _load_task_context(
         task, config, workdir
     )
-    _require_artifact(paths.translated_json, "synthesize", "translated.json")
-    with PipelineProgressReporter(console, show_overall=False) as reporter:
-        _ensure_synthesize(
-            task_manifest,
-            cfg,
-            paths,
-            executor,
-            cache_store,
-            fingerprints,
-            reporter=reporter,
-        )
+    effective_proxy = _save_proxy_override(
+        cfg, task_manifest, executor.task_store, override
+    )
+    with proxy_environment(effective_proxy, cfg.no_proxy):
+        _require_artifact(paths.translated_json, "synthesize", "translated.json")
+        with PipelineProgressReporter(console, show_overall=False) as reporter:
+            _ensure_synthesize(
+                task_manifest,
+                cfg,
+                paths,
+                executor,
+                cache_store,
+                fingerprints,
+                reporter=reporter,
+            )
 
 
 @app.command(
@@ -975,16 +1027,27 @@ def compose(
     task: str = typer.Argument(..., metavar="TASK", help="Task id or unique prefix."),
     config: Optional[Path] = typer.Option(None, "--config", help="Config file path."),
     workdir: Optional[Path] = typer.Option(None, "--workdir", help="Override workdir."),
+    proxy: Optional[str] = typer.Option(
+        None, "--proxy", help="HTTP proxy URL; saved for future resumes."
+    ),
+    no_proxy: bool = typer.Option(
+        False, "--no-proxy", help="Force direct connections; saved for future resumes."
+    ),
 ) -> None:
+    override = _proxy_override(proxy, no_proxy)
     cfg, task_manifest, paths, executor, _, fingerprints = _load_task_context(
         task, config, workdir
     )
-    _require_artifact(paths.translated_json, "compose", "translated.json")
-    _require_completed_tts(paths.translated_json)
-    with PipelineProgressReporter(console, show_overall=False) as reporter:
-        _ensure_compose(
-            task_manifest, cfg, paths, executor, fingerprints, reporter=reporter
-        )
+    effective_proxy = _save_proxy_override(
+        cfg, task_manifest, executor.task_store, override
+    )
+    with proxy_environment(effective_proxy, cfg.no_proxy):
+        _require_artifact(paths.translated_json, "compose", "translated.json")
+        _require_completed_tts(paths.translated_json)
+        with PipelineProgressReporter(console, show_overall=False) as reporter:
+            _ensure_compose(
+                task_manifest, cfg, paths, executor, fingerprints, reporter=reporter
+            )
 
 
 @cache_app.command(
@@ -1017,8 +1080,14 @@ def main() -> None:
 
 
 def _should_dispatch_root_task(argv: list[str]) -> bool:
-    option_with_value = {"--config", "--workdir", "--min_speakers", "--max_speakers"}
-    boolean_options = {"--preview", "--background"}
+    option_with_value = {
+        "--config",
+        "--workdir",
+        "--min_speakers",
+        "--max_speakers",
+        "--proxy",
+    }
+    boolean_options = {"--preview", "--background", "--no-proxy"}
     index = 0
     while index < len(argv):
         token = argv[index]
@@ -1034,6 +1103,30 @@ def _should_dispatch_root_task(argv: list[str]) -> bool:
             return False
         return token not in KNOWN_COMMANDS
     return False
+
+
+def _proxy_override(proxy: str | None, no_proxy: bool) -> str | None:
+    if proxy is not None and no_proxy:
+        raise typer.BadParameter("--proxy and --no-proxy are mutually exclusive.")
+    if no_proxy:
+        return ""
+    if proxy is not None:
+        try:
+            if not proxy.strip():
+                raise ValueError("Use --no-proxy for direct connections.")
+            return validate_proxy(proxy)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from None
+    return None
+
+
+def _save_proxy_override(
+    cfg: AppConfig, task: TaskManifest, store: TaskStore, override: str | None
+) -> str | None:
+    if override is not None:
+        task.proxy_override = override
+        store.save_task(task)
+    return task.proxy_override if task.proxy_override is not None else cfg.proxy or None
 
 
 def _load_runtime(
@@ -1060,6 +1153,7 @@ def _run_task(
     background: bool = False,
     min_speakers: int = DEFAULT_MIN_SPEAKERS,
     max_speakers: int = DEFAULT_MAX_SPEAKERS,
+    proxy_override: str | None = None,
 ) -> None:
     if not is_http_url(str(audio)):
         audio = Path(audio)
@@ -1077,26 +1171,30 @@ def _run_task(
         min_speakers=min_speakers,
         max_speakers=max_speakers,
     )
-    console.print(f"[green]Created task:[/green] {task_manifest.task_id}")
-    if background:
-        _start_background_resume(
+    effective_proxy = _save_proxy_override(
+        cfg, task_manifest, task_store, proxy_override
+    )
+    with proxy_environment(effective_proxy, cfg.no_proxy):
+        console.print(f"[green]Created task:[/green] {task_manifest.task_id}")
+        if background:
+            _start_background_resume(
+                task_manifest,
+                task_store,
+                config_path,
+                workdir_override,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+            )
+            return
+        _execute_pipeline(
             task_manifest,
+            cfg,
             task_store,
-            config_path,
-            workdir_override,
+            cache_store,
+            fingerprints,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
         )
-        return
-    _execute_pipeline(
-        task_manifest,
-        cfg,
-        task_store,
-        cache_store,
-        fingerprints,
-        min_speakers=min_speakers,
-        max_speakers=max_speakers,
-    )
 
 
 def _create_run_task(

@@ -182,6 +182,8 @@ class TaskManifest(BaseModel):
     entry_command: str
     config_hash: str
     config_snapshot: dict[str, object] = Field(default_factory=dict)
+    # None inherits config/environment; empty means explicit direct connection.
+    proxy_override: str | None = None
     current_stage: str = ""
     status: TaskStatus = "pending"
 

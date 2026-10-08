@@ -3002,3 +3002,172 @@ def test_transcribe_rejects_url_with_incomplete_download(tmp_path):
             CacheStore(paths.cache_dir),
             fingerprints,
         )
+
+
+@pytest.mark.parametrize(
+    "command", ["run", "resume", "transcribe", "translate", "synthesize", "compose"]
+)
+def test_proxy_flags_are_mutually_exclusive(command):
+    args = [command] + (["audio.mp3"] if command == "run" else ["task"])
+    result = runner.invoke(
+        cli.app, args + ["--proxy", "http://proxy:7890", "--no-proxy"]
+    )
+    assert result.exit_code != 0
+    assert "mutually exclusive" in _normalize_help_output(result.output)
+
+
+def test_proxy_persistence_precedence_and_current_bypass(tmp_path, monkeypatch):
+    from podtran.config import render_config_toml
+
+    config_path, cfg = _create_config(tmp_path)
+    cfg.proxy = "http://configured:7890"
+    config_path.write_text(render_config_toml(cfg), encoding="utf-8")
+    monkeypatch.setenv("HTTPS_PROXY", "http://environment:7890")
+    observed = []
+    monkeypatch.setattr(
+        cli,
+        "_execute_pipeline",
+        lambda *a, **kw: observed.append(
+            (os.environ["https_proxy"], os.environ["no_proxy"])
+        ),
+    )
+    common = ["--config", str(config_path), "--workdir", str(tmp_path)]
+    result = runner.invoke(
+        cli.app,
+        [
+            "run",
+            "https://example.com/episode",
+            *common,
+            "--proxy",
+            "http://temporary:7890",
+        ],
+    )
+    assert result.exit_code == 0, result.exception
+    store = cli._load_runtime(config_path, tmp_path)[2]
+    assert store.load_latest_task().proxy_override == "http://temporary:7890"
+    cfg.no_proxy = ["new.internal"]
+    config_path.write_text(render_config_toml(cfg), encoding="utf-8")
+    for flags, expected in [
+        ([], "http://temporary:7890"),
+        (["--proxy", "http://replacement:7890"], "http://replacement:7890"),
+        ([], "http://replacement:7890"),
+        (["--no-proxy"], ""),
+        ([], ""),
+    ]:
+        result = runner.invoke(cli.app, ["resume", *common, *flags])
+        assert result.exit_code == 0, result.exception
+        assert observed[-1][0] == expected
+        assert (
+            observed[-1][1] == "*"
+            if not expected
+            else "new.internal" in observed[-1][1]
+        )
+        assert store.load_latest_task().proxy_override == expected
+    assert os.environ["HTTPS_PROXY"] == "http://environment:7890"
+
+
+def test_background_proxy_inherits_and_is_saved(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    config_path, _ = _create_config(tmp_path)
+    captured = {}
+
+    def popen(command, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(pid=12345)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    result = runner.invoke(
+        cli.app,
+        [
+            "run",
+            "https://example.com/audio",
+            "--background",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+            "--proxy",
+            "http://proxy:7890",
+        ],
+    )
+    assert result.exit_code == 0, result.exception
+    assert captured["env"]["HTTPS_PROXY"] == "http://proxy:7890"
+    assert (
+        cli._load_runtime(config_path, tmp_path)[2].load_latest_task().proxy_override
+        == "http://proxy:7890"
+    )
+
+
+def test_root_proxy_shortcut():
+    assert cli._should_dispatch_root_task(
+        ["--proxy", "http://proxy:7890", "episode.mp3"]
+    )
+    assert cli._should_dispatch_root_task(["--no-proxy", "episode.mp3"])
+
+
+@pytest.mark.parametrize("configured", ["", "http://config:7890"])
+def test_proxy_config_and_environment_fallback(tmp_path, monkeypatch, configured):
+    from podtran.config import render_config_toml
+
+    config_path, cfg = _create_config(tmp_path)
+    cfg.proxy = configured
+    config_path.write_text(render_config_toml(cfg), encoding="utf-8")
+    monkeypatch.delenv("https_proxy", raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://environment:7890")
+    observed = []
+    monkeypatch.setattr(
+        cli,
+        "_execute_pipeline",
+        lambda *a, **kw: observed.append(os.environ["HTTPS_PROXY"]),
+    )
+    result = runner.invoke(
+        cli.app,
+        [
+            "run",
+            "https://example.com/audio",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.exception
+    assert observed == [configured or "http://environment:7890"]
+    assert (
+        cli._load_runtime(config_path, tmp_path)[2].load_latest_task().proxy_override
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "command", ["transcribe", "translate", "synthesize", "compose"]
+)
+def test_single_stage_proxy_override(tmp_path, monkeypatch, command):
+    config_path, cfg = _create_config(tmp_path)
+    store = cli._load_runtime(config_path, tmp_path)[2]
+    task = store.create_url_task("https://example.com/audio", cfg, "podtran run")
+    observed = []
+    monkeypatch.setattr(cli, "_require_artifact", lambda *args: None)
+    monkeypatch.setattr(cli, "_require_completed_tts", lambda *args: None)
+    monkeypatch.setattr(
+        cli,
+        "_ensure_" + command,
+        lambda *a, **kw: observed.append(os.environ["HTTPS_PROXY"]),
+    )
+    result = runner.invoke(
+        cli.app,
+        [
+            command,
+            task.task_id,
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+            "--proxy",
+            "http://stage:7890",
+        ],
+    )
+    assert result.exit_code == 0, result.exception
+    assert observed == ["http://stage:7890"]
+    assert store.load_task(task.task_id).proxy_override == "http://stage:7890"

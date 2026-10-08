@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from podtran.models import VoiceMode
+from podtran.network import validate_proxy
 
 try:
     import tomllib
@@ -198,6 +200,13 @@ class ComposeConfig(BaseModel):
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    proxy: str = ""
+    no_proxy: list[str] = Field(
+        default_factory=lambda: ["localhost", "127.0.0.1", "::1"]
+    )
+
+    _validate_proxy = field_validator("proxy")(validate_proxy)
+
     hf_token: str = ""
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     translation: TranslationConfig = Field(default_factory=TranslationConfig)
@@ -356,6 +365,9 @@ def render_config_toml(config: AppConfig) -> str:
         "# This config lives under ~/.podtran/config.toml by default.",
         "# Use --workdir to move config, tasks, and cache into a different directory.",
         f'hf_token = "{config.hf_token}"',
+        "# HTTP proxy without authentication; empty inherits the environment.",
+        f"proxy = {json.dumps(config.proxy)}",
+        f"no_proxy = {json.dumps(config.no_proxy)}",
         "",
         "[providers.dashscope]",
         f'api_key = "{config.providers.dashscope.api_key}"',

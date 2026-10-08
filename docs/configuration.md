@@ -4,6 +4,29 @@
 
 先运行 `podtran init` 生成配置，再按需修改 `~/.podtran/config.toml`。以下代码都是配置片段，请修改已有的对应表，不要重复添加同名 TOML 表。
 
+## 网络代理
+
+在 `config.toml` 顶层（任何 `[section]` 之前）配置无认证 HTTP 代理：
+
+```toml
+proxy = "http://192.168.1.10:7890"
+no_proxy = ["localhost", "127.0.0.1", "::1", "tts.internal"]
+```
+
+HTTP 代理也能用于 HTTPS 网站。代理覆盖音频 URL 下载、翻译、远程配音、声音克隆和模型下载；不支持在该配置中填写 SOCKS 或用户名密码。
+
+```powershell
+podtran run "https://www.youtube.com/watch?v=VIDEO_ID" --proxy http://192.168.1.10:7890
+podtran resume --proxy http://192.168.1.20:7890
+podtran resume --no-proxy
+```
+
+`run`、音频快捷入口、`resume` 及四个单阶段命令均支持互斥的 `--proxy` / `--no-proxy`。优先级为：本次参数 > 任务保存的临时设置 > 当前配置 > 标准代理环境变量。显式参数会保存到任务，后续恢复沿用；`--no-proxy` 保存强制直连设置。后台进程继承本次设置。
+
+配置中的 `proxy = ""` 表示继承环境变量，不表示强制直连。未显式配置代理时保留依赖库原有的环境代理行为。绕过规则每次读取当前配置，并追加环境变量 `NO_PROXY`；默认绕过本机地址。代理失败按现有规则重试并报错，不自动切换直连。修改代理不使已有内容缓存失效。
+
+使用显式代理或强制直连时，Hugging Face 模型下载采用普通 HTTP 路径，禁用 Xet / hf_transfer 下载加速，以统一网络行为。
+
 ## 翻译服务
 
 - `google-free`：默认选项，免费，无需 API key；走 Google 非公开网页接口，可能受地区、风控、请求频率影响

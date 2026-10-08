@@ -558,3 +558,41 @@ def test_resolve_workdir_uses_default_and_override() -> None:
         resolve_config_path(Path("~/custom.toml"))
         == Path("~/custom.toml").expanduser().resolve()
     )
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [
+        "socks5://host:1080",
+        "https://host:7890",
+        "http://user:secret@host:7890",
+        "http://host",
+        "http://host:0",
+        "http://host:99999",
+        "http://host:7890/path",
+    ],
+)
+def test_invalid_proxy_config(proxy):
+    with pytest.raises(ValidationError):
+        AppConfig(proxy=proxy)
+
+
+def test_proxy_round_trip_and_cache_fingerprints(tmp_path):
+    from podtran.fingerprints import SYNTHESIZE_CONFIG_KEYS, TRANSLATE_CONFIG_KEYS
+
+    config = AppConfig(
+        proxy="http://192.168.1.10:7890", no_proxy=["localhost", "service.internal"]
+    )
+    path = tmp_path / "config.toml"
+    path.write_text(render_config_toml(config), encoding="utf-8")
+    assert load_config(path) == config
+    fingerprints = FingerprintService(tmp_path / "indexes")
+    for keys in [
+        TRANSCRIBE_CONFIG_KEYS,
+        TRANSLATE_CONFIG_KEYS,
+        SYNTHESIZE_CONFIG_KEYS,
+        COMPOSE_CONFIG_KEYS,
+    ]:
+        assert fingerprints.hash_config_subset(
+            config, keys
+        ) == fingerprints.hash_config_subset(AppConfig(), keys)

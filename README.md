@@ -15,22 +15,16 @@
 - [FFmpeg](https://ffmpeg.org/download.html)，确保终端可执行 `ffmpeg` 和 `ffprobe`。
 - [Hugging Face token](https://huggingface.co/settings/tokens)，并接受 [说话人区分模型的使用条款](https://huggingface.co/pyannote/speaker-diarization-community-1)。
 
-安装默认的本地 TTS 版本：
+安装 podtran：
 
 ```powershell
-uv tool install --python 3.11 --torch-backend auto "podtran[qwen-local] @ git+https://github.com/R0sin/podtran"
+uv tool install --python 3.11 --torch-backend auto git+https://github.com/R0sin/podtran
 podtran --help
 ```
 
 `--torch-backend auto` 让 uv 根据设备选择 PyTorch 后端，详见 [uv 的 PyTorch 指南](https://docs.astral.sh/uv/guides/integration/pytorch/)。转写默认使用 CPU；首次运行需要下载模型，处理时间取决于硬件与音频长度。
 
-**使用云端或自托管 TTS？** 可只安装基础依赖，再在初始化时选择对应服务：
-
-```powershell
-uv tool install --python 3.11 --torch-backend auto git+https://github.com/R0sin/podtran
-```
-
-远程 TTS 按服务要求配置地址和密钥；转写仍在本地运行。
+使用云端或自托管 TTS 时，在初始化时选择对应服务，并按服务要求配置地址和密钥；转写仍在本地运行。本地 Qwen 模型仅在使用本地配音时下载。
 
 ## 快速开始
 

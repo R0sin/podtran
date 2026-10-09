@@ -1573,7 +1573,7 @@ def test_qwen_local_backend_reports_missing_dependencies(
         AppConfig(tts={"provider": "qwen-local", "mode": "preset"})
     )
 
-    with pytest.raises(RuntimeError, match="uv sync --extra qwen-local"):
+    with pytest.raises(RuntimeError, match="Reinstall podtran"):
         backend.synthesize(
             "你好",
             PresetVoiceSpec(identity="preset:Vivian", voice_name="Vivian"),

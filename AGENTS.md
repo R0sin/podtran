@@ -36,8 +36,9 @@ moves config, tasks, cache, and indexes together.
 | Retry | `tenacity` |
 | Tests / lint | `pytest`, `ruff` |
 
-`qwen-local` is optional in packaging (`podtran[qwen-local]`) but is the default
-runtime TTS provider. Development tests do not require real WhisperX, DashScope,
+`qwen-local` is the default runtime TTS provider and its dependencies are included
+in the default installation. The empty `podtran[qwen-local]` extra is retained for
+compatibility. Development tests do not require real WhisperX, DashScope,
 Google, vLLM, ffmpeg, or qwen-local service calls.
 
 ## Repository Layout
@@ -74,16 +75,10 @@ podtran/
 
 ## Development Commands
 
-Install normal dev dependencies:
+Install dev dependencies, including local Qwen TTS support:
 
 ```powershell
 uv sync
-```
-
-Install default local TTS dependencies for actual `qwen-local` runs:
-
-```powershell
-uv sync --extra qwen-local
 ```
 
 Run the CLI:

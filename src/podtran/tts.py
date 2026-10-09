@@ -54,7 +54,11 @@ from podtran.voices import (
 
 TTS_RETRY_ATTEMPTS = 3
 CLONE_VOICE_KINDS = frozenset({"provider_clone", "reference_clone"})
-QWEN_LOCAL_INSTALL_HINT = "Install local Qwen support with: uv sync --extra qwen-local"
+QWEN_LOCAL_INSTALL_HINT = (
+    "Qwen dependencies are included with podtran. "
+    "Reinstall podtran using the README installation command, "
+    "or run uv sync from a source checkout."
+)
 QWEN_LOCAL_BASE_MODELS = {
     "1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
     "0.6B": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",

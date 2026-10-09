@@ -8,8 +8,9 @@ import pytest
 from podtran.download import download_audio
 
 
+@pytest.mark.parametrize("sponsorblock", [False, True])
 def test_download_uses_postprocessed_audio_and_single_episode_options(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, sponsorblock
 ):
     audio = tmp_path / "episode.opus"
     audio.write_bytes(b"audio")
@@ -19,6 +20,22 @@ def test_download_uses_postprocessed_audio_and_single_episode_options(
             assert options["noplaylist"] is True
             assert options["extract_flat"] == "in_playlist"
             assert options["format"] == "bestaudio/best"
+            processors = options["postprocessors"]
+            if sponsorblock:
+                assert processors == [
+                    {
+                        "key": "SponsorBlock",
+                        "categories": ["sponsor"],
+                        "when": "after_filter",
+                    },
+                    {"key": "FFmpegExtractAudio", "preferredcodec": "best"},
+                    {"key": "ModifyChapters", "remove_sponsor_segments": ["sponsor"]},
+                ]
+            else:
+                assert processors == [
+                    {"key": "FFmpegExtractAudio", "preferredcodec": "best"}
+                ]
+            assert not options.get("ignoreerrors")
 
         def __enter__(self):
             return self
@@ -35,7 +52,9 @@ def test_download_uses_postprocessed_audio_and_single_episode_options(
             return {"requested_downloads": [{"filepath": str(audio)}]}
 
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=Downloader))
-    assert download_audio("https://example.com/episode", tmp_path) == audio
+    assert (
+        download_audio("https://example.com/episode", tmp_path, sponsorblock) == audio
+    )
 
 
 @pytest.mark.parametrize(

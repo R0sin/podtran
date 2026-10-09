@@ -69,6 +69,8 @@ podtran run "https://example.com/episode.mp3" --preview
 
 链接预览会先下载完整音频，再处理前五分钟。下载中断后用 `podtran resume` 继续，无需重新提交链接。
 
+支持赞助广告跳过参数 `--sponsorblock`，详见[使用说明](docs/configuration.md#跳过赞助口播)。
+
 ### 3. 找到输出
 
 完成后，终端会显示输出文件路径。默认保存在：

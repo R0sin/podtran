@@ -8,10 +8,19 @@ def is_http_url(value: str) -> bool:
     return urlsplit(value).scheme.lower() in {"http", "https"}
 
 
-def download_audio(url: str, directory: Path) -> Path:
+def download_audio(url: str, directory: Path, sponsorblock: bool = False) -> Path:
     from yt_dlp import YoutubeDL
 
     directory.mkdir(parents=True, exist_ok=True)
+    postprocessors = [{"key": "FFmpegExtractAudio", "preferredcodec": "best"}]
+    if sponsorblock:
+        postprocessors.insert(
+            0,
+            {"key": "SponsorBlock", "categories": ["sponsor"], "when": "after_filter"},
+        )
+        postprocessors.append(
+            {"key": "ModifyChapters", "remove_sponsor_segments": ["sponsor"]}
+        )
     options = {
         "format": "bestaudio/best",
         "noplaylist": True,
@@ -19,7 +28,7 @@ def download_audio(url: str, directory: Path) -> Path:
         "lazy_playlist": True,
         "outtmpl": str(directory / "%(title).100B [%(id)s].%(ext)s"),
         "restrictfilenames": True,
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "best"}],
+        "postprocessors": postprocessors,
     }
     with YoutubeDL(options) as downloader:
         info = downloader.extract_info(url, download=False)

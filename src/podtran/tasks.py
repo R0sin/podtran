@@ -48,6 +48,7 @@ class TaskStore:
             created_at=timestamp,
             updated_at=timestamp,
             source_url=url,
+            sponsorblock=config_snapshot.download.sponsorblock,
             source_audio_path="",
             source_audio_name="download",
             source_audio_sha256="",

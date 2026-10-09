@@ -197,6 +197,10 @@ class ComposeConfig(BaseModel):
     output_bitrate: str = "192k"
 
 
+class DownloadConfig(BaseModel):
+    sponsorblock: bool = False
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -208,6 +212,7 @@ class AppConfig(BaseModel):
     _validate_proxy = field_validator("proxy")(validate_proxy)
 
     hf_token: str = ""
+    download: DownloadConfig = Field(default_factory=DownloadConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     translation: TranslationConfig = Field(default_factory=TranslationConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
@@ -410,6 +415,10 @@ def render_config_toml(config: AppConfig) -> str:
         f'preset_voice = "{config.providers.mimo.preset_voice}"',
         f'audio_format = "{config.providers.mimo.audio_format}"',
         f'instructions = "{config.providers.mimo.instructions}"',
+        "",
+        "[download]",
+        "# Remove community-marked YouTube sponsor segments before processing.",
+        f"sponsorblock = {str(config.download.sponsorblock).lower()}",
         "",
         "[asr]",
         f'model = "{config.asr.model}"',

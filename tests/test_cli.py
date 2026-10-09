@@ -2882,8 +2882,10 @@ def test_url_shortcut_creates_task_before_download(tmp_path, monkeypatch, backgr
 
 
 @pytest.mark.parametrize("error", [RuntimeError("offline"), KeyboardInterrupt()])
-def test_download_failure_and_resume(tmp_path, monkeypatch, error):
+@pytest.mark.parametrize("sponsorblock", [False, True])
+def test_download_failure_and_resume(tmp_path, monkeypatch, error, sponsorblock):
     cfg = AppConfig()
+    cfg.download.sponsorblock = sponsorblock
     fingerprints = FingerprintService(tmp_path / "indexes")
     store = TaskStore(tmp_path, fingerprints)
     task = store.create_url_task("https://example.com/audio", cfg, "podtran URL")
@@ -2891,7 +2893,8 @@ def test_download_failure_and_resume(tmp_path, monkeypatch, error):
     executor = StageExecutor(store, task, paths)
     monkeypatch.setattr(cli, "ensure_command", lambda command: None)
 
-    def fail(*args):
+    def fail(url, directory, enabled):
+        assert enabled is sponsorblock
         raise error
 
     monkeypatch.setattr(cli, "download_audio", fail)
@@ -2900,6 +2903,7 @@ def test_download_failure_and_resume(tmp_path, monkeypatch, error):
     assert store.load_task(task.task_id).status == (
         "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
     )
+    assert store.load_task(task.task_id).source_audio_path == ""
     audio = paths.task_dir / "source" / "episode.opus"
     audio.parent.mkdir()
     audio.write_bytes(b"downloaded")
@@ -3171,3 +3175,81 @@ def test_single_stage_proxy_override(tmp_path, monkeypatch, command):
     assert result.exit_code == 0, result.exception
     assert observed == ["http://stage:7890"]
     assert store.load_task(task.task_id).proxy_override == "http://stage:7890"
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize(
+    "configured,flag,expected",
+    [
+        (False, None, False),
+        (True, None, True),
+        (False, "--sponsorblock", True),
+        (True, "--no-sponsorblock", False),
+    ],
+)
+def test_sponsorblock_cli_precedence_and_task_persistence(
+    tmp_path, monkeypatch, background, configured, flag, expected
+):
+    config_path, cfg = _create_config(tmp_path)
+    cfg.download.sponsorblock = configured
+    config_path.write_text(cli.render_config_toml(cfg), encoding="utf-8")
+    captured = []
+    monkeypatch.setattr(
+        cli, "_execute_pipeline", lambda task, *a, **k: captured.append(task)
+    )
+    monkeypatch.setattr(
+        cli, "_start_background_resume", lambda task, *a, **k: captured.append(task)
+    )
+    monkeypatch.setattr(
+        cli.sys,
+        "argv",
+        [
+            "podtran",
+            *([flag] if flag else []),
+            "https://www.youtube.com/watch?v=abc",
+            "--config",
+            str(config_path),
+            "--workdir",
+            str(tmp_path),
+            *(["--background"] if background else []),
+        ],
+    )
+    cli.main()
+    task = captured[0]
+    store = TaskStore(tmp_path, FingerprintService(tmp_path / "indexes"))
+    assert store.load_task(task.task_id).sponsorblock is expected
+    assert load_config(config_path).download.sponsorblock is configured
+
+
+def test_sponsorblock_resume_uses_saved_choice_before_preview(tmp_path, monkeypatch):
+    cfg = AppConfig(download={"sponsorblock": True})
+    fingerprints = FingerprintService(tmp_path / "indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task = store.create_url_task(
+        "https://www.youtube.com/watch?v=abc", cfg, "podtran URL", preview=True
+    )
+    task = store.load_task(task.task_id)
+    cfg.download.sponsorblock = False
+    paths = store.paths_for(task)
+    executor = StageExecutor(store, task, paths)
+    monkeypatch.setattr(cli, "ensure_command", lambda command: None)
+    audio = paths.task_dir / "cut.opus"
+
+    def download(url, directory, enabled):
+        assert enabled is True
+        audio.write_bytes(b"sponsor removed")
+        return audio
+
+    def preview(source, *args):
+        assert source.read_bytes() == b"sponsor removed"
+        paths.preview_audio_path.write_bytes(b"preview")
+        return paths.preview_audio_path
+
+    monkeypatch.setattr(cli, "download_audio", download)
+    monkeypatch.setattr(cli, "_create_preview_audio", preview)
+    cli._ensure_download(task, cfg, paths, executor, fingerprints)
+    assert task.source_audio_sha256 == fingerprints.hash_audio(audio)
+    monkeypatch.setattr(
+        cli, "download_audio", lambda *args: pytest.fail("download repeated")
+    )
+    cli._ensure_download(task, cfg, paths, executor, fingerprints)

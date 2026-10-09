@@ -41,6 +41,15 @@ from podtran.fingerprints import (
 )
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_sponsorblock_config_roundtrip(tmp_path, enabled):
+    assert AppConfig().download.sponsorblock is False
+    cfg = AppConfig(download={"sponsorblock": enabled})
+    path = tmp_path / "config.toml"
+    path.write_text(render_config_toml(cfg), encoding="utf-8")
+    assert load_config(path).download.sponsorblock is enabled
+
+
 @pytest.mark.parametrize("field", ["english_speed", "chinese_speed"])
 @pytest.mark.parametrize(
     "value", [0, 0.49, 2.01, float("nan"), float("inf"), -float("inf")]

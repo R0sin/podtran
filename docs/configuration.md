@@ -4,6 +4,27 @@
 
 先运行 `podtran init` 生成配置，再按需修改 `~/.podtran/config.toml`。以下代码都是配置片段，请修改已有的对应表，不要重复添加同名 TOML 表。
 
+## 跳过赞助口播
+
+处理 YouTube 节目时，加上 `--sponsorblock` 可以去掉其他用户已标记的赞助口播，保留片头、片尾和求订阅等内容。这个功能默认关闭：
+
+```powershell
+podtran run "https://www.youtube.com/watch?v=VIDEO_ID" --sponsorblock
+```
+
+如果希望以后自动去掉赞助口播，在 `config.toml` 中设置：
+
+```toml
+[download]
+sponsorblock = true
+```
+
+临时想保留完整节目，可以加 `--no-sponsorblock`。这两个命令行选项只影响本次任务，不会修改配置文件。
+
+没有人标记过的广告仍会保留；没有找到标记时，会继续翻译完整节目。其他网站和本地文件不会去广告。如果连接 SponsorBlock 多次失败，或剪切音频失败，任务会停止并显示错误，之后可用 `podtran resume` 重试。
+
+加上 `--preview` 时，会试听去掉赞助口播后的前五分钟。`podtran resume` 会沿用该任务原先的选择，已经处理好的音频也不会重新剪切。如果想改变是否去广告，或使用后来新增的广告标记，请重新运行 `podtran run`。
+
 ## 网络代理
 
 在 `config.toml` 顶层（任何 `[section]` 之前）配置无认证 HTTP 代理：

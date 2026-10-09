@@ -310,6 +310,11 @@ def run(
     preview: bool = typer.Option(
         False, "--preview", help="Run only the first five minutes as a preview task."
     ),
+    sponsorblock: Optional[bool] = typer.Option(
+        None,
+        "--sponsorblock/--no-sponsorblock",
+        help="Remove YouTube sponsor segments; overrides download.sponsorblock for this task.",
+    ),
     background: bool = typer.Option(
         False,
         "--background",
@@ -341,6 +346,7 @@ def run(
         config,
         workdir,
         proxy_override=override,
+        sponsorblock=sponsorblock,
         preview=preview,
         background=background,
         min_speakers=min_speakers,
@@ -1087,7 +1093,13 @@ def _should_dispatch_root_task(argv: list[str]) -> bool:
         "--max_speakers",
         "--proxy",
     }
-    boolean_options = {"--preview", "--background", "--no-proxy"}
+    boolean_options = {
+        "--preview",
+        "--background",
+        "--no-proxy",
+        "--sponsorblock",
+        "--no-sponsorblock",
+    }
     index = 0
     while index < len(argv):
         token = argv[index]
@@ -1154,6 +1166,7 @@ def _run_task(
     min_speakers: int = DEFAULT_MIN_SPEAKERS,
     max_speakers: int = DEFAULT_MAX_SPEAKERS,
     proxy_override: str | None = None,
+    sponsorblock: bool | None = None,
 ) -> None:
     if not is_http_url(str(audio)):
         audio = Path(audio)
@@ -1161,6 +1174,8 @@ def _run_task(
     cfg, _, task_store, cache_store, fingerprints = _load_runtime(
         config_path, workdir_override
     )
+    if sponsorblock is not None:
+        cfg.download.sponsorblock = sponsorblock
     task_manifest = _create_run_task(
         audio,
         cfg,
@@ -1598,7 +1613,9 @@ def _ensure_download(
         console.print("Downloading source audio...")
         audio = Path(task.source_audio_path) if task.source_audio_path else None
         if audio is None or not audio.is_file():
-            audio = download_audio(task.source_url, paths.task_dir / "source")
+            audio = download_audio(
+                task.source_url, paths.task_dir / "source", task.sponsorblock
+            )
         task.source_audio_path = str(audio.resolve())
         task.source_audio_name = audio.name
         task.source_audio_sha256 = fingerprints.hash_audio(audio)

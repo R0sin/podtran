@@ -171,6 +171,7 @@ class TaskManifest(BaseModel):
     created_at: str
     updated_at: str
     source_url: str = ""
+    sponsorblock: bool = False
     source_audio_path: str
     source_audio_name: str
     source_audio_sha256: str

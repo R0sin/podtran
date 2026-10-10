@@ -191,16 +191,19 @@ API key 也可通过 `MIMO_API_KEY` 环境变量提供；如使用其他服务�
 [asr]
 model = "medium"
 compute_type = "int8"
-device = "cpu"
+device = "auto"
 batch_size = 4
 ```
 
-`medium + cpu + int8` 是面向普通笔记本的默认组合。如需使用 GPU 或尝试不同效果，可以手动调整 `model`、`device` 和 `compute_type`。
+默认组合为 `medium + auto + int8`。`auto` 在 PyTorch 和 CTranslate2 均可使用 CUDA 时选择第一张可见 GPU，否则使用 CPU；ASR 不自动选择 XPU。已有配置中显式设置的 `cpu` 继续生效。ASR 与本地 TTS 分别通过 `[asr].device` 和 `[providers.qwen_local].device` 配置。
 
 可选值参考：
 
 - `model`：`base`、`small`、`medium`、`large-v2`、`large-v3`、`turbo`、`distil-large-v3`
 - `compute_type`：`int8`、`float16`
+- `device`：`auto`、`cpu`、`cuda`、`cuda:N`；`cuda` 使用第一张可见 GPU，`cuda:N` 指定可见设备编号（从 0 开始，受 `CUDA_VISIBLE_DEVICES` 影响）。转录、对齐和说话人分离使用同一设备。
+
+转写进度会显示最终设备。选定设备后，模型加载失败或显存不足会直接报错，不自动切换 CPU 重试；需要时可手动设置 `device = "cpu"`。`auto` 不改变 `compute_type`，也不按实际设备拆分转录缓存。
 
 一般建议：
 
@@ -217,7 +220,7 @@ device = "cuda"
 batch_size = 16
 ```
 
-安装时自动选择 PyTorch 后端不会改变 `[asr].device` 的默认值；使用 GPU 转写仍需修改配置。上述 GPU 示例中的批量大小应按可用显存调整。
+安装时选择 PyTorch 后端与运行时选择 ASR 设备是两个步骤，使用 CUDA 还需要兼容的驱动及运行库。上述 GPU 示例中的批量大小应按可用显存调整。
 
 ## 输出模式与倍速
 

@@ -178,7 +178,7 @@ class ASRConfig(BaseModel):
 
     model: str = "medium"
     compute_type: str = "int8"
-    device: str = "cpu"
+    device: str = "auto"
     language: str = "en"
     batch_size: int = 4
     align_model: str = ""

@@ -3,10 +3,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import ModuleType
+from unittest.mock import Mock
+
+import pytest
 
 from podtran.asr import (
     _build_asr_options,
     _get_diarization_pipeline_class,
+    _resolve_asr_device,
     transcribe_audio,
     transcription_stage_count,
 )
@@ -143,17 +147,71 @@ def test_get_diarization_pipeline_class_falls_back_to_nested_module(
     assert pipeline_cls is _FakeDiarizationPipeline
 
 
-def test_transcribe_audio_reports_stage_progress(monkeypatch) -> None:
+@pytest.fixture
+def device_backends(monkeypatch):
+    torch = Mock()
+    torch.cuda.is_available.return_value = True
+    ctranslate2 = Mock()
+    ctranslate2.get_cuda_device_count.return_value = 2
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "ctranslate2", ctranslate2)
+    return torch, ctranslate2
+
+
+@pytest.mark.parametrize(
+    "torch_available,ct2_count,expected",
+    [(True, 2, "cuda:0"), (True, 0, "cpu"), (False, 2, "cpu"), (False, 0, "cpu")],
+)
+def test_auto_device_requires_both_cuda_backends(
+    device_backends, torch_available, ct2_count, expected
+) -> None:
+    torch, ctranslate2 = device_backends
+    torch.cuda.is_available.return_value = torch_available
+    ctranslate2.get_cuda_device_count.return_value = ct2_count
+    assert _resolve_asr_device("auto") == expected
+
+
+@pytest.mark.parametrize(
+    "requested,expected",
+    [("cpu", "cpu"), ("cuda", "cuda:0"), (" CUDA:1 ", "cuda:1")],
+)
+def test_explicit_device_does_not_probe_or_fall_back(
+    device_backends, requested, expected
+) -> None:
+    torch, ctranslate2 = device_backends
+    assert _resolve_asr_device(requested) == expected
+    torch.cuda.is_available.assert_not_called()
+    ctranslate2.get_cuda_device_count.assert_not_called()
+
+
+@pytest.mark.parametrize("requested", ["", "xpu", "mps", "cuda:-1", "cuda:abc"])
+def test_invalid_asr_device_is_rejected(requested) -> None:
+    with pytest.raises(ValueError, match="Unsupported ASR device"):
+        _resolve_asr_device(requested)
+
+
+@pytest.mark.parametrize(
+    "requested,expected",
+    [("auto", "cuda:0"), ("cpu", "cpu"), ("cuda", "cuda:0"), ("cuda:1", "cuda:1")],
+)
+@pytest.mark.parametrize("align_model", ["", "custom-align-model"])
+def test_transcribe_audio_reports_stage_progress(
+    monkeypatch, device_backends, requested, expected, align_model
+) -> None:
     monkeypatch.setitem(sys.modules, "whisperx", _FakeWhisperXModule)
     options_module = ModuleType("faster_whisper.transcribe")
     options_module.TranscriptionOptions = _CurrentOptions
     monkeypatch.setitem(sys.modules, "faster_whisper.transcribe", options_module)
+    spies = {}
+    for name in ["load_model", "load_align_model", "align", "DiarizationPipeline"]:
+        spies[name] = Mock(wraps=getattr(_FakeWhisperXModule, name))
+        monkeypatch.setattr(_FakeWhisperXModule, name, spies[name])
     _FakeDiarizationPipeline.calls.clear()
     events: list[tuple[int, int, str]] = []
 
     result = transcribe_audio(
         Path("fake.wav"),
-        ASRConfig(),
+        ASRConfig(device=requested, align_model=align_model),
         "hf-token",
         min_speakers=2,
         max_speakers=5,
@@ -170,4 +228,26 @@ def test_transcribe_audio_reports_stage_progress(monkeypatch) -> None:
     )
     assert all(event[1] == transcription_stage_count() for event in events)
     assert events[0][2] == "Loading audio"
+    assert events[1][2] == f"Loading ASR model (device: {expected})"
     assert events[-1][2] == "Transcription complete"
+    device_type, _, device_index = expected.partition(":")
+    assert spies["load_model"].call_args.args[1] == device_type
+    assert spies["load_model"].call_args.kwargs["device_index"] == int(
+        device_index or 0
+    )
+    assert spies["load_align_model"].call_args.kwargs["device"] == expected
+    assert spies["align"].call_args.args[4] == expected
+    assert spies["DiarizationPipeline"].call_args.kwargs["device"] == expected
+
+
+def test_cuda_load_failure_is_not_retried_on_cpu(monkeypatch, device_backends) -> None:
+    monkeypatch.setitem(sys.modules, "whisperx", _FakeWhisperXModule)
+    monkeypatch.setattr("podtran.asr._build_asr_options", lambda: {})
+    load_model = Mock(side_effect=RuntimeError("CUDA out of memory"))
+    monkeypatch.setattr(_FakeWhisperXModule, "load_model", load_model)
+
+    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+        transcribe_audio(Path("fake.wav"), ASRConfig(), "hf-token")
+
+    load_model.assert_called_once()
+    assert load_model.call_args.args[1] == "cuda"

@@ -41,6 +41,16 @@ from podtran.fingerprints import (
 )
 
 
+@pytest.mark.parametrize("device", ["auto", "cpu", "cuda", "cuda:1"])
+def test_asr_device_default_and_roundtrip(tmp_path, device):
+    assert AppConfig().asr.device == "auto"
+    assert AppConfig().asr.compute_type == "int8"
+    config = AppConfig(asr={"device": device})
+    path = tmp_path / "config.toml"
+    path.write_text(render_config_toml(config), encoding="utf-8")
+    assert load_config(path).asr.device == device
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_sponsorblock_config_roundtrip(tmp_path, enabled):
     assert AppConfig().download.sponsorblock is False

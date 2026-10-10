@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import inspect
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -32,15 +33,18 @@ def transcribe_audio(
 ) -> list[TranscriptSegment]:
     import whisperx
 
+    device = _resolve_asr_device(config.device)
+    device_type, _, device_index = device.partition(":")
     progress = _TranscriptionProgress(progress_callback)
     progress.start(_TRANSCRIPTION_STAGE_LABELS[0])
     audio = whisperx.load_audio(str(audio_path))
     batch_size = max(1, config.batch_size)
 
-    progress.advance(_TRANSCRIPTION_STAGE_LABELS[1])
+    progress.advance(f"{_TRANSCRIPTION_STAGE_LABELS[1]} (device: {device})")
     model = whisperx.load_model(
         config.model,
-        config.device,
+        device_type,
+        device_index=int(device_index or 0),
         compute_type=config.compute_type,
         language=config.language or None,
         asr_options=_build_asr_options(),
@@ -55,13 +59,13 @@ def transcribe_audio(
     if config.align_model.strip():
         model_a, metadata = whisperx.load_align_model(
             language_code=language_code,
-            device=config.device,
+            device=device,
             model_name=config.align_model,
         )
     else:
         model_a, metadata = whisperx.load_align_model(
             language_code=language_code,
-            device=config.device,
+            device=device,
         )
     progress.advance(_TRANSCRIPTION_STAGE_LABELS[4])
     aligned = whisperx.align(
@@ -69,7 +73,7 @@ def transcribe_audio(
         model_a,
         metadata,
         audio,
-        config.device,
+        device,
         return_char_alignments=False,
     )
     del model_a
@@ -77,7 +81,7 @@ def transcribe_audio(
 
     diarization_pipeline_cls = _get_diarization_pipeline_class(whisperx)
     progress.advance(_TRANSCRIPTION_STAGE_LABELS[5])
-    diarize_model = diarization_pipeline_cls(token=hf_token, device=config.device)
+    diarize_model = diarization_pipeline_cls(token=hf_token, device=device)
     diarize_kwargs = {}
     if min_speakers > 0:
         diarize_kwargs["min_speakers"] = min_speakers
@@ -125,6 +129,24 @@ def transcribe_audio(
 
     progress.finish()
     return records
+
+
+def _resolve_asr_device(value: str) -> str:
+    requested = value.strip().lower()
+    if requested == "auto":
+        import ctranslate2
+        import torch
+
+        if torch.cuda.is_available() and ctranslate2.get_cuda_device_count() > 0:
+            return "cuda:0"
+        return "cpu"
+    if requested == "cuda":
+        return "cuda:0"
+    if requested == "cpu" or re.fullmatch(r"cuda:[0-9]+", requested):
+        return requested
+    raise ValueError(
+        f"Unsupported ASR device: {value!r}. Expected auto, cpu, cuda, or cuda:N"
+    )
 
 
 def infer_speaker(words: list[WordAlignment]) -> str | None:

@@ -2,6 +2,18 @@
 
 这里记录项目中值得关注的用户可感知变更。
 
+## [0.4.1] - 2026-10-10
+
+### 新增
+
+- 支持通过 `--sponsorblock` 或 `[download].sponsorblock` 跳过 YouTube 中社区标记的赞助口播；默认关闭，任务恢复时沿用创建任务时的选择。
+- GitHub Release 自动提供中文更新说明及 wheel、sdist 安装包，现有 Git 安装与升级方式保持不变。
+
+### 改进
+
+- 默认安装包含本地 Qwen TTS 依赖，无需额外指定 `qwen-local`；旧的 extra 安装命令继续兼容。
+- 发布前自动检查 Windows / Python 3.11 和 Linux / Python 3.10–3.12，并验证构建包的安装与 CLI 入口。
+
 ## [0.4.0] - 2026-10-08
 
 ### 新增

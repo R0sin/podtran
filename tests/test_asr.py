@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import sys
 from pathlib import Path
+from types import ModuleType
 
 from podtran.asr import (
     _build_asr_options,
@@ -130,14 +133,21 @@ def test_get_diarization_pipeline_class_prefers_top_level_export() -> None:
     )
 
 
-def test_get_diarization_pipeline_class_falls_back_to_nested_module() -> None:
+def test_get_diarization_pipeline_class_falls_back_to_nested_module(
+    monkeypatch,
+) -> None:
+    module = ModuleType("whisperx.diarize")
+    module.DiarizationPipeline = _FakeDiarizationPipeline
+    monkeypatch.setitem(sys.modules, "whisperx.diarize", module)
     pipeline_cls = _get_diarization_pipeline_class(type("_NoTopLevelWhisperX", (), {}))
-    assert pipeline_cls.__name__ == "DiarizationPipeline"
-    assert pipeline_cls.__module__ == "whisperx.diarize"
+    assert pipeline_cls is _FakeDiarizationPipeline
 
 
 def test_transcribe_audio_reports_stage_progress(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "whisperx", _FakeWhisperXModule)
+    options_module = ModuleType("faster_whisper.transcribe")
+    options_module.TranscriptionOptions = _CurrentOptions
+    monkeypatch.setitem(sys.modules, "faster_whisper.transcribe", options_module)
     _FakeDiarizationPipeline.calls.clear()
     events: list[tuple[int, int, str]] = []
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 from pathlib import Path
 import signal
@@ -40,6 +42,21 @@ from podtran.tts import (
     build_tts_backend,
     synthesize_segments,
 )
+
+
+@pytest.fixture(autouse=True)
+def fake_torch(monkeypatch):
+    # Backend unit tests must not load PyTorch or depend on the host's GPU.
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(
+            float16=object(),
+            float32=object(),
+            bfloat16=object(),
+            cuda=types.SimpleNamespace(is_available=lambda: False),
+        ),
+    )
 
 
 class _DummyBackend:
@@ -219,9 +236,10 @@ def test_resolve_tts_model_uses_qwen_local_model_identity() -> None:
     assert _resolve_tts_model(config, preset_spec) == "qwen-local:customvoice:0.6B"
 
 
-def test_build_tts_backend_rejects_clone_mode_for_backend_without_clone_capability() -> (
-    None
-):
+def test_build_tts_backend_rejects_clone_mode_for_backend_without_clone_capability(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("podtran.tts.OpenAI", lambda **kwargs: object())
     config = AppConfig(tts=TTSConfig(provider="openai-compatible", mode="clone"))
 
     with pytest.raises(RuntimeError, match="Clone mode is not supported"):

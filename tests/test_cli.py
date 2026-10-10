@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-from click.exceptions import Exit as ClickExit
+from typer import Exit as TyperExit
 import pytest
 from rich.console import Console
 from typer.testing import CliRunner
@@ -2515,7 +2515,7 @@ def test_ensure_synthesize_rejects_incomplete_translation_without_mutating_outpu
     write_json(paths.translated_json, [_segment("seg_1", "RuntimeError: boom")])
     original = paths.translated_json.read_text(encoding="utf-8")
 
-    with pytest.raises(ClickExit):
+    with pytest.raises(TyperExit):
         cli._ensure_synthesize(
             task,
             cfg,
@@ -2547,7 +2547,7 @@ def test_require_completed_tts_rejects_partial_outputs(tmp_path: Path) -> None:
         ],
     )
 
-    with pytest.raises(ClickExit):
+    with pytest.raises(TyperExit):
         cli._require_completed_tts(translated_json)
 
 
@@ -2838,7 +2838,7 @@ def test_execute_pipeline_prints_resume_hint_on_stage_failure(
     monkeypatch.setattr(cli, "_ensure_translate", failing_translate)
     cli.console = recorded_console
     try:
-        with pytest.raises(ClickExit):
+        with pytest.raises(TyperExit):
             cli._execute_pipeline(task_manifest, cfg, store, cache_store, fingerprints)
         rendered = recorded_console.export_text()
     finally:
@@ -2997,7 +2997,7 @@ def test_transcribe_rejects_url_with_incomplete_download(tmp_path):
     store = TaskStore(tmp_path, fingerprints)
     task = store.create_url_task("https://example.com/audio", cfg, "podtran URL")
     paths = store.paths_for(task)
-    with pytest.raises(ClickExit):
+    with pytest.raises(TyperExit):
         cli._ensure_transcribe(
             task,
             cfg,

@@ -72,7 +72,8 @@ def test_resolve_translation_key_prefers_provider_credentials(monkeypatch) -> No
     assert _resolve_translation_key(config) == "provider-key"
 
 
-def test_build_translation_backend_supports_known_providers() -> None:
+def test_build_translation_backend_supports_known_providers(monkeypatch) -> None:
+    monkeypatch.setattr("podtran.translate.OpenAI", lambda **kwargs: object())
     assert translation_provider_names() == (
         "google-free",
         "bing-free",

@@ -41,6 +41,10 @@ path = "src/podtran/__init__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/podtran"]
 
+[tool.ruff.lint]
+# Preserve the project's existing rule set across Ruff default changes.
+select = ["E4", "E7", "E9", "F"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",

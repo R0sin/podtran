@@ -111,6 +111,7 @@ podtran resume        # 继续最近任务
 - [任务与维护](docs/usage.md)：后台运行、切换翻译服务、工作目录、单阶段执行、升级与开发。
 - [常见问题](docs/troubleshooting.md)：安装、模型下载、权限、内存及翻译失败排查。
 - [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/R0sin/podtran/issues)
+- [维护者发布流程](RELEASING.md)
 
 ## 许可证
 

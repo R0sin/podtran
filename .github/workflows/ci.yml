@@ -5,10 +5,26 @@ on:
     branches:
       - main
   pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: windows-latest
+            python: "3.11"
 
     steps:
       - name: Checkout
@@ -17,21 +33,49 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
+          python-version: ${{ matrix.python }}
           enable-cache: true
 
       - name: Install minimal CI dependencies
         run: |
           uv venv
           uv pip install -e . --no-deps
-          uv pip install httpx openai pydantic rich tenacity typer pytest ruff
+          uv pip install -r scripts/ci-requirements.txt
 
       - name: Lint
-        run: uv run ruff check src tests
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
+        run: uv run --no-sync ruff check src tests scripts
 
       - name: Test
-        run: uv run pytest -q
+        run: uv run --no-sync pytest -q
+
+  package:
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - name: Build sdist and wheel
+        run: uv build --no-sources
+      - name: Verify installed wheel
+        shell: bash
+        run: python scripts/check_distribution.py dist/*.whl
+      - name: Save release distributions
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          overwrite: true
+          path: dist/*
+          if-no-files-found: error

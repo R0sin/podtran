@@ -708,9 +708,22 @@ def test_run_background_creates_task_and_starts_resume_process(
     assert f"podtran status {task.task_id}" in result.output
 
 
-@pytest.mark.parametrize("framework_launcher", [False, True])
+@pytest.mark.parametrize(
+    "framework_launcher",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                sys.platform != "darwin", reason="macOS framework launcher behavior"
+            ),
+        ),
+    ],
+)
 def test_stop_running_background_task_marks_task_and_stage_interrupted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, framework_launcher: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    framework_launcher: bool,
 ) -> None:
     config_path, cfg = _create_config(tmp_path)
     audio = tmp_path / "episode.mp3"

@@ -1406,8 +1406,13 @@ def _verified_background_process(
     try:
         process = psutil.Process(pid)
         command = process.cmdline()
-        executable = Path(process.exe()).resolve()
-        current_executable = Path(psutil.Process().exe()).resolve()
+        if sys.platform == "darwin":
+            # Framework Python replaces the launcher path in argv[0].
+            executable = Path(process.exe()).resolve()
+            current_executable = Path(psutil.Process().exe()).resolve()
+        else:
+            executable = Path(command[0]).resolve() if command else None
+            current_executable = Path(sys.executable).resolve()
     except (psutil.NoSuchProcess, psutil.ZombieProcess):
         return None
     except psutil.AccessDenied as exc:

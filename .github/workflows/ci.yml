@@ -76,6 +76,8 @@ jobs:
                   for case in ET.parse(results).iter("testcase"):
                       for failure in list(case):
                           if failure.tag in {"failure", "error"}:
+                              detail = (failure.text or "").replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                              print(f"::error title={case.get('name')}::{detail}")
                               summary.write(f"### {case.get('classname')}.{case.get('name')}\n\n")
                               summary.write(f"```text\n{failure.text or ''}\n```\n\n")
 

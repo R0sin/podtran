@@ -1663,8 +1663,9 @@ def test_synthesize_segments_preserves_completed_results_when_worker_interrupts(
     assert synthesized[1].tts_audio_path == ""
 
 
+@pytest.mark.parametrize("interrupt_at_start", [False, True])
 def test_synthesize_segments_stops_queued_work_quickly_on_sigint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupt_at_start: bool
 ) -> None:
     paths = _paths(tmp_path)
     paths.ensure()
@@ -1681,11 +1682,11 @@ def test_synthesize_segments_stops_queued_work_quickly_on_sigint(
         def synthesize(self, text, spec, model, output_path):
             self.calls += 1
             started.set()
-            try:
-                assert release.wait(timeout=5)
-                output_path.write_bytes(text.encode("utf-8"))
-            finally:
-                finished.set()
+            assert release.wait(timeout=5)
+            output_path.write_bytes(text.encode("utf-8"))
+
+        def close(self):
+            finished.set()
 
     backend = BlockingBackend()
 
@@ -1697,7 +1698,18 @@ def test_synthesize_segments_stops_queued_work_quickly_on_sigint(
             signal.raise_signal(signal.SIGINT)
 
     interrupt = threading.Thread(target=interrupt_started_work)
-    interrupt.start()
+    if interrupt_at_start:
+        original_start = threading.Thread.start
+
+        def start_then_interrupt(thread):
+            original_start(thread)
+            if thread.name.startswith("podtran-tts-"):
+                assert started.wait(timeout=5)
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(threading.Thread, "start", start_then_interrupt)
+    else:
+        interrupt.start()
     start = time.perf_counter()
     try:
         with pytest.raises(KeyboardInterrupt):
@@ -1711,7 +1723,8 @@ def test_synthesize_segments_stops_queued_work_quickly_on_sigint(
             )
     finally:
         release.set()
-        interrupt.join(timeout=5)
+        if not interrupt_at_start:
+            interrupt.join(timeout=5)
 
     elapsed = time.perf_counter() - start
     assert finished.wait(timeout=5)

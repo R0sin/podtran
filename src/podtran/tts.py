@@ -685,15 +685,6 @@ def synthesize_segments(
 
         worker_count = max_workers
         workers = []
-        for index in range(worker_count):
-            worker = threading.Thread(
-                target=_synthesis_worker,
-                name=f"podtran-tts-{index + 1}",
-                args=(config, work_queue, result_queue, stop_event, paths.workdir),
-                daemon=True,
-            )
-            workers.append(worker)
-            worker.start()
 
         def handle_outcome(outcome: _SynthesisWorkerOutcome) -> None:
             nonlocal processed_segments
@@ -765,6 +756,15 @@ def synthesize_segments(
         completed_items = 0
         total_items = len(work_batches)
         try:
+            for index in range(worker_count):
+                worker = threading.Thread(
+                    target=_synthesis_worker,
+                    name=f"podtran-tts-{index + 1}",
+                    args=(config, work_queue, result_queue, stop_event, paths.workdir),
+                    daemon=True,
+                )
+                workers.append(worker)
+                worker.start()
             while completed_items < total_items:
                 try:
                     outcome = result_queue.get(timeout=0.1)
@@ -782,7 +782,8 @@ def synthesize_segments(
             stop_event.set()
             if config.providers.qwen_local.device == "mlx":
                 for worker in workers:
-                    worker.join(timeout=5)
+                    if worker.ident is not None:
+                        worker.join(timeout=5)
 
     if progress_callback is not None:
         progress_callback(stage_total, stage_total, "Synthesis complete")

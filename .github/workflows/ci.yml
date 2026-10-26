@@ -40,6 +40,8 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
+          # Avoid inferring the version from platform-specific uv dependencies.
+          version: "0.13.5"
           python-version: ${{ matrix.python }}
           enable-cache: true
 
@@ -72,6 +74,8 @@ jobs:
         with:
           python-version: "3.11"
       - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.5"
       - name: Build sdist and wheel
         run: uv build --no-sources
       - name: Verify installed wheel

@@ -60,7 +60,24 @@ jobs:
         run: uv run --no-sync python scripts/check_macos_dependencies.py
 
       - name: Test
-        run: uv run --no-sync pytest -q
+        run: uv run --no-sync pytest -q --junitxml=test-results.xml
+
+      - name: Summarize test failures
+        if: failure()
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          results = Path("test-results.xml")
+          if results.exists():
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  for case in ET.parse(results).iter("testcase"):
+                      for failure in list(case):
+                          if failure.tag in {"failure", "error"}:
+                              summary.write(f"### {case.get('classname')}.{case.get('name')}\n\n")
+                              summary.write(f"```text\n{failure.text or ''}\n```\n\n")
 
   package:
     needs: test

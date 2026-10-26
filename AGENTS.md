@@ -67,7 +67,7 @@ podtran/
 │   └── __main__.py         # python -m podtran entry
 ├── tests/                  # Unit tests with mocked external services
 ├── scripts/                # Local helper scripts
-├── docs/                   # Local design docs, gitignored
+├── docs/                   # Project documentation and design decisions
 ├── main.py                 # Dev entry point that adds src/ to sys.path
 ├── pyproject.toml
 └── uv.lock
@@ -329,4 +329,20 @@ workflow.
 - `qwen-local` model sizes are currently `0.6B` and `1.7B`.
 - For long audio, WhisperX can load the whole file into memory; pre-splitting is
   still the practical fallback on constrained machines.
-- `docs/` and `.codex/` are gitignored local working areas.
+- Commit project documentation under `docs/`. Keep task drafts and process
+  notes in `.scratch/`; it and `.codex/` are gitignored local working areas.
+
+## Agent skills
+
+### Issue tracker
+
+Before reading or writing issues, read `docs/agents/issue-tracker.md`.
+Track work as local Markdown under `.scratch/`.
+
+### Triage labels
+
+Before triaging issues, read `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout. Before exploring the codebase, read `docs/agents/domain.md`.

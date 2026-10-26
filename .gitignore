@@ -13,5 +13,7 @@ wheels/
 .pytest_cache/
 .coverage
 htmlcov/
-/docs/
+
+# Local agent configuration and temporary working files
 .codex/
+/.scratch/

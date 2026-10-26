@@ -776,7 +776,7 @@ def test_stop_running_background_task_marks_task_and_stage_interrupted(
             ],
         )
 
-        assert result.exit_code == 0
+        assert result.exit_code == 0, result.output
         assert f"Stopped task: {task.task_id}" in result.output
         assert process.wait(timeout=5) is not None
         assert store.load_task(task.task_id).status == "interrupted"

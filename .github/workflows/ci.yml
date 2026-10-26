@@ -67,9 +67,11 @@ jobs:
         shell: python
         run: |
           import os
+          import sys
           from pathlib import Path
           import xml.etree.ElementTree as ET
 
+          sys.stdout.reconfigure(encoding="utf-8")
           results = Path("test-results.xml")
           if results.exists():
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:

@@ -203,8 +203,9 @@ class VllmOmniCloneProvider:
 
 
 class QwenLocalCloneProvider:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, workdir: Path | None = None) -> None:
         self.config = config
+        self.workdir = workdir
 
     def create_voice_spec(
         self,
@@ -266,11 +267,19 @@ class QwenLocalCloneProvider:
                 x_vector_only_mode=True,
             ),
         )
-        backend = QwenLocalTTSBackend(self.config)
+        if self.config.providers.qwen_local.device == "mlx":
+            from podtran.tts import build_tts_backend
+
+            backend = build_tts_backend(self.config, self.workdir)
+        else:
+            backend = QwenLocalTTSBackend(self.config)
         try:
             backend.synthesize(ANCHOR_REFERENCE_TEXT, spec, target_model, anchor_audio)
         finally:
-            backend._unload_model()
+            if self.config.providers.qwen_local.device == "mlx":
+                backend.close()
+            else:
+                backend._unload_model()
 
 
 class MimoCloneProvider:
@@ -555,7 +564,7 @@ class VoiceResolver:
         if provider == "vllm-omni":
             return VllmOmniCloneProvider(self.config)
         if provider == "qwen-local":
-            return QwenLocalCloneProvider(self.config)
+            return QwenLocalCloneProvider(self.config, self.paths.workdir)
         if provider == "mimo":
             return MimoCloneProvider(self.config)
         raise RuntimeError(

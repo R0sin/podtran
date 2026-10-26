@@ -44,6 +44,7 @@ from podtran.models import (
     VoiceSpec,
 )
 from podtran.stage_versions import TTS_STAGE_VERSION
+from podtran.macos import resolve_tts_config
 from podtran.voices import (
     UNKNOWN_SPEAKER_TTS_SKIP_MESSAGE,
     VoiceResolver,
@@ -535,6 +536,7 @@ def synthesize_segments(
     fingerprints: FingerprintService | None = None,
     progress_callback: StageProgressCallback | None = None,
 ) -> list[SegmentRecord]:
+    config = resolve_tts_config(config)
     segments = _load_resume_segments(input_path, output_path)
     paths.tts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -682,13 +684,16 @@ def synthesize_segments(
             work_queue.put(batch)
 
         worker_count = max_workers
+        workers = []
         for index in range(worker_count):
-            threading.Thread(
+            worker = threading.Thread(
                 target=_synthesis_worker,
                 name=f"podtran-tts-{index + 1}",
-                args=(config, work_queue, result_queue, stop_event),
+                args=(config, work_queue, result_queue, stop_event, paths.workdir),
                 daemon=True,
-            ).start()
+            )
+            workers.append(worker)
+            worker.start()
 
         def handle_outcome(outcome: _SynthesisWorkerOutcome) -> None:
             nonlocal processed_segments
@@ -775,13 +780,21 @@ def synthesize_segments(
             raise
         finally:
             stop_event.set()
+            if config.providers.qwen_local.device == "mlx":
+                for worker in workers:
+                    worker.join(timeout=5)
 
     if progress_callback is not None:
         progress_callback(stage_total, stage_total, "Synthesis complete")
     return segments
 
 
-def build_tts_backend(config: AppConfig) -> TTSBackend:
+def build_tts_backend(
+    config: AppConfig,
+    workdir: Path | None = None,
+    stop_event: threading.Event | None = None,
+) -> TTSBackend:
+    config = resolve_tts_config(config)
     provider = config.tts.provider.strip().lower()
     if provider == "dashscope":
         backend: TTSBackend = DashScopeTTSBackend(config)
@@ -792,7 +805,14 @@ def build_tts_backend(config: AppConfig) -> TTSBackend:
     elif provider == "mimo":
         backend = MimoTTSBackend(config)
     elif provider == "qwen-local":
-        backend = QwenLocalTTSBackend(config)
+        if config.providers.qwen_local.device == "mlx":
+            from podtran.mlx_tts import MLXTTSBackend
+
+            if workdir is None:
+                raise RuntimeError("MLX TTS requires the task workdir.")
+            backend = MLXTTSBackend(config, workdir, stop_event)
+        else:
+            backend = QwenLocalTTSBackend(config)
     else:
         raise RuntimeError(f"Unsupported TTS provider: {config.tts.provider}")
 
@@ -1055,30 +1075,42 @@ def _synthesis_worker(
     work_queue: queue.Queue[_SynthesisBatchWorkItem],
     result_queue: queue.Queue[_SynthesisWorkerOutcome],
     stop_event: threading.Event,
+    workdir: Path | None = None,
 ) -> None:
     backend: TTSBackend | None = None
-    while not stop_event.is_set():
-        try:
-            item = work_queue.get_nowait()
-        except queue.Empty:
-            return
+    try:
+        while not stop_event.is_set():
+            try:
+                item = work_queue.get_nowait()
+            except queue.Empty:
+                return
 
-        if stop_event.is_set():
+            if stop_event.is_set():
+                work_queue.task_done()
+                return
+
+            try:
+                if backend is None:
+                    if config.providers.qwen_local.device == "mlx":
+                        backend = build_tts_backend(config, workdir, stop_event)
+                    else:
+                        backend = build_tts_backend(config)
+                payload: list[_SynthesisItemOutcome] | BaseException = (
+                    _synthesize_batch_work_item(backend, item)
+                )
+            except (
+                BaseException
+            ) as exc:  # pragma: no cover - exercised through main-thread handling
+                payload = exc
+            result_queue.put(_SynthesisWorkerOutcome(batch=item, payload=payload))
             work_queue.task_done()
-            return
-
-        try:
-            if backend is None:
-                backend = build_tts_backend(config)
-            payload: list[_SynthesisItemOutcome] | BaseException = (
-                _synthesize_batch_work_item(backend, item)
-            )
-        except (
-            BaseException
-        ) as exc:  # pragma: no cover - exercised through main-thread handling
-            payload = exc
-        result_queue.put(_SynthesisWorkerOutcome(batch=item, payload=payload))
-        work_queue.task_done()
+    finally:
+        if backend is not None:
+            close = getattr(backend, "close", None)
+            if close is not None:
+                close()
+            elif isinstance(backend, QwenLocalTTSBackend):
+                backend._unload_model()
 
 
 def _drain_ready_synthesis_outcomes(

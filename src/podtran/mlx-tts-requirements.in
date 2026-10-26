@@ -1,0 +1,4 @@
+# Regenerate with scripts/check_macos_dependencies.py --update-mlx-lock.
+mlx-audio==0.6.1
+pydantic>=2.8
+soundfile>=0.12

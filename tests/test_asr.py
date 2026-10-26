@@ -184,7 +184,7 @@ def test_explicit_device_does_not_probe_or_fall_back(
     ctranslate2.get_cuda_device_count.assert_not_called()
 
 
-@pytest.mark.parametrize("requested", ["", "xpu", "mps", "cuda:-1", "cuda:abc"])
+@pytest.mark.parametrize("requested", ["", "xpu", "cuda:-1", "cuda:abc"])
 def test_invalid_asr_device_is_rejected(requested) -> None:
     with pytest.raises(ValueError, match="Unsupported ASR device"):
         _resolve_asr_device(requested)

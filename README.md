@@ -5,7 +5,7 @@
 - **先试听**：用前 5 分钟音频预览翻译和配音效果。
 - **可恢复**：转写、翻译、配音、合成分阶段执行，中断后从兼容的断点继续。
 - **复用结果**：自动缓存转写、翻译、音色和逐段配音，减少重复处理。
-- **灵活选择**：默认本地 WhisperX 转写、免费网页翻译、本地 Qwen TTS，也支持云端和自托管服务。
+- **灵活选择**：默认本地转写、免费网页翻译、本地 Qwen TTS，也支持云端和自托管服务。
 
 ## 安装
 
@@ -15,16 +15,21 @@
 - [FFmpeg](https://ffmpeg.org/download.html)，确保终端可执行 `ffmpeg` 和 `ffprobe`。
 - [Hugging Face token](https://huggingface.co/settings/tokens)，并接受 [说话人区分模型的使用条款](https://huggingface.co/pyannote/speaker-diarization-community-1)。
 
-安装 podtran：
+Windows / Linux：
 
 ```powershell
 uv tool install --python 3.11 --torch-backend auto git+https://github.com/R0sin/podtran
-podtran --help
 ```
 
-`--torch-backend auto` 让 uv 根据设备选择 PyTorch 后端，详见 [uv 的 PyTorch 指南](https://docs.astral.sh/uv/guides/integration/pytorch/)。首次运行需要下载模型，处理时间取决于硬件与音频长度。
+macOS 需使用 Apple Silicon、macOS 14 及以上和原生 arm64 Python 3.11：
 
-使用云端或自托管 TTS 时，在初始化时选择对应服务，并按服务要求配置地址和密钥；转写仍在本地运行。本地 Qwen 模型仅在使用本地配音时下载。
+```bash
+uv tool install --python 3.11 git+https://github.com/R0sin/podtran
+```
+
+安装后运行 `podtran --help` 检查是否可用，再按下方步骤初始化并试听。首次运行需要联网下载模型和准备所需组件，耗时取决于网络和设备。
+
+使用云端或自托管配音时，在初始化时选择对应服务，并按服务要求配置地址和密钥。本地 Qwen 模型仅在使用本地配音时下载。
 
 ## 快速开始
 

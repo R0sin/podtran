@@ -1322,7 +1322,7 @@ def _start_background_resume(
     atomic_write_text(pid_path, f"{process.pid}\n")
     console.print(f"[green]Started background task:[/green] {task_manifest.task_id}")
     console.print(f"pid={process.pid}")
-    console.print(f"log={log_path.resolve()}")
+    console.print(f"log={log_path.resolve()}", soft_wrap=True, markup=False)
     console.print(
         "status="
         f"podtran status {task_manifest.task_id} --config {resolved_config_path} "
@@ -1883,6 +1883,9 @@ def _ensure_transcribe(
     reporter: PipelineProgressReporter | None = None,
 ) -> StageDecision:
     from podtran.asr import transcription_stage_count
+    from podtran.macos import resolve_asr_config
+
+    cfg = cfg.model_copy(update={"asr": resolve_asr_config(cfg.asr)})
 
     download_manifest = (
         executor.load_manifest("download") if task_manifest.source_url else None
@@ -2216,6 +2219,9 @@ def _ensure_synthesize(
     reporter: PipelineProgressReporter | None = None,
 ) -> StageDecision:
     from podtran.tts import synthesize_segments
+    from podtran.macos import resolve_tts_config
+
+    cfg = resolve_tts_config(cfg)
 
     translation_segments = _require_translated_segments_ready(paths.translated_json)
     synthesis_input = _synthesize_input_segments(translation_segments)

@@ -86,15 +86,9 @@ translation_model = "qwen-flash"
 
 ### 本地 Qwen（默认）
 
-默认 TTS 后端会直接在 podtran 进程内运行 Qwen3-TTS，需要安装 `qwen-local` 可选依赖。使用 `uv tool install` 安装 CLI 时，请按 [README 的安装命令](../README.md#安装)启用 `podtran[qwen-local]`。
+按 [README 的安装命令](../README.md#安装)安装后即可使用本地 Qwen3-TTS，无需额外安装依赖。从源码运行时使用 `uv sync`。Mac 首次使用 GPU 配音时会自动安装所需组件，详见 [macOS 设置](#macos-设备与首次运行)。
 
-如果是在源码 checkout 中开发或运行，可同步 extra：
-
-```powershell
-uv sync --extra qwen-local
-```
-
-然后配置：
+本地配音配置示例：
 
 ```toml
 [tts]
@@ -110,7 +104,7 @@ device = "auto"
 language = "Chinese"
 ```
 
-`batch_size` 可以根据设备资源微调；显存或内存紧张时调小，资源更充足时可以适当调大。
+`batch_size` 可以根据设备资源微调；显存或内存紧张时调小，资源更充足时可以适当调大。Mac 使用 Apple GPU 配音时逐条生成，调大批量大小不会增加同时生成的片段数。
 
 ### DashScope
 
@@ -195,7 +189,11 @@ device = "auto"
 batch_size = 4
 ```
 
-默认组合为 `medium + auto + int8`。`auto` 在 PyTorch 和 CTranslate2 均可使用 CUDA 时选择第一张可见 GPU，否则使用 CPU；ASR 不自动选择 XPU。已有配置中显式设置的 `cpu` 继续生效。ASR 与本地 TTS 分别通过 `[asr].device` 和 `[providers.qwen_local].device` 配置。
+默认使用 `medium` 模型并自动选择设备。Apple Silicon Mac 的设备选择见下方 [macOS 设置](#macos-设备与首次运行)。已有配置中显式设置的 `cpu` 继续生效。转写与本地配音分别通过 `[asr].device` 和 `[providers.qwen_local].device` 配置。
+
+### Windows 与 Linux
+
+`auto` 在 PyTorch 和 CTranslate2 均可使用 CUDA 时选择第一张可见 GPU，否则使用 CPU；转写不自动选择 XPU。
 
 可选值参考：
 
@@ -221,6 +219,42 @@ batch_size = 16
 ```
 
 安装时选择 PyTorch 后端与运行时选择 ASR 设备是两个步骤，使用 CUDA 还需要兼容的驱动及运行库。上述 GPU 示例中的批量大小应按可用显存调整。
+
+### macOS 设备与首次运行
+
+Apple GPU 加速要求 Apple Silicon、macOS 14 及以上，以及原生 arm64 Python 3.11。转写和本地 Qwen 配音默认使用 `device = "auto"`，启动时检测到可用的 Apple GPU 就使用 GPU，否则提示原因并使用 CPU。
+
+要让已有配置自动选择设备，修改对应小节：
+
+```toml
+[asr]
+device = "auto"
+
+[providers.qwen_local]
+device = "auto"
+```
+
+两个设置分别控制转写和本地配音，可单独修改。
+
+| `device` 值 | 行为 |
+| --- | --- |
+| `auto` | 优先使用 Apple GPU，不可用时提示并使用 CPU |
+| `gpu`、`mlx`、`mps` | 使用 Apple GPU，不可用时直接报错 |
+| `cpu` | 使用 CPU |
+
+设备只在启动时选择。运行中遇到模型加载失败或内存不足，不会自动切换 CPU。修正问题后运行 `podtran resume`；需要改用 CPU 时，先将对应的 `device` 改为 `"cpu"`。
+
+Apple GPU 转写使用 MLX Whisper，词级对齐和说话人区分仍使用 CPU。本地配音使用 MLX Audio 的 Qwen3-TTS，逐条生成以限制内存占用。使用 GPU 时，以下选项不生效：
+
+- `[asr].compute_type`
+- `[providers.qwen_local].torch_dtype`
+- `[providers.qwen_local].attn_implementation`
+
+默认模型仍为 Whisper `medium` 和 Qwen `0.6B`。GPU 使用 MLX 格式的非量化模型，首次使用需要另行下载。切换 CPU 与 Apple GPU 后，相关阶段和音色可能需要重新生成。
+
+首次 GPU 配音时，podtran 自动在 `<workdir>/runtimes/` 安装独立的 Python 3.11 环境，默认位于 `~/.podtran/runtimes/`。安装需要联网，终端会显示准备提示，后续运行复用该环境。安装中断后，运行 `podtran resume` 会重新准备未完成的环境；安装失败时，按错误提示查看日志。
+
+使用 `--workdir` 更换工作目录时，配音环境也随之更换，新目录可能需要重新安装。CPU 配音使用 podtran 安装时已包含的 Qwen 依赖。
 
 ## 输出模式与倍速
 

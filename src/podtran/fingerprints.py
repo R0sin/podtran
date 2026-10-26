@@ -34,6 +34,7 @@ VOICE_CLONE_CONFIG_KEYS = [
     "providers.vllm_omni.language",
     "providers.vllm_omni.instructions",
     "providers.vllm_omni.x_vector_only_mode",
+    "providers.qwen_local.device",
     "providers.qwen_local.clone_model_size",
     "providers.qwen_local.torch_dtype",
     "providers.qwen_local.attn_implementation",
@@ -135,6 +136,12 @@ class FingerprintService:
         return stable_hash(self.config_subset(config, keys))
 
     def config_subset(self, config: AppConfig, keys: list[str]) -> dict[str, Any]:
+        from podtran.macos import resolve_asr_config, resolve_tts_config
+
+        if "asr.device" in keys:
+            config = config.model_copy(update={"asr": resolve_asr_config(config.asr)})
+        if "providers.qwen_local.device" in keys:
+            config = resolve_tts_config(config)
         raw = model_dump(config)
         return {key: _resolve_dotted_key(raw, key) for key in keys}
 

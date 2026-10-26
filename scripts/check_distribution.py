@@ -66,7 +66,16 @@ def main() -> None:
             raise ValueError("Installed CLI reported an unexpected version.")
         run(str(cli), "--help")
         run(str(python), "-m", "podtran", "--help")
-        print(f"Verified {wheel.name}: metadata, version, and CLI entry points.")
+        run(
+            str(python),
+            "-c",
+            "from pathlib import Path; import podtran.mlx_worker as worker; "
+            "assert Path(worker.__file__).is_file(); "
+            "assert Path(worker.__file__).with_name('mlx-tts-requirements.txt').is_file()",
+        )
+        print(
+            f"Verified {wheel.name}: metadata, CLI entry points, and MLX worker resources."
+        )
 
 
 if __name__ == "__main__":

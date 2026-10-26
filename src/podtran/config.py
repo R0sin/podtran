@@ -279,7 +279,8 @@ class AppConfig(BaseModel):
         if provider == "vllm-omni":
             return self.providers.vllm_omni.model.strip()
         if provider == "qwen-local":
-            return f"qwen-local:customvoice:{self.providers.qwen_local.preset_model_size.strip() or DEFAULT_QWEN_LOCAL_MODEL_SIZE}"
+            backend = "mlx:" if self.providers.qwen_local.device == "mlx" else ""
+            return f"qwen-local:{backend}customvoice:{self.providers.qwen_local.preset_model_size.strip() or DEFAULT_QWEN_LOCAL_MODEL_SIZE}"
         if provider == "mimo":
             return self.providers.mimo.preset_model.strip() or DEFAULT_MIMO_PRESET_MODEL
         return ""
@@ -294,7 +295,8 @@ class AppConfig(BaseModel):
         if provider == "vllm-omni":
             return self.providers.vllm_omni.model.strip()
         if provider == "qwen-local":
-            return f"qwen-local:base:{self.providers.qwen_local.clone_model_size.strip() or DEFAULT_QWEN_LOCAL_MODEL_SIZE}"
+            backend = "mlx:" if self.providers.qwen_local.device == "mlx" else ""
+            return f"qwen-local:{backend}base:{self.providers.qwen_local.clone_model_size.strip() or DEFAULT_QWEN_LOCAL_MODEL_SIZE}"
         if provider == "mimo":
             return self.providers.mimo.clone_model.strip() or DEFAULT_MIMO_CLONE_MODEL
         return ""
@@ -400,6 +402,7 @@ def render_config_toml(config: AppConfig) -> str:
         "[providers.qwen_local]",
         f'clone_model_size = "{config.providers.qwen_local.clone_model_size}"',
         f'preset_model_size = "{config.providers.qwen_local.preset_model_size}"',
+        "# Apple Silicon: auto, gpu (MLX), or cpu. Other platforms: auto/cuda/xpu/cpu.",
         f'device = "{config.providers.qwen_local.device}"',
         f'torch_dtype = "{config.providers.qwen_local.torch_dtype}"',
         f'attn_implementation = "{config.providers.qwen_local.attn_implementation}"',
@@ -423,6 +426,7 @@ def render_config_toml(config: AppConfig) -> str:
         "[asr]",
         f'model = "{config.asr.model}"',
         f'compute_type = "{config.asr.compute_type}"',
+        "# Apple Silicon: auto, gpu (MLX), or cpu. Other platforms: auto/cuda/cpu.",
         f'device = "{config.asr.device}"',
         f'language = "{config.asr.language}"',
         f"batch_size = {config.asr.batch_size}",

@@ -147,9 +147,12 @@ class MLXTTSBackend:
                 text=True,
                 encoding="utf-8",
                 env={
-                    key: value
-                    for key, value in os.environ.items()
-                    if key not in {"PYTHONPATH", "PYTHONHOME"}
+                    **{
+                        key: value
+                        for key, value in os.environ.items()
+                        if key not in {"PYTHONPATH", "PYTHONHOME"}
+                    },
+                    "PYTHONIOENCODING": "utf-8",
                 },
             )
         except BaseException:

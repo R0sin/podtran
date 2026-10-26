@@ -764,6 +764,9 @@ def test_stop_running_background_task_marks_task_and_stage_interrupted(
         (paths.task_dir / "run.pid").write_text(f"{process.pid}\n", encoding="utf-8")
         (paths.task_dir / "run.token").write_text(f"{run_token}\n", encoding="utf-8")
 
+        import psutil
+
+        observed_command = psutil.Process(process.pid).cmdline()
         result = runner.invoke(
             cli.app,
             [
@@ -776,7 +779,7 @@ def test_stop_running_background_task_marks_task_and_stage_interrupted(
             ],
         )
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 0, (result.output, sys.executable, observed_command)
         assert f"Stopped task: {task.task_id}" in result.output
         assert process.wait(timeout=5) is not None
         assert store.load_task(task.task_id).status == "interrupted"

@@ -29,7 +29,7 @@ def fake_worker(tmp_path, monkeypatch):
         "from podtran import mlx_worker\n"
         "class Engine:\n"
         "    def generate(self, request):\n"
-        f"        with open({str(requests)!r}, 'a') as out: out.write(request.model_dump_json() + '\\n')\n"
+        f"        with open({str(requests)!r}, 'a', encoding='utf-8') as out: out.write(request.model_dump_json() + '\\n')\n"
         "        if request.text == 'wait': time.sleep(60)\n"
         "        if request.text == 'fail': raise RuntimeError('GPU failure')\n"
         "        print('model diagnostic')\n"
@@ -57,9 +57,11 @@ def clone_spec(x_vector=False):
     )
 
 
+@pytest.mark.parametrize("stdio_encoding", ["utf-8", "ascii", "cp1252"])
 def test_worker_reuses_process_and_preserves_clone_and_preset_inputs(
-    fake_worker, tmp_path
+    fake_worker, tmp_path, monkeypatch, stdio_encoding
 ):
+    monkeypatch.setenv("PYTHONIOENCODING", stdio_encoding)
     backend = MLXTTSBackend(AppConfig(), tmp_path)
     try:
         backend.synthesize("你好", clone_spec(), "unused", tmp_path / "one.wav")
@@ -73,7 +75,8 @@ def test_worker_reuses_process_and_preserves_clone_and_preset_inputs(
         )
         assert backend.process is process
         assert (tmp_path / "one.wav").read_bytes() == b"RIFF-fake-audio"
-        requests = [json.loads(line) for line in fake_worker.read_text().splitlines()]
+        requests = [json.loads(line) for line in fake_worker.read_text(encoding="utf-8").splitlines()]
+        assert [request["text"] for request in requests] == ["你好", "再见", "预设"]
         assert requests[0]["reference_text"] == "reference text"
         assert requests[1]["reference_text"] is None
         assert requests[2]["voice"] == "Vivian"
@@ -90,7 +93,7 @@ def test_worker_failure_does_not_publish_or_switch_to_cpu(fake_worker, tmp_path)
         backend.synthesize("fail", clone_spec(), "unused", output)
     assert not output.exists()
     assert backend.process is None
-    assert len(fake_worker.read_text().splitlines()) == 1
+    assert len(fake_worker.read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_cancellation_terminates_inflight_worker(fake_worker, tmp_path):

@@ -1406,6 +1406,8 @@ def _verified_background_process(
     try:
         process = psutil.Process(pid)
         command = process.cmdline()
+        executable = Path(process.exe()).resolve()
+        current_executable = Path(psutil.Process().exe()).resolve()
     except (psutil.NoSuchProcess, psutil.ZombieProcess):
         return None
     except psutil.AccessDenied as exc:
@@ -1415,7 +1417,7 @@ def _verified_background_process(
     options = _background_resume_options(command[5:])
     command_matches = (
         len(command) >= 13
-        and Path(command[0]).resolve() == Path(sys.executable).resolve()
+        and executable == current_executable
         and command[1:5] == ["-m", "podtran", "resume", task_id]
         and options is not None
         and Path(options["--config"]).resolve() == config_path.resolve()

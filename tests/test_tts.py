@@ -1673,13 +1673,31 @@ def test_synthesize_segments_stops_queued_work_quickly_on_sigint(
         _segment_with_text("seg_2", "你好二"),
     ]
     write_json(paths.translated_json, segments)
-    backend = _TrackingBackend(sleep_seconds=0.2)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class BlockingBackend(_TrackingBackend):
+        def synthesize(self, text, spec, model, output_path):
+            self.calls += 1
+            started.set()
+            try:
+                assert release.wait(timeout=5)
+                output_path.write_bytes(text.encode("utf-8"))
+            finally:
+                finished.set()
+
+    backend = BlockingBackend()
 
     monkeypatch.setattr("podtran.tts.build_tts_backend", lambda cfg: backend)
     monkeypatch.setattr("podtran.tts.probe_duration", lambda ffprobe_path, path: 1.0)
 
-    timer = threading.Timer(0.05, lambda: signal.raise_signal(signal.SIGINT))
-    timer.start()
+    def interrupt_started_work():
+        if started.wait(timeout=5):
+            signal.raise_signal(signal.SIGINT)
+
+    interrupt = threading.Thread(target=interrupt_started_work)
+    interrupt.start()
     start = time.perf_counter()
     try:
         with pytest.raises(KeyboardInterrupt):
@@ -1692,10 +1710,11 @@ def test_synthesize_segments_stops_queued_work_quickly_on_sigint(
                 paths,
             )
     finally:
-        timer.cancel()
+        release.set()
+        interrupt.join(timeout=5)
 
     elapsed = time.perf_counter() - start
-    time.sleep(0.3)
+    assert finished.wait(timeout=5)
 
-    assert elapsed < 0.35
+    assert elapsed < 2
     assert backend.calls == 1

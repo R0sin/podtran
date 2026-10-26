@@ -708,8 +708,9 @@ def test_run_background_creates_task_and_starts_resume_process(
     assert f"podtran status {task.task_id}" in result.output
 
 
+@pytest.mark.parametrize("framework_launcher", [False, True])
 def test_stop_running_background_task_marks_task_and_stage_interrupted(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, framework_launcher: bool,
 ) -> None:
     config_path, cfg = _create_config(tmp_path)
     audio = tmp_path / "episode.mp3"
@@ -766,7 +767,16 @@ def test_stop_running_background_task_marks_task_and_stage_interrupted(
 
         import psutil
 
-        observed_command = psutil.Process(process.pid).cmdline()
+        if framework_launcher:
+            original_cmdline = psutil.Process.cmdline
+
+            def framework_cmdline(candidate):
+                command = original_cmdline(candidate)
+                if candidate.pid == process.pid:
+                    command[0] = str(tmp_path / "Python.app/Contents/MacOS/Python")
+                return command
+
+            monkeypatch.setattr(psutil.Process, "cmdline", framework_cmdline)
         result = runner.invoke(
             cli.app,
             [
@@ -779,7 +789,7 @@ def test_stop_running_background_task_marks_task_and_stage_interrupted(
             ],
         )
 
-        assert result.exit_code == 0, (result.output, sys.executable, observed_command)
+        assert result.exit_code == 0, result.output
         assert f"Stopped task: {task.task_id}" in result.output
         assert process.wait(timeout=5) is not None
         assert store.load_task(task.task_id).status == "interrupted"

@@ -112,6 +112,24 @@ class TaskStore:
         paths.ensure()
         write_json(paths.task_json, manifest)
 
+    def refresh_audio_fingerprints(self, manifest: TaskManifest) -> None:
+        """Recheck persisted audio identities before executing an existing task.
+
+        This deliberately does not map old cache entries to the new identity.
+        Unchanged files use the versioned fingerprint index without decoding.
+        """
+        source_hash = self.fingerprints.hash_audio(Path(manifest.source_audio_path))
+        processing_hash = self.fingerprints.hash_audio(
+            Path(manifest.processing_audio_path)
+        )
+        if (source_hash, processing_hash) != (
+            manifest.source_audio_sha256,
+            manifest.processing_audio_sha256,
+        ):
+            manifest.source_audio_sha256 = source_hash
+            manifest.processing_audio_sha256 = processing_hash
+            self.save_task(manifest)
+
     def load_task(self, id_or_prefix: str) -> TaskManifest:
         matches = self._resolve_matches(id_or_prefix)
         if not matches:

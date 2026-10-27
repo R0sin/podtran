@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -20,6 +22,114 @@ from podtran.stage_executor import StageExecutor
 from podtran.tasks import TaskStore
 
 runner = CliRunner()
+pytestmark = pytest.mark.usefixtures("fake_audio_decoder")
+
+
+def test_resume_refreshes_legacy_audio_before_checking_completed_asr(
+    tmp_path, monkeypatch
+):
+    config_path, cfg = _create_config(tmp_path)
+    source = tmp_path / "source.opus"
+    source.write_bytes(b"audio")
+    fingerprints = FingerprintService(tmp_path / "indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    task = store.create_task(source, cfg, "podtran source.opus")
+    task.source_audio_sha256 = task.processing_audio_sha256 = "legacy-file-hash"
+    store.save_task(task)
+    paths = store.paths_for(task)
+    write_json(paths.transcript_json, [])
+    write_json(
+        paths.manifest_path("transcribe"),
+        StageManifest(
+            stage="transcribe",
+            status="completed",
+            stage_version=6,
+            input_fingerprints={"audio": "legacy-file-hash"},
+            config_fingerprint=cli._transcribe_config_fingerprint(
+                fingerprints, cfg, 2, 5
+            ),
+            output_refs={"transcript_json": "transcript.json"},
+        ),
+    )
+    calls = []
+    monkeypatch.setattr(cli, "ensure_command", lambda command: None)
+    monkeypatch.setattr(cli, "ensure_hf_token", lambda token: None)
+    monkeypatch.setattr(
+        cli,
+        "_run_transcription_with_progress",
+        lambda *a, **kw: calls.append(a[0]) or [],
+    )
+    for stage in ["translate", "synthesize", "compose"]:
+        monkeypatch.setattr(
+            cli,
+            f"_ensure_{stage}",
+            lambda *a, _stage=stage, **kw: cli.StageDecision(
+                _stage, "up-to-date", "fixture"
+            ),
+        )
+    cache = CacheStore(paths.cache_dir)
+    assert (
+        cli._execute_pipeline(task, cfg, store, cache, fingerprints)[0].action == "run"
+    )
+    assert store.load_task(
+        task.task_id
+    ).processing_audio_sha256 == fingerprints.hash_audio(source)
+    assert (
+        cli._execute_pipeline(task, cfg, store, cache, fingerprints)[0].action
+        == "up-to-date"
+    )
+    assert calls == [source]
+
+    # Single-stage commands must refresh saved identities too.
+    task.source_audio_sha256 = task.processing_audio_sha256 = "legacy-file-hash"
+    store.save_task(task)
+    _, refreshed, *_ = cli._load_task_context(task.task_id, config_path, tmp_path)
+    assert refreshed.processing_audio_sha256 == fingerprints.hash_audio(source)
+
+
+def test_separate_url_runs_download_again_but_reuse_asr_content_cache(
+    tmp_path, monkeypatch
+):
+    cfg = AppConfig()
+    fingerprints = FingerprintService(tmp_path / "indexes")
+    store = TaskStore(tmp_path, fingerprints)
+    cache = CacheStore(tmp_path / "artifacts/cache")
+    downloads = []
+    asr_calls = []
+
+    def download(url, directory, sponsorblock):
+        directory.mkdir(parents=True)
+        audio = directory / "source.opus"
+        audio.write_bytes(f"container-{len(downloads)}".encode())
+        downloads.append(audio)
+        return audio
+
+    monkeypatch.setattr(cli, "download_audio", download)
+    monkeypatch.setattr(
+        "podtran.fingerprints.hash_audio_content", lambda path: "same-decoded-content"
+    )
+    monkeypatch.setattr(cli, "ensure_command", lambda command: None)
+    monkeypatch.setattr(cli, "ensure_hf_token", lambda token: None)
+    monkeypatch.setattr(
+        cli,
+        "_run_transcription_with_progress",
+        lambda *a, **kw: asr_calls.append(a[0]) or [],
+    )
+    actions = []
+    for _ in range(2):
+        task = store.create_url_task("https://example.com/episode", cfg, "podtran URL")
+        paths = store.paths_for(task)
+        executor = StageExecutor(store, task, paths)
+        cli._ensure_download(task, cfg, paths, executor, fingerprints)
+        actions.append(
+            cli._ensure_transcribe(
+                task, cfg, paths, executor, cache, fingerprints
+            ).action
+        )
+    assert len(downloads) == 2
+    assert downloads[0] != downloads[1]
+    assert actions == ["run", "cache hit"]
+    assert len(asr_calls) == 1
 
 
 def _normalize_help_output(output: str) -> str:
@@ -2762,7 +2872,8 @@ def test_ensure_synthesize_resumes_failed_stage_and_reuses_completed_audio(
     input_fps = {
         "translated_json": fingerprints.hash_json(
             cli._synthesize_input_segments(translated)
-        )
+        ),
+        "source_audio": task.processing_audio_sha256,
     }
     config_fp = fingerprints.hash_config_subset(cfg, cli.SYNTHESIZE_CONFIG_KEYS)
     write_json(

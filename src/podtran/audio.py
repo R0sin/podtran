@@ -1,11 +1,117 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
+import tempfile
+from collections.abc import Iterable
 from pathlib import Path
 
 FFMPEG_COMMAND = "ffmpeg"
 FFPROBE_COMMAND = "ffprobe"
+
+# Changing the decoding/framing contract requires a new version, including the
+# on-disk fingerprint index namespace.
+AUDIO_FINGERPRINT_VERSION = 2
+
+
+def hash_audio_content(path: Path) -> str:
+    """Hash decoded samples, native rate/channels and presentation timestamps.
+
+    Fixed sample blocks remove container packet boundaries from the identity.
+    Float64 PCM preserves decoder precision without resampling, downmixing,
+    trimming silence or padding the last block. Only the first audio stream is
+    used, matching the processing pipeline.
+    """
+    command = [
+        FFMPEG_COMMAND,
+        "-nostdin",
+        "-v",
+        "error",
+        "-xerror",
+        "-copyts",
+        "-i",
+        str(path),
+        "-filter_complex",
+        "[0:a:0]asplit=2[timing][samples];[samples]asetnsamples=n=4096:p=0[blocks]",
+        "-map",
+        "[timing]",
+        "-map",
+        "[blocks]",
+        "-c:a",
+        "pcm_f64le",
+        "-f",
+        "framehash",
+        "-hash",
+        "sha256",
+        "pipe:1",
+    ]
+    # A file for stderr avoids a pipe deadlock without retaining decoder output
+    # in memory. stdout contains only one small checksum record per PCM block.
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors)
+        try:
+            assert process.stdout is not None
+            value = _hash_audio_frames(process.stdout)
+            returncode = process.wait()
+            if returncode != 0:
+                errors.seek(0)
+                detail = errors.read(4096).decode("utf-8", errors="replace").strip()
+                raise RuntimeError(
+                    f"Cannot fingerprint audio {path}: {detail or 'ffmpeg failed'}"
+                )
+            if value is None:
+                raise RuntimeError(
+                    f"Cannot fingerprint audio {path}: no audio samples decoded"
+                )
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+    return value
+
+
+def _hash_audio_frames(lines: Iterable[bytes]) -> str | None:
+    """Canonicalize framehash records without retaining decoded audio.
+
+    Stream 0 retains decoder timestamps. Merge adjacent frames into intervals
+    so packet boundaries do not affect timing identity. Stream 1 contains fixed
+    sample blocks; its timestamps are ignored because buffering can hide gaps.
+    """
+    samples = hashlib.sha256(f"podtran-audio-v{AUDIO_FINGERPRINT_VERSION}\n".encode())
+    timing = hashlib.sha256()
+    interval: tuple[int, int] | None = None
+    has_samples = False
+    for line in lines:
+        if line.startswith(b"#software:"):
+            continue
+        normalized = b"".join(line.split())
+        if not normalized:
+            continue
+        if normalized.startswith(b"#"):
+            samples.update(normalized + b"\n")
+            continue
+        stream, _dts, pts, duration, size, checksum = normalized.split(b",")
+        if stream == b"0":
+            start = int(pts)
+            end = start + int(duration)
+            if interval is not None and start == interval[1]:
+                interval = interval[0], end
+            else:
+                if interval is not None:
+                    timing.update(f"{interval[0]}:{interval[1]}\n".encode())
+                interval = start, end
+        elif stream == b"1":
+            samples.update(b",".join([duration, size, checksum]) + b"\n")
+            has_samples = True
+    if interval is None or not has_samples:
+        return None
+    timing.update(f"{interval[0]}:{interval[1]}\n".encode())
+    samples.update(timing.digest())
+    return samples.hexdigest()
 
 
 def seconds_arg(value: float | None) -> str | None:

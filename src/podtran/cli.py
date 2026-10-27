@@ -1592,6 +1592,8 @@ def _load_task_context(
         config_path, workdir_override
     )
     task_manifest = task_store.load_task(task)
+    if task_manifest.processing_audio_path:
+        task_store.refresh_audio_fingerprints(task_manifest)
     paths = task_store.paths_for(task_manifest)
     paths.ensure()
     executor = StageExecutor(task_store, task_manifest, paths)
@@ -1663,6 +1665,7 @@ def _execute_pipeline(
         try:
             if task_manifest.source_url:
                 _ensure_download(task_manifest, cfg, paths, executor, fingerprints)
+            task_store.refresh_audio_fingerprints(task_manifest)
             decisions.append(
                 _ensure_transcribe(
                     task_manifest,
@@ -2232,7 +2235,10 @@ def _ensure_synthesize(
 
     translation_segments = _require_translated_segments_ready(paths.translated_json)
     synthesis_input = _synthesize_input_segments(translation_segments)
-    input_fingerprints = {"translated_json": fingerprints.hash_json(synthesis_input)}
+    input_fingerprints = {
+        "translated_json": fingerprints.hash_json(synthesis_input),
+        "source_audio": task_manifest.processing_audio_sha256,
+    }
     config_fingerprint = fingerprints.hash_config_subset(cfg, SYNTHESIZE_CONFIG_KEYS)
     output_refs = _synthesize_output_refs(cfg)
     cache_key = fingerprints.build_stage_cache_key(

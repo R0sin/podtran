@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from podtran.artifacts import atomic_write_text, read_json_data
+from podtran.audio import AUDIO_FINGERPRINT_VERSION, hash_audio_content
 from podtran.config import AppConfig, model_dump
 
 
@@ -110,17 +111,25 @@ class FingerprintService:
     def hash_audio(self, path: Path) -> str:
         resolved = path.resolve()
         stat = resolved.stat()
-        cache_key = f"{resolved}|{stat.st_size}|{stat.st_mtime_ns}"
+        cache_key = (
+            f"v{AUDIO_FINGERPRINT_VERSION}|{resolved}|{stat.st_size}|"
+            f"{stat.st_mtime_ns}|{stat.st_ctime_ns}"
+        )
         index = self._load_index()
         cached = index.get(cache_key)
         if cached:
             return str(cached)
 
-        digest = hashlib.sha256()
-        with resolved.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        value = digest.hexdigest()
+        value = hash_audio_content(resolved)
+        after = resolved.stat()
+        if (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise RuntimeError(
+                f"Audio changed while calculating its fingerprint: {resolved}"
+            )
         index[cache_key] = value
         self._save_index(index)
         return value

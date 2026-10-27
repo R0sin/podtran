@@ -174,6 +174,7 @@ class TaskManifest(BaseModel):
     sponsorblock: bool = False
     source_audio_path: str
     source_audio_name: str
+    # SHA256 of canonical decoded audio, not the source container bytes.
     source_audio_sha256: str
     preview: bool = False
     preview_start_seconds: float = 0.0

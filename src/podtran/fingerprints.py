@@ -134,6 +134,15 @@ class FingerprintService:
         self._save_index(index)
         return value
 
+    @staticmethod
+    def hash_file(path: Path) -> str:
+        """Source provenance only; stage caches use the prepared PCM identity."""
+        value = hashlib.sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                value.update(chunk)
+        return value.hexdigest()
+
     def hash_json(self, value: Path | BaseModel | dict | list) -> str:
         if isinstance(value, Path):
             payload = read_json_data(value)

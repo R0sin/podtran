@@ -31,7 +31,7 @@ from podtran.artifacts import (
     remove_path,
     write_json,
 )
-from podtran.audio import FFMPEG_COMMAND, FFPROBE_COMMAND, extract_audio_chunk
+from podtran.audio import FFMPEG_COMMAND, FFPROBE_COMMAND, prepare_audio
 from podtran.cache_store import CacheStore
 from podtran.checks import ensure_audio_file, ensure_command, ensure_hf_token
 from podtran.compose import compose_output
@@ -78,11 +78,9 @@ from podtran.stage_versions import (
     TRANSCRIBE_STAGE_VERSION,
     TRANSLATE_STAGE_VERSION,
 )
-from podtran.tasks import TaskStore
+from podtran.tasks import PREVIEW_DURATION_SECONDS, TaskStore
 from podtran.network import proxy_environment, validate_proxy
 
-PREVIEW_DURATION_SECONDS = 300.0
-PREVIEW_START_SECONDS = 0.0
 
 ROOT_HELP = """Translate English podcast audio into Chinese with a staged CLI.
 
@@ -1180,7 +1178,6 @@ def _run_task(
         audio,
         cfg,
         task_store,
-        fingerprints,
         preview=preview,
         background=background,
         min_speakers=min_speakers,
@@ -1216,7 +1213,6 @@ def _create_run_task(
     audio: Path | str,
     cfg: AppConfig,
     task_store: TaskStore,
-    fingerprints: FingerprintService,
     *,
     preview: bool,
     background: bool,
@@ -1234,31 +1230,9 @@ def _create_run_task(
         return task_store.create_url_task(
             str(audio), cfg, entry_command, preview=preview
         )
-    audio = Path(audio)
-    if preview:
-        ensure_command(FFMPEG_COMMAND)
-        task_id, source_audio_sha256 = task_store.reserve_task_id(audio)
-        paths = ArtifactPaths.from_task_id(task_store.workdir, task_id)
-        paths.ensure()
-        try:
-            processing_audio = _create_preview_audio(audio.resolve(), cfg, paths)
-            processing_audio_sha256 = fingerprints.hash_audio(processing_audio)
-        except Exception:
-            remove_path(paths.task_dir)
-            raise
-        return task_store.create_task_with_processing_audio(
-            audio,
-            cfg,
-            entry_command=entry_command,
-            task_id=task_id,
-            source_audio_sha256=source_audio_sha256,
-            processing_audio=processing_audio,
-            processing_audio_sha256=processing_audio_sha256,
-            preview=True,
-            preview_start_seconds=PREVIEW_START_SECONDS,
-            preview_duration_seconds=PREVIEW_DURATION_SECONDS,
-        )
-    return task_store.create_task(audio, cfg, entry_command=entry_command)
+    return task_store.create_task(
+        Path(audio), cfg, entry_command=entry_command, preview=preview
+    )
 
 
 def _start_background_resume(
@@ -1548,14 +1522,11 @@ def _record_stopped_task(task_store: TaskStore, task_id: str, pid: int) -> bool:
     return True
 
 
-def _create_preview_audio(audio: Path, cfg: AppConfig, paths: ArtifactPaths) -> Path:
-    remove_path(paths.preview_audio_path)
-    return extract_audio_chunk(
-        FFMPEG_COMMAND,
+def _create_preview_audio(audio: Path, paths: ArtifactPaths) -> Path:
+    return prepare_audio(
         audio,
         paths.preview_audio_path,
-        PREVIEW_START_SECONDS,
-        PREVIEW_START_SECONDS + PREVIEW_DURATION_SECONDS,
+        duration=PREVIEW_DURATION_SECONDS,
     )
 
 
@@ -1607,6 +1578,7 @@ def _ensure_download(
     executor: StageExecutor,
     fingerprints: FingerprintService,
 ) -> None:
+    executor.task_store.require_prepared_audio(task)
     manifest = executor.load_manifest("download") or StageManifest(stage="download")
     if (
         manifest.status == "completed"
@@ -1622,15 +1594,16 @@ def _ensure_download(
         console.print("Downloading source audio...")
         audio = Path(task.source_audio_path) if task.source_audio_path else None
         if audio is None or not audio.is_file():
-            audio = download_audio(
+            downloaded = download_audio(
                 task.source_url, paths.task_dir / "source", task.sponsorblock
             )
-        task.source_audio_path = str(audio.resolve())
-        task.source_audio_name = audio.name
-        task.source_audio_sha256 = fingerprints.hash_audio(audio)
+            audio = downloaded.processing_audio
+            task.source_audio_path = str(audio.resolve())
+            task.source_audio_name = downloaded.source_audio_name
+            task.source_audio_sha256 = downloaded.source_audio_sha256
         # Save the full download before preview extraction so a failed preview can resume.
         executor.task_store.save_task(task)
-        processing = _create_preview_audio(audio, cfg, paths) if task.preview else audio
+        processing = _create_preview_audio(audio, paths) if task.preview else audio
         task.processing_audio_path = str(processing.resolve())
         task.processing_audio_sha256 = fingerprints.hash_audio(processing)
         manifest.output_refs = {

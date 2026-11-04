@@ -3,10 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from podtran.artifacts import ArtifactPaths, read_model, write_json
+from podtran.artifacts import ArtifactPaths, read_model, remove_path, write_json
+from podtran.audio import AUDIO_PREPARATION_VERSION, prepare_audio
 from podtran.config import AppConfig, model_dump
 from podtran.fingerprints import FingerprintService
 from podtran.models import TaskManifest
+
+
+PREVIEW_DURATION_SECONDS = 300.0
 
 
 class TaskStore:
@@ -18,20 +22,41 @@ class TaskStore:
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
 
     def create_task(
-        self, audio: Path, config_snapshot: AppConfig, entry_command: str
+        self,
+        audio: Path,
+        config_snapshot: AppConfig,
+        entry_command: str,
+        *,
+        preview: bool = False,
     ) -> TaskManifest:
         resolved_audio = audio.resolve()
-        source_audio_sha256 = self.fingerprints.hash_audio(resolved_audio)
+        source_audio_sha256 = self.fingerprints.hash_file(resolved_audio)
         task_id = self._build_unique_task_id(source_audio_sha256)
-        return self.create_task_with_processing_audio(
-            resolved_audio,
-            config_snapshot,
-            entry_command,
-            task_id=task_id,
-            source_audio_sha256=source_audio_sha256,
-            processing_audio=resolved_audio,
-            processing_audio_sha256=source_audio_sha256,
-        )
+        paths = ArtifactPaths.from_task_id(self.workdir, task_id)
+        paths.ensure()
+        try:
+            processing = prepare_audio(
+                resolved_audio,
+                paths.preview_audio_path
+                if preview
+                else paths.task_dir / "processing.flac",
+                duration=PREVIEW_DURATION_SECONDS if preview else None,
+            )
+            processing_hash = self.fingerprints.hash_audio(processing)
+            return self.create_task_with_processing_audio(
+                resolved_audio,
+                config_snapshot,
+                entry_command,
+                task_id=task_id,
+                source_audio_sha256=source_audio_sha256,
+                processing_audio=processing,
+                processing_audio_sha256=processing_hash,
+                preview=preview,
+                preview_duration_seconds=PREVIEW_DURATION_SECONDS if preview else 0.0,
+            )
+        except BaseException:
+            remove_path(paths.task_dir)
+            raise
 
     def create_url_task(
         self,
@@ -52,8 +77,9 @@ class TaskStore:
             source_audio_path="",
             source_audio_name="download",
             source_audio_sha256="",
+            audio_preparation_version=AUDIO_PREPARATION_VERSION,
             preview=preview,
-            preview_duration_seconds=300.0 if preview else 0.0,
+            preview_duration_seconds=PREVIEW_DURATION_SECONDS if preview else 0.0,
             entry_command=entry_command,
             config_hash=self.fingerprints.hash_value(model_dump(config_snapshot)),
             config_snapshot=model_dump(config_snapshot),
@@ -61,11 +87,6 @@ class TaskStore:
         )
         self.save_task(manifest)
         return manifest
-
-    def reserve_task_id(self, audio: Path) -> tuple[str, str]:
-        resolved_audio = audio.resolve()
-        source_audio_sha256 = self.fingerprints.hash_audio(resolved_audio)
-        return self._build_unique_task_id(source_audio_sha256), source_audio_sha256
 
     def create_task_with_processing_audio(
         self,
@@ -93,6 +114,7 @@ class TaskStore:
             source_audio_path=str(resolved_audio),
             source_audio_name=resolved_audio.name,
             source_audio_sha256=source_audio_sha256,
+            audio_preparation_version=AUDIO_PREPARATION_VERSION,
             preview=preview,
             preview_start_seconds=preview_start_seconds,
             preview_duration_seconds=preview_duration_seconds,
@@ -113,22 +135,26 @@ class TaskStore:
         write_json(paths.task_json, manifest)
 
     def refresh_audio_fingerprints(self, manifest: TaskManifest) -> None:
-        """Recheck persisted audio identities before executing an existing task.
+        """Recheck the working snapshot before executing an existing task.
 
-        This deliberately does not map old cache entries to the new identity.
-        Unchanged files use the versioned fingerprint index without decoding.
+        Source provenance stays as recorded at creation, even if the original
+        local file is later edited or deleted. Unchanged working files reuse
+        the versioned fingerprint index without decoding.
         """
-        source_hash = self.fingerprints.hash_audio(Path(manifest.source_audio_path))
+        self.require_prepared_audio(manifest)
         processing_hash = self.fingerprints.hash_audio(
             Path(manifest.processing_audio_path)
         )
-        if (source_hash, processing_hash) != (
-            manifest.source_audio_sha256,
-            manifest.processing_audio_sha256,
-        ):
-            manifest.source_audio_sha256 = source_hash
+        if processing_hash != manifest.processing_audio_sha256:
             manifest.processing_audio_sha256 = processing_hash
             self.save_task(manifest)
+
+    def require_prepared_audio(self, manifest: TaskManifest) -> None:
+        if manifest.audio_preparation_version != AUDIO_PREPARATION_VERSION:
+            raise RuntimeError(
+                "This task uses an older audio preparation format. "
+                "Start a new task with podtran run; existing artifacts are unchanged."
+            )
 
     def load_task(self, id_or_prefix: str) -> TaskManifest:
         matches = self._resolve_matches(id_or_prefix)

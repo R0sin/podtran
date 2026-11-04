@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -11,6 +12,28 @@ TaskStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
 VoiceMode = Literal["auto", "preset", "clone"]
 VoiceSpecKind = Literal["preset", "provider_clone", "reference_clone"]
 StageProgressCallback = Callable[[int, int, str], None]
+
+
+class DownloadResult(BaseModel):
+    processing_audio: Path
+    source_audio_name: str
+    source_audio_sha256: str
+
+
+class AudioCut(BaseModel):
+    start_time: float = Field(ge=0, allow_inf_nan=False)
+    end_time: float = Field(gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def ordered(self) -> "AudioCut":
+        if self.end_time <= self.start_time:
+            raise ValueError("Audio cut end must be after its start")
+        return self
+
+
+class AudioFormat(BaseModel):
+    sample_rate: int = Field(gt=0)
+    channels: int = Field(gt=0)
 
 
 class WordAlignment(BaseModel):
@@ -174,8 +197,9 @@ class TaskManifest(BaseModel):
     sponsorblock: bool = False
     source_audio_path: str
     source_audio_name: str
-    # SHA256 of canonical decoded audio, not the source container bytes.
+    # SHA256 of source file bytes, recorded when the task is created.
     source_audio_sha256: str
+    audio_preparation_version: int = 0
     preview: bool = False
     preview_start_seconds: float = 0.0
     preview_duration_seconds: float = 0.0
@@ -191,9 +215,9 @@ class TaskManifest(BaseModel):
 
     @model_validator(mode="after")
     def apply_processing_defaults(self) -> "TaskManifest":
-        if not self.processing_audio_path:
+        if self.audio_preparation_version == 0 and not self.processing_audio_path:
             self.processing_audio_path = self.source_audio_path
-        if not self.processing_audio_sha256:
+        if self.audio_preparation_version == 0 and not self.processing_audio_sha256:
             self.processing_audio_sha256 = self.source_audio_sha256
         return self
 

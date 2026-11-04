@@ -1,58 +1,87 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Sequence
 from pathlib import Path
+
+from podtran.artifacts import atomic_output_path
+from podtran.models import AudioCut, AudioFormat
+
 
 FFMPEG_COMMAND = "ffmpeg"
 FFPROBE_COMMAND = "ffprobe"
 
-# Changing the decoding/framing contract requires a new version, including the
-# on-disk fingerprint index namespace.
-AUDIO_FINGERPRINT_VERSION = 2
+# Change these when preparation or PCM identity semantics change.
+AUDIO_PREPARATION_VERSION = 1
+AUDIO_FINGERPRINT_VERSION = 3
+
+
+def probe_audio_format(path: Path) -> AudioFormat:
+    result = subprocess.run(
+        [
+            FFPROBE_COMMAND,
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=sample_rate,channels",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(f"Cannot inspect audio {path}: {result.stderr.strip()}")
+    streams = json.loads(result.stdout).get("streams", [])
+    if not streams:
+        raise RuntimeError(f"Cannot inspect audio {path}: no audio stream")
+    return AudioFormat.model_validate(streams[0])
 
 
 def hash_audio_content(path: Path) -> str:
-    """Hash decoded samples, native rate/channels and presentation timestamps.
+    """Hash native-rate/channel PCM16 samples, independent of container framing.
 
-    Fixed sample blocks remove container packet boundaries from the identity.
-    Float64 PCM preserves decoder precision without resampling, downmixing,
-    trimming silence or padding the last block. Only the first audio stream is
-    used, matching the processing pipeline.
+    Task inputs have already been prepared onto a continuous sample clock.
+    Hashing does not repair media or interpret its container timestamps.
     """
+    audio_format = probe_audio_format(path)
+    value = hashlib.sha256(f"podtran-pcm16-v{AUDIO_FINGERPRINT_VERSION}\n".encode())
+    value.update(json.dumps(audio_format.model_dump(), sort_keys=True).encode())
+    value.update(b"\n")
     command = [
         FFMPEG_COMMAND,
         "-nostdin",
         "-v",
         "error",
         "-xerror",
-        "-copyts",
         "-i",
         str(path),
-        "-filter_complex",
-        "[0:a:0]asplit=2[timing][samples];[samples]asetnsamples=n=4096:p=0[blocks]",
         "-map",
-        "[timing]",
-        "-map",
-        "[blocks]",
+        "0:a:0",
+        "-af",
+        "asetpts=N/SR/TB",
         "-c:a",
-        "pcm_f64le",
+        "pcm_s16le",
         "-f",
-        "framehash",
-        "-hash",
-        "sha256",
+        "s16le",
         "pipe:1",
     ]
-    # A file for stderr avoids a pipe deadlock without retaining decoder output
-    # in memory. stdout contains only one small checksum record per PCM block.
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors)
         try:
             assert process.stdout is not None
-            value = _hash_audio_frames(process.stdout)
+            size = 0
+            while chunk := process.stdout.read(1024 * 1024):
+                value.update(chunk)
+                size += len(chunk)
             returncode = process.wait()
             if returncode != 0:
                 errors.seek(0)
@@ -60,7 +89,7 @@ def hash_audio_content(path: Path) -> str:
                 raise RuntimeError(
                     f"Cannot fingerprint audio {path}: {detail or 'ffmpeg failed'}"
                 )
-            if value is None:
+            if not size:
                 raise RuntimeError(
                     f"Cannot fingerprint audio {path}: no audio samples decoded"
                 )
@@ -71,47 +100,105 @@ def hash_audio_content(path: Path) -> str:
         finally:
             if process.stdout is not None:
                 process.stdout.close()
-    return value
+    return value.hexdigest()
 
 
-def _hash_audio_frames(lines: Iterable[bytes]) -> str | None:
-    """Canonicalize framehash records without retaining decoded audio.
+def prepare_audio(
+    source: Path,
+    output: Path,
+    *,
+    cuts: Sequence[AudioCut] = (),
+    duration: float | None = None,
+) -> Path:
+    """Publish native-rate/channel PCM16 FLAC on a continuous sample timeline.
 
-    Stream 0 retains decoder timestamps. Merge adjacent frames into intervals
-    so packet boundaries do not affect timing identity. Stream 1 contains fixed
-    sample blocks; its timestamps are ignored because buffering can hide gaps.
+    Rebase source timestamps, materialize gaps as silence and trim overlaps.
+    Cut decoded samples before concatenation; preview limits apply afterwards.
+    Neither decoding nor hashing retains the full episode in memory.
     """
-    samples = hashlib.sha256(f"podtran-audio-v{AUDIO_FINGERPRINT_VERSION}\n".encode())
-    timing = hashlib.sha256()
-    interval: tuple[int, int] | None = None
-    has_samples = False
-    for line in lines:
-        if line.startswith(b"#software:"):
-            continue
-        normalized = b"".join(line.split())
-        if not normalized:
-            continue
-        if normalized.startswith(b"#"):
-            samples.update(normalized + b"\n")
-            continue
-        stream, _dts, pts, duration, size, checksum = normalized.split(b",")
-        if stream == b"0":
-            start = int(pts)
-            end = start + int(duration)
-            if interval is not None and start == interval[1]:
-                interval = interval[0], end
-            else:
-                if interval is not None:
-                    timing.update(f"{interval[0]}:{interval[1]}\n".encode())
-                interval = start, end
-        elif stream == b"1":
-            samples.update(b",".join([duration, size, checksum]) + b"\n")
-            has_samples = True
-    if interval is None or not has_samples:
-        return None
-    timing.update(f"{interval[0]}:{interval[1]}\n".encode())
-    samples.update(timing.digest())
-    return samples.hexdigest()
+    if source.resolve() == output.resolve():
+        raise ValueError("Prepared audio must not overwrite its source")
+    if duration is not None and duration <= 0:
+        raise ValueError("Preview duration must be positive")
+    source_stat = source.stat()
+    merged: list[AudioCut] = []
+    for cut in sorted(cuts, key=lambda item: item.start_time):
+        if merged and cut.start_time <= merged[-1].end_time:
+            merged[-1] = merged[-1].model_copy(
+                update={"end_time": max(merged[-1].end_time, cut.end_time)}
+            )
+        else:
+            merged.append(cut)
+    intervals: list[tuple[float, float | None]] = []
+    cursor = 0.0
+    for cut in merged:
+        if cut.start_time > cursor:
+            intervals.append((cursor, cut.start_time))
+        cursor = cut.end_time
+    intervals.append((cursor, None))
+
+    # Keep source rate and channel layout. No whole-file PCM intermediate.
+    filters = [
+        "[0:a:0]asetpts=PTS-STARTPTS,aresample=async=1:min_comp=0:min_hard_comp=0:first_pts=0[clock]"
+    ]
+    if len(intervals) == 1:
+        inputs = ["[clock]"]
+    else:
+        inputs = [f"[part{i}]" for i in range(len(intervals))]
+        filters.append(f"[clock]asplit={len(inputs)}" + "".join(inputs))
+    for i, (start, end) in enumerate(intervals):
+        trim = f"atrim=start={start:.9f}"
+        if end is not None:
+            trim += f":end={end:.9f}"
+        filters.append(f"{inputs[i]}{trim},asetpts=PTS-STARTPTS[keep{i}]")
+    kept = "".join(f"[keep{i}]" for i in range(len(intervals)))
+    if len(intervals) > 1:
+        filters.append(f"{kept}concat=n={len(intervals)}:v=0:a=1[joined]")
+        kept = "[joined]"
+    preview = f",atrim=duration={duration:.9f}" if duration is not None else ""
+    filters.append(f"{kept}asetpts=N/SR/TB{preview}[audio]")
+    with atomic_output_path(output) as temporary:
+        run_ffmpeg(
+            FFMPEG_COMMAND,
+            [
+                "-nostdin",
+                "-v",
+                "error",
+                "-xerror",
+                "-i",
+                str(source),
+                "-filter_complex",
+                ";".join(filters),
+                "-map",
+                "[audio]",
+                "-map_metadata",
+                "-1",
+                "-map_chapters",
+                "-1",
+                "-c:a",
+                "flac",
+                "-sample_fmt",
+                "s16",
+                "-f",
+                "flac",
+                str(temporary),
+            ],
+        )
+        # Removing the entire input must not publish an empty working file.
+        try:
+            prepared_duration = probe_duration(FFPROBE_COMMAND, temporary)
+        except ValueError as exc:
+            raise RuntimeError("Audio preparation produced no audio samples") from exc
+        if prepared_duration <= 0:
+            raise RuntimeError("Audio preparation produced no audio samples")
+        after = source.stat()
+        if (source_stat.st_size, source_stat.st_mtime_ns, source_stat.st_ctime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise RuntimeError(f"Audio changed during preparation: {source}")
+    return output
 
 
 def seconds_arg(value: float | None) -> str | None:

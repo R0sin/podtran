@@ -19,3 +19,11 @@ def fake_audio_decoder(monkeypatch):
         "podtran.fingerprints.hash_audio_content",
         lambda path: hashlib.sha256(b"decoded:" + path.read_bytes()).hexdigest(),
     )
+
+    def prepare(source, output, *, cuts=(), duration=None):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(source.read_bytes())
+        return output
+
+    monkeypatch.setattr("podtran.tasks.prepare_audio", prepare)
+    monkeypatch.setattr("podtran.cli.prepare_audio", prepare)

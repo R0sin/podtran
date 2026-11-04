@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import tempfile
+from contextlib import contextmanager
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
@@ -14,6 +16,21 @@ from podtran.config import model_dump
 
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+@contextmanager
+def atomic_output_path(path: Path) -> Iterator[Path]:
+    """Publish a tool-generated artifact only after the writer succeeds."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, suffix=path.suffix, delete=False
+    ) as handle:
+        temporary = Path(handle.name)
+    try:
+        yield temporary
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @dataclass(slots=True)
@@ -58,7 +75,7 @@ class ArtifactPaths:
             transcript_json=task_dir / "transcript.json",
             segments_json=task_dir / "segments.json",
             translated_json=task_dir / "translated.json",
-            preview_audio_path=task_dir / "preview.wav",
+            preview_audio_path=task_dir / "preview.flac",
             refs_dir=task_dir / "refs",
             voices_json=task_dir / "voices.json",
             tts_dir=task_dir / "tts",

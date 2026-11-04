@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 from podtran.fingerprints import FingerprintService
+from podtran.audio import prepare_audio
 
 
 def main() -> None:
@@ -56,7 +57,6 @@ def main() -> None:
             ("channels", "pan=stereo|c0=c0|c1=c0"),
             ("silence", "apad=pad_len=10"),
             ("samples", "volume=0.5"),
-            ("start", "asetpts=PTS+2400"),
             ("gap", "asetpts=PTS+gte(N\\,1024)*2400"),
         ]:
             changed = root / f"{name}.nut"
@@ -69,9 +69,10 @@ def main() -> None:
                 "pcm_s16le",
                 str(changed),
             )
-            assert fingerprints.hash_audio(changed) != expected, name
+            prepared = prepare_audio(changed, root / f"{name}.flac")
+            assert fingerprints.hash_audio(prepared) != expected, name
         print(
-            "PASS: samples, rate, channels, silence, start time and internal gaps remain distinct"
+            "PASS: samples, rate, channels, silence and materialized gaps remain distinct"
         )
 
         first = root / "first.opus"
@@ -87,7 +88,7 @@ def main() -> None:
         if args.equivalent_files:
             values = {fingerprints.hash_audio(path) for path in args.equivalent_files}
             assert len(values) == 1, (
-                "Provided files have different decoded content or timing"
+                "Provided files have different decoded PCM16 content or sample format"
             )
             print(
                 f"PASS: {len(args.equivalent_files)} provided files share a fingerprint"

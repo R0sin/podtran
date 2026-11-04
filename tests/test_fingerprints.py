@@ -7,22 +7,18 @@ from pathlib import Path
 import pytest
 
 from podtran.fingerprints import FingerprintService
-from podtran.audio import _hash_audio_frames
+from podtran.models import AudioFormat
 
 
-FRAMEHASH = b"""#format: frame checksums
-#version: 2
-#hash: SHA256
-#software: Lavf61
-#tb 0: 1/24000
-#media_type 0: audio
-#codec_id 0: pcm_f64le
-#sample_rate 0: 24000
-#channel_layout_name 0: mono
-#stream#, dts, pts, duration, size, hash
-0, 0, 0, 2400, 19200, abcdef
-1, 0, 0, 2400, 19200, abcdef
-"""
+PCM = b"\x01\x02\x03\x04" * 1200
+
+
+@pytest.fixture(autouse=True)
+def audio_format(monkeypatch):
+    monkeypatch.setattr(
+        "podtran.audio.probe_audio_format",
+        lambda path: AudioFormat(sample_rate=24000, channels=1),
+    )
 
 
 @pytest.fixture
@@ -54,45 +50,57 @@ class FakeProcess:
         self.killed = True
 
 
-def test_audio_content_ignores_container_bytes_and_encoder_version(tmp_path, decoder):
+def test_audio_content_ignores_container_and_packet_framing(tmp_path, monkeypatch):
     first = tmp_path / "first.opus"
     second = tmp_path / "second.mka"
-    first.write_bytes(FRAMEHASH)
-    second.write_bytes(FRAMEHASH.replace(b"Lavf61", b"Lavf99"))
+    first.write_bytes(b"container-one")
+    second.write_bytes(b"different-container")
+    commands = []
+
+    def start(command, **kwargs):
+        commands.append(command)
+        return FakeProcess(PCM)
+
+    monkeypatch.setattr("podtran.audio.subprocess.Popen", start)
     service = FingerprintService(tmp_path / "indexes")
     assert service.hash_audio(first) == service.hash_audio(second)
-    assert len(decoder[0]) == 2
-    command = decoder[0][0]
-    assert "-copyts" in command
-    assert "pcm_f64le" in command
-    assert "asetnsamples=n=4096:p=0" in command[command.index("-filter_complex") + 1]
-    assert "-ar" not in command and "-ac" not in command
+    assert "-copyts" not in commands[0]
+    assert "pcm_s16le" in commands[0]
+    assert "-ar" not in commands[0] and "-ac" not in commands[0]
+    assert service.hash_file(first) != service.hash_file(second)
+
+
+def test_sample_and_silence_changes_invalidate_fingerprint(tmp_path, decoder):
+    original = tmp_path / "original.flac"
+    changed = tmp_path / "changed.flac"
+    original.write_bytes(PCM)
+    service = FingerprintService(tmp_path / "indexes")
+    baseline = service.hash_audio(original)
+    for content in [PCM[:-2], PCM + b"\x00\x00", b"\x00\x00" + PCM[2:]]:
+        changed.write_bytes(content)
+        assert service.hash_audio(changed) != baseline
 
 
 @pytest.mark.parametrize(
-    ("old", "new"),
+    "format",
     [
-        (b"abcdef", b"fedcba"),
-        (b"24000", b"48000"),
-        (b"mono", b"stereo"),
-        (b"0, 0, 0,", b"0, 2400, 2400,"),
-        (b"2400, 19200", b"2401, 19208"),
+        AudioFormat(sample_rate=48000, channels=1),
+        AudioFormat(sample_rate=24000, channels=2),
     ],
 )
-def test_audio_content_changes_invalidate_fingerprint(tmp_path, decoder, old, new):
-    first = tmp_path / "first.wav"
-    second = tmp_path / "second.wav"
-    first.write_bytes(FRAMEHASH)
-    second.write_bytes(FRAMEHASH.replace(old, new))
-    service = FingerprintService(tmp_path / "indexes")
-    assert service.hash_audio(first) != service.hash_audio(second)
+def test_sample_format_participates_in_identity(tmp_path, decoder, monkeypatch, format):
+    audio = tmp_path / "input.flac"
+    audio.write_bytes(PCM)
+    before = FingerprintService(tmp_path / "before").hash_audio(audio)
+    monkeypatch.setattr("podtran.audio.probe_audio_format", lambda path: format)
+    assert FingerprintService(tmp_path / "after").hash_audio(audio) != before
 
 
 def test_index_ignores_legacy_entries_and_reuses_only_unchanged_files(
     tmp_path, decoder
 ):
     audio = tmp_path / "audio.opus"
-    audio.write_bytes(FRAMEHASH)
+    audio.write_bytes(PCM)
     service = FingerprintService(tmp_path / "indexes")
     stat = audio.stat()
     service.index_path.write_text(
@@ -104,7 +112,7 @@ def test_index_ignores_legacy_entries_and_reuses_only_unchanged_files(
     assert first != "legacy-file-hash"
     assert service.hash_audio(audio) == first
     assert len(decoder[0]) == 1
-    audio.write_bytes(FRAMEHASH.replace(b"abcdef", b"changed"))
+    audio.write_bytes(PCM + b"changed")
     assert service.hash_audio(audio) != first
     assert len(decoder[0]) == 2
 
@@ -118,24 +126,10 @@ def test_empty_decode_is_not_cached(tmp_path, decoder):
     assert not service.index_path.exists()
 
 
-def test_timing_ignores_packet_boundaries_but_preserves_gaps_and_overlaps():
-    split = FRAMEHASH.replace(
-        b"0, 0, 0, 2400, 19200, abcdef\n",
-        b"0, 0, 0, 1024, 8192, first\n0, 1024, 1024, 1376, 11008, last\n",
-    )
-    baseline = _hash_audio_frames(FRAMEHASH.splitlines())
-    assert _hash_audio_frames(split.splitlines()) == baseline
-    for offset in [100, -100]:
-        changed = split.replace(
-            b"0, 1024, 1024,", f"0, 1024, {1024 + offset},".encode()
-        )
-        assert _hash_audio_frames(changed.splitlines()) != baseline
-
-
 def test_decoder_failure_does_not_publish_partial_fingerprint(tmp_path, monkeypatch):
     audio = tmp_path / "broken.opus"
     audio.write_bytes(b"broken")
-    process = FakeProcess(FRAMEHASH)
+    process = FakeProcess(PCM)
     process.returncode = 1
 
     def start(*args, **kwargs):
@@ -153,10 +147,10 @@ def test_decoder_failure_does_not_publish_partial_fingerprint(tmp_path, monkeypa
 def test_interruption_reaps_decoder_without_publishing_index(tmp_path, monkeypatch):
     audio = tmp_path / "audio.opus"
     audio.write_bytes(b"audio")
-    process = FakeProcess(FRAMEHASH)
+    process = FakeProcess(PCM)
 
     class InterruptedOutput(io.BytesIO):
-        def __next__(self):
+        def read(self, size=-1):
             raise KeyboardInterrupt
 
     process.stdout = InterruptedOutput()

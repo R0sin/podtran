@@ -17,7 +17,13 @@ from podtran.artifacts import read_model, read_model_list, write_json
 from podtran.cache_store import CacheStore
 from podtran.config import AppConfig, load_config, write_default_config
 from podtran.fingerprints import FingerprintService
-from podtran.models import SegmentRecord, StageManifest, TaskManifest, TranscriptSegment
+from podtran.models import (
+    DownloadResult,
+    SegmentRecord,
+    StageManifest,
+    TaskManifest,
+    TranscriptSegment,
+)
 from podtran.stage_executor import StageExecutor
 from podtran.tasks import TaskStore
 
@@ -78,7 +84,7 @@ def test_resume_refreshes_legacy_audio_before_checking_completed_asr(
         cli._execute_pipeline(task, cfg, store, cache, fingerprints)[0].action
         == "up-to-date"
     )
-    assert calls == [source]
+    assert calls == [Path(task.processing_audio_path)]
 
     # Single-stage commands must refresh saved identities too.
     task.source_audio_sha256 = task.processing_audio_sha256 = "legacy-file-hash"
@@ -102,7 +108,11 @@ def test_separate_url_runs_download_again_but_reuse_asr_content_cache(
         audio = directory / "source.opus"
         audio.write_bytes(f"container-{len(downloads)}".encode())
         downloads.append(audio)
-        return audio
+        return DownloadResult(
+            processing_audio=audio,
+            source_audio_name=audio.name,
+            source_audio_sha256=fingerprints.hash_file(audio),
+        )
 
     monkeypatch.setattr(cli, "download_audio", download)
     monkeypatch.setattr(
@@ -168,7 +178,7 @@ def _create_config(tmp_path: Path) -> tuple[Path, AppConfig]:
 def _preview_task(tmp_path: Path) -> tuple[AppConfig, TaskStore, TaskManifest]:
     source = tmp_path / "episode.mp3"
     source.write_bytes(b"source-audio")
-    preview = tmp_path / "preview.wav"
+    preview = tmp_path / "preview.flac"
     preview.write_bytes(b"preview-audio")
     cfg = AppConfig()
     fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
@@ -639,20 +649,17 @@ def test_root_preview_creates_preview_task_and_executes_pipeline(
         captured["max_speakers"] = max_speakers
         return []
 
-    def fake_extract_audio_chunk(
-        ffmpeg_path: str,
+    def fake_prepare_audio(
         source: Path,
         output: Path,
-        start: float | None,
-        end: float | None,
+        *,
+        duration: float | None = None,
     ) -> Path:
         clip_args.update(
             {
-                "ffmpeg_path": ffmpeg_path,
                 "source": source,
                 "output": output,
-                "start": start,
-                "end": end,
+                "duration": duration,
             }
         )
         output.write_bytes(b"preview")
@@ -661,7 +668,7 @@ def test_root_preview_creates_preview_task_and_executes_pipeline(
     argv = [part.format(audio=audio) for part in argv]
 
     monkeypatch.setattr(cli, "_execute_pipeline", fake_execute_pipeline)
-    monkeypatch.setattr(cli, "extract_audio_chunk", fake_extract_audio_chunk)
+    monkeypatch.setattr("podtran.tasks.prepare_audio", fake_prepare_audio)
     monkeypatch.setattr(cli, "ensure_command", lambda command: None)
     monkeypatch.setattr(
         cli.sys,
@@ -677,15 +684,13 @@ def test_root_preview_creates_preview_task_and_executes_pipeline(
     assert task.preview is True
     assert task.preview_start_seconds == 0.0
     assert task.preview_duration_seconds == 300.0
-    assert Path(task.processing_audio_path).name == "preview.wav"
+    assert Path(task.processing_audio_path).name == "preview.flac"
     assert Path(task.processing_audio_path).read_bytes() == b"preview"
     assert task.processing_audio_path != task.source_audio_path
     assert clip_args == {
-        "ffmpeg_path": "ffmpeg",
         "source": audio.resolve(),
         "output": Path(task.processing_audio_path),
-        "start": 0.0,
-        "end": 300.0,
+        "duration": 300.0,
     }
 
 
@@ -1111,12 +1116,11 @@ def test_background_preview_creates_preview_before_starting_resume_process(
     class FakeProcess:
         pid = 2468
 
-    def fake_extract_audio_chunk(
-        ffmpeg_path: str,
+    def fake_prepare_audio(
         source: Path,
         output: Path,
-        start: float | None,
-        end: float | None,
+        *,
+        duration: float | None = None,
     ) -> Path:
         captured["preview_exists_before_popen"] = False
         output.write_bytes(b"preview")
@@ -1124,11 +1128,11 @@ def test_background_preview_creates_preview_before_starting_resume_process(
 
     def fake_popen(command, **kwargs):
         task_id = command[4]
-        preview_path = tmp_path / "artifacts" / "tasks" / task_id / "preview.wav"
+        preview_path = tmp_path / "artifacts" / "tasks" / task_id / "preview.flac"
         captured["preview_exists_before_popen"] = preview_path.exists()
         return FakeProcess()
 
-    monkeypatch.setattr(cli, "extract_audio_chunk", fake_extract_audio_chunk)
+    monkeypatch.setattr("podtran.tasks.prepare_audio", fake_prepare_audio)
     monkeypatch.setattr(cli, "ensure_command", lambda command: None)
     monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
 
@@ -1160,7 +1164,7 @@ def test_status_reports_factual_stage_statuses_and_preview_mode(tmp_path: Path) 
     config_path, cfg = _create_config(tmp_path)
     audio = tmp_path / "episode.mp3"
     audio.write_bytes(b"audio")
-    preview_audio = tmp_path / "preview.wav"
+    preview_audio = tmp_path / "preview.flac"
     preview_audio.write_bytes(b"preview")
     fingerprints = FingerprintService(tmp_path / "artifacts" / "cache" / "_indexes")
     store = TaskStore(tmp_path, fingerprints)
@@ -3044,7 +3048,15 @@ def test_download_failure_and_resume(tmp_path, monkeypatch, error, sponsorblock)
     audio = paths.task_dir / "source" / "episode.opus"
     audio.parent.mkdir()
     audio.write_bytes(b"downloaded")
-    monkeypatch.setattr(cli, "download_audio", lambda *args: audio)
+    monkeypatch.setattr(
+        cli,
+        "download_audio",
+        lambda *args: DownloadResult(
+            processing_audio=audio,
+            source_audio_name="original.opus",
+            source_audio_sha256="original-source-hash",
+        ),
+    )
     task = store.load_task(task.task_id)
     executor = StageExecutor(store, task, paths)
     cli._ensure_download(task, cfg, paths, executor, fingerprints)
@@ -3068,7 +3080,15 @@ def test_url_preview_failure_reuses_download_and_stop_records_stage(
     monkeypatch.setattr(cli, "ensure_command", lambda command: None)
     audio = paths.task_dir / "episode.opus"
     audio.write_bytes(b"full episode")
-    monkeypatch.setattr(cli, "download_audio", lambda *args: audio)
+    monkeypatch.setattr(
+        cli,
+        "download_audio",
+        lambda *args: DownloadResult(
+            processing_audio=audio,
+            source_audio_name="original.opus",
+            source_audio_sha256="original-source-hash",
+        ),
+    )
 
     def fail_preview(*args):
         raise RuntimeError("preview failed")
@@ -3077,6 +3097,8 @@ def test_url_preview_failure_reuses_download_and_stop_records_stage(
     with pytest.raises(RuntimeError):
         cli._ensure_download(task, cfg, paths, executor, fingerprints)
     task = store.load_task(task.task_id)
+    assert task.source_audio_sha256 == "original-source-hash"
+    assert task.source_audio_name == "original.opus"
     executor = StageExecutor(store, task, paths)
     monkeypatch.setattr(
         cli, "download_audio", lambda *args: pytest.fail("download repeated")
@@ -3089,6 +3111,8 @@ def test_url_preview_failure_reuses_download_and_stop_records_stage(
     monkeypatch.setattr(cli, "_create_preview_audio", preview)
     cli._ensure_download(task, cfg, paths, executor, fingerprints)
     assert task.processing_audio_path == str(paths.preview_audio_path)
+    assert task.source_audio_sha256 == "original-source-hash"
+    assert store.load_task(task.task_id).source_audio_sha256 == "original-source-hash"
     assert task.processing_audio_sha256 != task.source_audio_sha256
     stage = executor.start(StageManifest(stage="download"))
     assert cli._record_stopped_task(store, task.task_id, stage.pid)
@@ -3107,7 +3131,15 @@ def test_url_pipeline_downloads_before_transcribe_and_status_shows_download(
     audio = paths.task_dir / "episode.opus"
     audio.write_bytes(b"audio")
     monkeypatch.setattr(cli, "ensure_command", lambda command: None)
-    monkeypatch.setattr(cli, "download_audio", lambda *args: audio)
+    monkeypatch.setattr(
+        cli,
+        "download_audio",
+        lambda *args: DownloadResult(
+            processing_audio=audio,
+            source_audio_name="original.opus",
+            source_audio_sha256="original-source-hash",
+        ),
+    )
     seen = []
 
     def stage(task, *args, **kwargs):
@@ -3375,7 +3407,11 @@ def test_sponsorblock_resume_uses_saved_choice_before_preview(tmp_path, monkeypa
     def download(url, directory, enabled):
         assert enabled is True
         audio.write_bytes(b"sponsor removed")
-        return audio
+        return DownloadResult(
+            processing_audio=audio,
+            source_audio_name="original.opus",
+            source_audio_sha256="original-source-hash",
+        )
 
     def preview(source, *args):
         assert source.read_bytes() == b"sponsor removed"
@@ -3385,7 +3421,7 @@ def test_sponsorblock_resume_uses_saved_choice_before_preview(tmp_path, monkeypa
     monkeypatch.setattr(cli, "download_audio", download)
     monkeypatch.setattr(cli, "_create_preview_audio", preview)
     cli._ensure_download(task, cfg, paths, executor, fingerprints)
-    assert task.source_audio_sha256 == fingerprints.hash_audio(audio)
+    assert task.source_audio_sha256 == "original-source-hash"
     monkeypatch.setattr(
         cli, "download_audio", lambda *args: pytest.fail("download repeated")
     )
